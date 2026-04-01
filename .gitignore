@@ -1,0 +1,13 @@
+# Build artifacts
+*.o
+*.a
+*.d
+build/
+funnelcake_test
+
+# Test output
+output/
+
+# Editor backup files
+*~
+.DS_Store

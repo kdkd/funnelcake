@@ -1,6 +1,6 @@
 # Funnelcake
 
-Funnelcake is a fused multi-resolution YUV420 downscaler. A single call
+Funnelcake is a fused multi-resolution planar YUV downscaler. A single call
 produces up to four downscaled outputs simultaneously in one pass over the
 source data, using AVX2 (x86-64) or NEON (aarch64) SIMD kernels, with a
 portable scalar fallback.
@@ -10,7 +10,8 @@ copies of each frame — thumbnail generation, adaptive bitrate encoding ladders
 preview streams — where calling a general-purpose scaler once per output is
 prohibitively slow.
 
-Input and output are I420 planar (separate Y, U, V planes), 8-bit unsigned.
+Input and output are planar 8-bit YUV with separate Y, U, and V planes.
+`FUSED_CHROMA_420` (I420) and `FUSED_CHROMA_422` (I422) are supported.
 
 
 ## How it works
@@ -86,8 +87,8 @@ Times are the minimum observed over 1000 frames (single-threaded).
 
 On **April 1, 2026**, on an **Intel Core i7-9700** Ubuntu x86-64 workstation,
 the in-tree `make bench` results were compared against single-threaded `ffmpeg`
-`scale` filter graphs that produced the same output ladders from raw I420
-frames using bilinear scaling:
+`scale` filter graphs that produced the same output ladders from raw planar
+YUV420 frames using bilinear scaling:
 
 | Case | Funnelcake mean | `ffmpeg` avg / frame | Speedup |
 |------|----------------:|---------------------:|--------:|
@@ -106,6 +107,9 @@ To reproduce the Funnelcake side, run:
 ```sh
 make bench
 ```
+
+The in-tree benchmark set includes both `420` and `422` cases. At the time of
+writing, the `422` presets are `1280x720 pow2 422` and `1920x1080 thirds 422`.
 
 To reproduce one comparable `ffmpeg` case:
 
@@ -129,13 +133,16 @@ These constraints apply to the source data passed to `fused_scaler_init` and
 `fused_scaler_run`.
 
 ### Format
-- **YUV420 I420 planar only.** The three planes (Y, U, V) must be passed
+- **Planar YUV only.** `FUSED_CHROMA_420` (I420) and `FUSED_CHROMA_422`
+  (I422) are supported. The three planes (Y, U, V) must be passed
   separately. Packed formats (NV12, UYVY, etc.) are not supported.
 - **8-bit unsigned** samples only.
 - **Downscaling only.** The library does not upscale.
 
 ### Dimensions
-- `src_width` and `src_height` must be **positive** and **even**.
+- `src_width` must be **positive** and **even**.
+- `src_height` must be **positive**. It must also be **even** when
+  `chroma_format == FUSED_CHROMA_420`.
 - Both dimensions must be **large enough** to produce at least one output
   pixel at the deepest requested scale step (minimum output size is 32×2
   luma pixels).
@@ -233,6 +240,7 @@ scaler.src_width     = 1920;
 scaler.src_height    = 1080;
 scaler.src_y_stride  = (1920 + 31) & ~31;   /* 1920 */
 scaler.src_uv_stride = (960  + 31) & ~31;   /* 960  */
+scaler.chroma_format = FUSED_CHROMA_420;
 scaler.requested_flags = FUSED_SCALE_1_5X | FUSED_SCALE_3X | FUSED_SCALE_6X;
 
 int rc = fused_scaler_init(&scaler);

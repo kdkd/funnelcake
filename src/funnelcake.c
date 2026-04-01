@@ -48,22 +48,40 @@ static int stride_for(int width) {
     return (width + 31) & ~31;
 }
 
+static int chroma_height_for(int luma_height, int chroma_format)
+{
+    return (chroma_format == FUSED_CHROMA_422) ? luma_height : (luma_height / 2);
+}
+
 /* --------------------------------------------------------------------------
  * fused_scaler_init
  * -------------------------------------------------------------------------- */
 
 int fused_scaler_init(fused_scaler_ctx_t *ctx)
 {
+    int chroma_format;
+    int uv_height_div;
     if (!ctx) return FUSED_ERR_BAD_DIMENSIONS;
+
+    chroma_format = ctx->chroma_format;
+    if (chroma_format != FUSED_CHROMA_420 && chroma_format != FUSED_CHROMA_422) {
+        fused_log(&ctx->log_errors, FUSED_LOG_ERROR,
+            "funnelcake: chroma_format=%d must be FUSED_CHROMA_420 or FUSED_CHROMA_422\n",
+            chroma_format);
+        return FUSED_ERR_BAD_DIMENSIONS;
+    }
+
+    uv_height_div = (chroma_format == FUSED_CHROMA_422) ? 1 : 2;
 
     /* ------------------------------------------------------------------ */
     /* 1. Validate source dimensions                                        */
     /* ------------------------------------------------------------------ */
 
     if (ctx->src_width <= 0 || ctx->src_height <= 0 ||
-        (ctx->src_width & 1) || (ctx->src_height & 1)) {
+        (ctx->src_width & 1) ||
+        (chroma_format == FUSED_CHROMA_420 && (ctx->src_height & 1))) {
         fused_log(&ctx->log_errors, FUSED_LOG_ERROR,
-            "funnelcake: src_width=%d src_height=%d must be positive and even\n",
+            "funnelcake: src_width=%d src_height=%d must be positive; width must be even and height must be even for 4:2:0\n",
             ctx->src_width, ctx->src_height);
         return FUSED_ERR_BAD_DIMENSIONS;
     }
@@ -126,17 +144,12 @@ int fused_scaler_init(fused_scaler_ctx_t *ctx)
 
     if (!(ctx->options & FUSED_OPT_NO_CROP)) {
         /*
-         * The crop divisor must ensure ALL output luma dimensions are:
-         *   (a) exact integers (source divisible by ratio denominator)
-         *   (b) even (YUV420 requires even luma dimensions)
+         * The crop divisor must ensure all requested outputs have exact
+         * dimensions and valid chroma geometry.
          *
-         * For pow2: output = source / ratio. Even output requires source
-         * divisible by 2 * ratio.
-         *
-         * For thirds: 1.5x = src*2/3 (even when src%3==0 since 2*3k/3=2k).
-         * 3x = src/3 even requires src%6==0. 6x = src/6 even requires
-         * src%12==0. 12x = src/12 even requires src%24==0.
-         * Height also needs divisibility by the vertical period (6 or 12).
+         * Width must always end up even because U/V are half-width in both
+         * supported formats. Height must also end up even only for 4:2:0,
+         * where chroma is half-height.
          */
         if (family == FUSED_FAMILY_THIRDS) {
             int w_div = 3;   /* 1.5x: src%3==0 sufficient */
@@ -145,22 +158,24 @@ int fused_scaler_init(fused_scaler_ctx_t *ctx)
             if (req & FUSED_SCALE_12X) w_div = 24;
             eff_w = round_down(eff_w, w_div);
 
-            /* Height: vertical period is 6 (or 12 if 12x active), plus
-             * the even-output constraint for the deepest step */
+            /* Height only needs exact ratio divisibility, except 4:2:0 also
+             * requires even output heights for half-height chroma. */
             int h_div = 6;
-            if (req & FUSED_SCALE_3X)  { if (h_div < 6)  h_div = 6;  }
-            if (req & FUSED_SCALE_6X)  { if (h_div < 12) h_div = 12; }
-            if (req & FUSED_SCALE_12X) { if (h_div < 24) h_div = 24; }
+            if (chroma_format == FUSED_CHROMA_420) {
+                if (req & FUSED_SCALE_6X)  h_div = 12;
+                if (req & FUSED_SCALE_12X) h_div = 24;
+            } else {
+                if (req & FUSED_SCALE_12X) h_div = 12;
+            }
             eff_h = round_down(eff_h, h_div);
         } else {
-            /* pow2: deepest ratio * 2 ensures even output */
+            /* Width always needs even output; height only does for 4:2:0. */
             int max_ratio = 2;
             if (req & FUSED_SCALE_4X)  max_ratio = 4;
             if (req & FUSED_SCALE_8X)  max_ratio = 8;
             if (req & FUSED_SCALE_16X) max_ratio = 16;
-            int div = max_ratio * 2;
-            eff_w = round_down(eff_w, div);
-            eff_h = round_down(eff_h, div);
+            eff_w = round_down(eff_w, max_ratio * 2);
+            eff_h = round_down(eff_h, max_ratio * uv_height_div);
         }
     }
 
@@ -246,11 +261,12 @@ int fused_scaler_init(fused_scaler_ctx_t *ctx)
             continue;
         }
 
-        /* (b) Output luma dimensions must be even */
-        if ((out_w & 1) || (out_h & 1)) {
+        /* (b) Output geometry must preserve chroma dimensions */
+        if ((out_w & 1) || ((chroma_format == FUSED_CHROMA_420) && (out_h & 1))) {
             fused_log(&ctx->log_warnings, FUSED_LOG_WARN,
-                "funnelcake: %s rejected: output luma %dx%d has odd dimension\n",
-                sd->name, out_w, out_h);
+                "funnelcake: %s rejected: output luma %dx%d is incompatible with %s chroma\n",
+                sd->name, out_w, out_h,
+                (chroma_format == FUSED_CHROMA_420) ? "4:2:0" : "4:2:2");
             rejected |= sd->flag;
             continue;
         }
@@ -287,7 +303,7 @@ int fused_scaler_init(fused_scaler_ctx_t *ctx)
         /* Allocate output buffers */
         int y_stride  = stride_for(out_w);
         int uv_stride = stride_for(chroma_w);
-        int chroma_h  = out_h / 2;
+        int chroma_h  = chroma_height_for(out_h, chroma_format);
 
         void *py = NULL, *pu = NULL, *pv = NULL;
         if (posix_memalign(&py, 32, (size_t)y_stride  * (size_t)out_h)  != 0 ||
@@ -349,6 +365,8 @@ int fused_scaler_init(fused_scaler_ctx_t *ctx)
     p->src_height  = eff_h;
     p->src_y_stride  = ctx->src_y_stride;
     p->src_uv_stride = ctx->src_uv_stride;
+    p->src_uv_height = chroma_height_for(eff_h, chroma_format);
+    p->chroma_format = chroma_format;
 
     p->family = family;
 

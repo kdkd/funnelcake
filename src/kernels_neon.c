@@ -5,7 +5,7 @@
  *   fused_kernel_pow2_neon   — power-of-two family (2x/4x/8x/16x)
  *   fused_kernel_thirds_neon — thirds family (1.5x/3x/6x/12x)
  *
- * Both process YUV420 I420 frames plane-by-plane. The vertical phase uses
+ * Both process planar 4:2:0 / 4:2:2 frames plane-by-plane. The vertical phase uses
  * NEON intrinsics (vrhaddq_u8, vmull_u8, vmlal_u8, etc.) for throughput.
  * The horizontal phase uses NEON for both pow2 (vpaddlq_u8 cascade) and
  * thirds (vld3q_u8 deinterleave for bilinear 3:2 and box-of-3 patterns).
@@ -807,7 +807,9 @@ void __attribute__((hot)) fused_kernel_pow2_neon(const fused_kernel_params_t *p,
             u_planes[k]  = p->out[b].plane_u;
             v_planes[k]  = p->out[b].plane_v;
             uv_widths[k]  = p->out[b].width / 2;
-            uv_heights[k] = p->out[b].height / 2;
+            uv_heights[k] = (p->chroma_format == FUSED_CHROMA_422)
+                            ? p->out[b].height
+                            : (p->out[b].height / 2);
             uv_strides[k] = p->out[b].uv_stride;
         } else {
             y_planes[k] = u_planes[k] = v_planes[k] = NULL;
@@ -822,15 +824,15 @@ void __attribute__((hot)) fused_kernel_pow2_neon(const fused_kernel_params_t *p,
                           p->active_outputs,
                           y_planes, y_widths, y_strides, y_heights);
 
-    /* U plane (half dimensions) */
+    /* U plane */
     scale_plane_pow2_neon(src_u,
-                          p->src_width / 2, p->src_height / 2, p->src_uv_stride,
+                          p->src_width / 2, p->src_uv_height, p->src_uv_stride,
                           p->active_outputs,
                           u_planes, uv_widths, uv_strides, uv_heights);
 
-    /* V plane (half dimensions) */
+    /* V plane */
     scale_plane_pow2_neon(src_v,
-                          p->src_width / 2, p->src_height / 2, p->src_uv_stride,
+                          p->src_width / 2, p->src_uv_height, p->src_uv_stride,
                           p->active_outputs,
                           v_planes, uv_widths, uv_strides, uv_heights);
 }
@@ -858,7 +860,9 @@ void __attribute__((hot)) fused_kernel_thirds_neon(const fused_kernel_params_t *
             u_planes[k]  = p->out[b].plane_u;
             v_planes[k]  = p->out[b].plane_v;
             uv_widths[k]  = p->out[b].width / 2;
-            uv_heights[k] = p->out[b].height / 2;
+            uv_heights[k] = (p->chroma_format == FUSED_CHROMA_422)
+                            ? p->out[b].height
+                            : (p->out[b].height / 2);
             uv_strides[k] = p->out[b].uv_stride;
         } else {
             y_planes[k] = u_planes[k] = v_planes[k] = NULL;
@@ -873,15 +877,15 @@ void __attribute__((hot)) fused_kernel_thirds_neon(const fused_kernel_params_t *
                             p->active_outputs,
                             y_planes, y_widths, y_strides, y_heights);
 
-    /* U plane (half dimensions) */
+    /* U plane */
     scale_plane_thirds_neon(src_u,
-                            p->src_width / 2, p->src_height / 2, p->src_uv_stride,
+                            p->src_width / 2, p->src_uv_height, p->src_uv_stride,
                             p->active_outputs,
                             u_planes, uv_widths, uv_strides, uv_heights);
 
-    /* V plane (half dimensions) */
+    /* V plane */
     scale_plane_thirds_neon(src_v,
-                            p->src_width / 2, p->src_height / 2, p->src_uv_stride,
+                            p->src_width / 2, p->src_uv_height, p->src_uv_stride,
                             p->active_outputs,
                             v_planes, uv_widths, uv_strides, uv_heights);
 }

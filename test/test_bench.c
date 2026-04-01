@@ -33,7 +33,7 @@ static int compare_doubles(const void *a, const void *b)
  * -------------------------------------------------------------------------- */
 
 static void bench_config(const char *label, int width, int height,
-                         uint32_t flags)
+                         int chroma_format, uint32_t flags)
 {
     test_frame_t frame;
     fused_scaler_ctx_t ctx;
@@ -41,7 +41,8 @@ static void bench_config(const char *label, int width, int height,
     int rc;
 
     /* Build a random test frame */
-    if (test_frame_create(&frame, width, height, PATTERN_RANDOM, 0xdeadbeef) != 0) {
+    if (test_frame_create_ex(&frame, width, height, chroma_format,
+                             PATTERN_RANDOM, 0xdeadbeef) != 0) {
         printf("  %-28s  ERROR: could not allocate test frame\n", label);
         return;
     }
@@ -52,6 +53,7 @@ static void bench_config(const char *label, int width, int height,
     ctx.src_height   = height;
     ctx.src_y_stride  = frame.y_stride;
     ctx.src_uv_stride = frame.uv_stride;
+    ctx.chroma_format = chroma_format;
     ctx.requested_flags = flags;
     ctx.log_errors.target   = FUSED_LOG_SUPPRESS;
     ctx.log_warnings.target = FUSED_LOG_SUPPRESS;
@@ -124,16 +126,19 @@ typedef struct {
     const char *label;
     int         width;
     int         height;
+    int         chroma_format;
     uint32_t    flags;
 } bench_entry_t;
 
 static const bench_entry_t bench_configs[] = {
-    { "640x360 pow2 2x",     640,  360,  FUSED_SCALE_2X },
-    { "960x540 thirds",      960,  540,  FUSED_SCALE_1_5X | FUSED_SCALE_3X },
-    { "1280x720 pow2",       1280, 720,  FUSED_SCALE_2X  | FUSED_SCALE_4X },
-    { "1920x1080 thirds",    1920, 1080, FUSED_SCALE_1_5X | FUSED_SCALE_3X | FUSED_SCALE_6X },
-    { "2560x1440 pow2",      2560, 1440, FUSED_SCALE_2X  | FUSED_SCALE_4X | FUSED_SCALE_8X },
-    { "3840x2160 thirds",    3840, 2160, FUSED_SCALE_1_5X | FUSED_SCALE_3X | FUSED_SCALE_6X | FUSED_SCALE_12X },
+    { "640x360 pow2 2x 420",     640,  360,  FUSED_CHROMA_420, FUSED_SCALE_2X },
+    { "960x540 thirds 420",      960,  540,  FUSED_CHROMA_420, FUSED_SCALE_1_5X | FUSED_SCALE_3X },
+    { "1280x720 pow2 420",       1280, 720,  FUSED_CHROMA_420, FUSED_SCALE_2X  | FUSED_SCALE_4X },
+    { "1280x720 pow2 422",       1280, 720,  FUSED_CHROMA_422, FUSED_SCALE_2X  | FUSED_SCALE_4X },
+    { "1920x1080 thirds 420",    1920, 1080, FUSED_CHROMA_420, FUSED_SCALE_1_5X | FUSED_SCALE_3X | FUSED_SCALE_6X },
+    { "1920x1080 thirds 422",    1920, 1080, FUSED_CHROMA_422, FUSED_SCALE_1_5X | FUSED_SCALE_3X | FUSED_SCALE_6X },
+    { "2560x1440 pow2 420",      2560, 1440, FUSED_CHROMA_420, FUSED_SCALE_2X  | FUSED_SCALE_4X | FUSED_SCALE_8X },
+    { "3840x2160 thirds 420",    3840, 2160, FUSED_CHROMA_420, FUSED_SCALE_1_5X | FUSED_SCALE_3X | FUSED_SCALE_6X | FUSED_SCALE_12X },
 };
 
 #define BENCH_CONFIG_COUNT ((int)(sizeof(bench_configs) / sizeof(bench_configs[0])))
@@ -148,6 +153,6 @@ void run_bench_tests(const char *filter)
         const bench_entry_t *e = &bench_configs[i];
         if (filter != NULL && strstr(e->label, filter) == NULL)
             continue;
-        bench_config(e->label, e->width, e->height, e->flags);
+        bench_config(e->label, e->width, e->height, e->chroma_format, e->flags);
     }
 }

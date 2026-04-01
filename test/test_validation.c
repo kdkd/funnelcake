@@ -78,6 +78,29 @@ static void test_valid_720p_pow2(void)
     TEST_PASS();
 }
 
+static void test_valid_720p_pow2_422(void)
+{
+    fused_scaler_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.src_width       = 1280;
+    ctx.src_height      = 720;
+    ctx.src_y_stride    = align_up_32(1280);
+    ctx.src_uv_stride   = align_up_32(640);
+    ctx.chroma_format   = FUSED_CHROMA_422;
+    ctx.requested_flags = FUSED_SCALE_2X | FUSED_SCALE_4X;
+    suppress_log(&ctx);
+
+    int rc = fused_scaler_init(&ctx);
+    TEST_ASSERT_EQ(rc, FUSED_OK, "422 rc should be FUSED_OK");
+    TEST_ASSERT_EQ(ctx.outputs[1].width, 640, "outputs[1].width");
+    TEST_ASSERT_EQ(ctx.outputs[1].height, 360, "outputs[1].height");
+    TEST_ASSERT_EQ(ctx.outputs[1].uv_stride, align_up_32(320), "outputs[1].uv_stride");
+    TEST_ASSERT(ctx.outputs[1].plane_u != NULL, "outputs[1].plane_u != NULL");
+
+    fused_scaler_free(&ctx);
+    TEST_PASS();
+}
+
 /* --------------------------------------------------------------------------
  * 3. test_valid_4k_full_thirds
  *    3840x2160, flags 1.5x|3x|6x|12x → FUSED_OK
@@ -192,6 +215,27 @@ static void test_bad_dimensions_odd(void)
     TEST_PASS();
 }
 
+static void test_422_allows_odd_source_height(void)
+{
+    fused_scaler_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.src_width       = 1920;
+    ctx.src_height      = 1081;
+    ctx.src_y_stride    = align_up_32(1920);
+    ctx.src_uv_stride   = align_up_32(960);
+    ctx.chroma_format   = FUSED_CHROMA_422;
+    ctx.requested_flags = FUSED_SCALE_2X;
+    suppress_log(&ctx);
+
+    int rc = fused_scaler_init(&ctx);
+    TEST_ASSERT(rc >= 0, "422 should allow odd source height and crop if needed");
+    TEST_ASSERT((rc & FUSED_WARN_BIT_CROPPED) != 0, "422 odd height should crop here");
+    TEST_ASSERT_EQ(ctx.effective_height, 1080, "effective height cropped to 1080");
+
+    fused_scaler_free(&ctx);
+    TEST_PASS();
+}
+
 /* --------------------------------------------------------------------------
  * 8. test_bad_alignment
  *    stride=100 (not 32-byte aligned) → FUSED_ERR_BAD_ALIGNMENT
@@ -270,6 +314,28 @@ static void test_no_crop_rejects(void)
     /* Step rejected, achieved=0 → hard error */
     TEST_ASSERT(rc < 0, "1360x762 2x NO_CROP: step rejected → negative return code");
 
+    TEST_PASS();
+}
+
+static void test_no_crop_allows_odd_output_height_422(void)
+{
+    fused_scaler_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.src_width       = 1280;
+    ctx.src_height      = 762;
+    ctx.src_y_stride    = align_up_32(1280);
+    ctx.src_uv_stride   = align_up_32(640);
+    ctx.chroma_format   = FUSED_CHROMA_422;
+    ctx.requested_flags = FUSED_SCALE_2X;
+    ctx.options         = FUSED_OPT_NO_CROP;
+    suppress_log(&ctx);
+
+    int rc = fused_scaler_init(&ctx);
+    TEST_ASSERT_EQ(rc, FUSED_OK, "422 NO_CROP should allow odd output height");
+    TEST_ASSERT_EQ(ctx.outputs[1].width, 640, "2x output width = 640");
+    TEST_ASSERT_EQ(ctx.outputs[1].height, 381, "2x output height = 381");
+
+    fused_scaler_free(&ctx);
     TEST_PASS();
 }
 
@@ -531,14 +597,17 @@ void run_validation_tests(void)
 {
     RUN_TEST(test_valid_1080p_thirds);
     RUN_TEST(test_valid_720p_pow2);
+    RUN_TEST(test_valid_720p_pow2_422);
     RUN_TEST(test_valid_4k_full_thirds);
     RUN_TEST(test_mixed_families);
     RUN_TEST(test_empty_flags);
     RUN_TEST(test_bad_dimensions_zero);
     RUN_TEST(test_bad_dimensions_odd);
+    RUN_TEST(test_422_allows_odd_source_height);
     RUN_TEST(test_bad_alignment);
     RUN_TEST(test_crop_to_fit);
     RUN_TEST(test_no_crop_rejects);
+    RUN_TEST(test_no_crop_allows_odd_output_height_422);
     RUN_TEST(test_scalar_fallback_oddball);
     RUN_TEST(test_no_fallback_rejects);
     RUN_TEST(test_deep_step_only);

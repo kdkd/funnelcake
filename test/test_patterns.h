@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 /* --------------------------------------------------------------------------
- * Test frame: holds a synthetic YUV420 (I420) image
+ * Test frame: holds a synthetic planar YUV image
  * -------------------------------------------------------------------------- */
 
 typedef struct {
@@ -12,6 +12,7 @@ typedef struct {
     int      height;
     int      y_stride;
     int      uv_stride;
+    int      chroma_format;
     uint8_t *plane_y;
     uint8_t *plane_u;
     uint8_t *plane_v;
@@ -44,6 +45,8 @@ extern const char *pattern_names[];
  */
 int  test_frame_create(test_frame_t *frame, int width, int height,
                        test_pattern_t pattern, uint32_t seed);
+int  test_frame_create_ex(test_frame_t *frame, int width, int height,
+                          int chroma_format, test_pattern_t pattern, uint32_t seed);
 
 /*
  * Free all plane allocations and zero the struct.

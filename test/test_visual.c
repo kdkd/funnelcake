@@ -53,7 +53,7 @@ static void save_plane_png(const char *path, const uint8_t *plane,
 static void save_rgb_png(const char *path,
                           const uint8_t *y_plane, int y_stride,
                           const uint8_t *u_plane, const uint8_t *v_plane, int uv_stride,
-                          int width, int height)
+                          int width, int height, int chroma_format)
 {
     uint8_t *rgb = malloc((size_t)width * (size_t)height * 3);
     if (!rgb) {
@@ -63,8 +63,9 @@ static void save_rgb_png(const char *path,
     for (int row = 0; row < height; row++) {
         for (int col = 0; col < width; col++) {
             uint8_t yv = y_plane[row * y_stride + col];
-            uint8_t uv = u_plane[(row / 2) * uv_stride + col / 2];
-            uint8_t vv = v_plane[(row / 2) * uv_stride + col / 2];
+            int chroma_row = (chroma_format == FUSED_CHROMA_422) ? row : (row / 2);
+            uint8_t uv = u_plane[chroma_row * uv_stride + col / 2];
+            uint8_t vv = v_plane[chroma_row * uv_stride + col / 2];
             uint8_t r, g, b;
             yuv_to_rgb(yv, uv, vv, &r, &g, &b);
             int idx = (row * width + col) * 3;
@@ -186,7 +187,7 @@ void run_visual_tests(void)
                              ctx.outputs[i].plane_y, ys,
                              ctx.outputs[i].plane_u,
                              ctx.outputs[i].plane_v, uvs,
-                             ow, oh);
+                             ow, oh, ctx.chroma_format);
                 printf("  %s\n", path_rgb);
                 total_files++;
             }

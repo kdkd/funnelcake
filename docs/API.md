@@ -1,10 +1,11 @@
 # Funnelcake API Reference
 
-Funnelcake is a fused multi-resolution YUV420 downscaler. A single call
+Funnelcake is a fused multi-resolution planar YUV downscaler. A single call
 to `fused_scaler_run` produces up to four downscaled outputs in one pass,
 using AVX2 or NEON SIMD kernels with a portable scalar fallback.
 
-Input and output are I420 planar (Y, U, V separate planes), 8-bit.
+Input and output are planar 8-bit YUV with separate Y, U, and V planes.
+`FUSED_CHROMA_420` (I420) and `FUSED_CHROMA_422` (I422) are supported.
 
 
 ## Quick Start
@@ -32,6 +33,7 @@ scaler.src_width    = width;
 scaler.src_height   = height;
 scaler.src_y_stride  = y_stride;
 scaler.src_uv_stride = uv_stride;
+scaler.chroma_format = FUSED_CHROMA_420;
 scaler.requested_flags = FUSED_SCALE_1_5X | FUSED_SCALE_3X | FUSED_SCALE_6X;
 
 int rc = fused_scaler_init(&scaler);
@@ -54,6 +56,10 @@ fused_scale_output_t *out_6x   = &scaler.outputs[4]; /* FUSED_SCALE_6X   bit 4 *
 fused_scaler_free(&scaler);
 free(src_y); free(src_u); free(src_v);
 ```
+
+For `FUSED_CHROMA_422`, allocate `src_u` and `src_v` with `uv_stride * height`
+bytes instead of `uv_stride * (height / 2)`, and set
+`scaler.chroma_format = FUSED_CHROMA_422`.
 
 
 ## API Reference
@@ -145,6 +151,7 @@ a struct member. Zero-initialise before use.
 | `src_height` | `int` | Source luma height in pixels. Must be > 0 and large enough for all requested steps. |
 | `src_y_stride` | `int` | Bytes per row of the luma plane. Must be >= `src_width` and 32-byte aligned. |
 | `src_uv_stride` | `int` | Bytes per row of each chroma plane. Must be >= `src_width/2` and 32-byte aligned. |
+| `chroma_format` | `int` | `FUSED_CHROMA_420` or `FUSED_CHROMA_422`. Zero-init contexts default to `FUSED_CHROMA_420`. |
 | `requested_flags` | `uint32_t` | Bitmask of `FUSED_SCALE_*` flags. All set bits must belong to the same family (thirds or pow2). |
 | `options` | `uint32_t` | Bitmask of `FUSED_OPT_*` flags. Zero means default (lenient) behavior. |
 | `log_errors` | `fused_log_config_t` | Logging target for hard errors. Zero-value = stderr. |
@@ -161,6 +168,9 @@ a struct member. Zero-initialise before use.
 | `outputs[8]` | `fused_scale_output_t` | One slot per bit position. Slots for steps not in `achieved_flags` have NULL plane pointers. |
 
 The `_internal` field is opaque; do not read or write it.
+
+`FUSED_CHROMA_420` uses half-width, half-height chroma planes. `FUSED_CHROMA_422`
+uses half-width, full-height chroma planes.
 
 ---
 
@@ -343,6 +353,9 @@ uint8_t *plane_u = aligned_alloc(32, uv_stride * (height / 2));
 uint8_t *plane_v = aligned_alloc(32, uv_stride * (height / 2));
 ```
 
+For `FUSED_CHROMA_422`, allocate the chroma planes with `uv_stride * height`
+bytes instead.
+
 Misaligned strides cause `fused_scaler_init` to return
 `FUSED_ERR_BAD_ALIGNMENT`. Misaligned buffer pointers do not cause a
 hard error at init time but will produce incorrect results or faults
@@ -362,13 +375,16 @@ AVFrame planes map directly to the scaler's source parameters:
 #include "funnelcake.h"
 #include <libavcodec/avcodec.h>
 
-/* frame is an AVFrame* with format AV_PIX_FMT_YUV420P */
+/* frame is an AVFrame* with format AV_PIX_FMT_YUV420P or AV_PIX_FMT_YUV422P */
 
 fused_scaler_ctx_t scaler = {0};
 scaler.src_width     = frame->width;
 scaler.src_height    = frame->height;
 scaler.src_y_stride  = frame->linesize[0];
 scaler.src_uv_stride = frame->linesize[1];
+scaler.chroma_format = (frame->format == AV_PIX_FMT_YUV422P)
+                       ? FUSED_CHROMA_422
+                       : FUSED_CHROMA_420;
 scaler.requested_flags = FUSED_SCALE_1_5X | FUSED_SCALE_3X | FUSED_SCALE_6X;
 
 int rc = fused_scaler_init(&scaler);

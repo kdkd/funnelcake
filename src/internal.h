@@ -29,6 +29,8 @@ typedef struct {
     int src_height;         /* luma rows in the effective region            */
     int src_y_stride;       /* bytes per luma row in the source buffer      */
     int src_uv_stride;      /* bytes per chroma row in the source buffer    */
+    int src_uv_height;      /* chroma rows in the effective source region   */
+    int chroma_format;      /* FUSED_CHROMA_*                               */
 
     /* Kernel family and cascade shape */
     int family;             /* FUSED_FAMILY_THIRDS or FUSED_FAMILY_POW2     */

@@ -1,4 +1,5 @@
 #include "test_patterns.h"
+#include "funnelcake.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
@@ -23,6 +24,11 @@ const char *pattern_names[] = {
 static int align_up_32(int x)
 {
     return (x + 31) & ~31;
+}
+
+static int chroma_height_for(const test_frame_t *f)
+{
+    return (f->chroma_format == FUSED_CHROMA_422) ? f->height : (f->height / 2);
 }
 
 /* Allocate a 32-byte aligned plane of (stride * rows) bytes. */
@@ -56,7 +62,7 @@ static void fill_solid(test_frame_t *f)
     for (int y = 0; y < f->height; y++)
         memset(f->plane_y + y * f->y_stride, 128, (size_t)f->width);
 
-    int ch = f->height / 2;
+    int ch = chroma_height_for(f);
     int cw = f->width  / 2;
     for (int y = 0; y < ch; y++) {
         memset(f->plane_u + y * f->uv_stride, 128, (size_t)cw);
@@ -74,7 +80,7 @@ static void fill_hgradient(test_frame_t *f)
         }
     }
 
-    int ch = f->height / 2;
+    int ch = chroma_height_for(f);
     int cw = f->width  / 2;
     for (int y = 0; y < ch; y++) {
         uint8_t *ru = f->plane_u + y * f->uv_stride;
@@ -95,7 +101,7 @@ static void fill_vgradient(test_frame_t *f)
         memset(f->plane_y + y * f->y_stride, val, (size_t)f->width);
     }
 
-    int ch = f->height / 2;
+    int ch = chroma_height_for(f);
     int cw = f->width  / 2;
     for (int y = 0; y < ch; y++) {
         uint8_t val = (uint8_t)((y * 255) / (ch > 1 ? ch - 1 : 1));
@@ -118,7 +124,7 @@ static void fill_checkerboard(test_frame_t *f)
 
     /* Chroma block_size=4, values 16 and 240 */
     int cbs = 4;
-    int ch = f->height / 2;
+    int ch = chroma_height_for(f);
     int cw = f->width  / 2;
     for (int y = 0; y < ch; y++) {
         uint8_t *ru = f->plane_u + y * f->uv_stride;
@@ -143,7 +149,7 @@ static void fill_random(test_frame_t *f, uint32_t seed)
         }
     }
 
-    int ch = f->height / 2;
+    int ch = chroma_height_for(f);
     int cw = f->width  / 2;
     for (int y = 0; y < ch; y++) {
         uint8_t *ru = f->plane_u + y * f->uv_stride;
@@ -162,7 +168,14 @@ static void fill_random(test_frame_t *f, uint32_t seed)
 int test_frame_create(test_frame_t *frame, int width, int height,
                       test_pattern_t pattern, uint32_t seed)
 {
+    return test_frame_create_ex(frame, width, height, FUSED_CHROMA_420, pattern, seed);
+}
+
+int test_frame_create_ex(test_frame_t *frame, int width, int height,
+                         int chroma_format, test_pattern_t pattern, uint32_t seed)
+{
     if (!frame || width <= 0 || height <= 0) return -1;
+    if (chroma_format != FUSED_CHROMA_420 && chroma_format != FUSED_CHROMA_422) return -1;
 
     memset(frame, 0, sizeof(*frame));
 
@@ -170,10 +183,11 @@ int test_frame_create(test_frame_t *frame, int width, int height,
     frame->height    = height;
     frame->y_stride  = align_up_32(width);
     frame->uv_stride = align_up_32(width / 2);
+    frame->chroma_format = chroma_format;
 
     frame->plane_y = alloc_plane(frame->y_stride, height);
-    frame->plane_u = alloc_plane(frame->uv_stride, height / 2);
-    frame->plane_v = alloc_plane(frame->uv_stride, height / 2);
+    frame->plane_u = alloc_plane(frame->uv_stride, chroma_height_for(frame));
+    frame->plane_v = alloc_plane(frame->uv_stride, chroma_height_for(frame));
 
     if (!frame->plane_y || !frame->plane_u || !frame->plane_v) {
         test_frame_free(frame);

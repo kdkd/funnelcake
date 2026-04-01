@@ -12,6 +12,11 @@
 
 static int align_up_32(int v) { return (v + 31) & ~31; }
 
+static int chroma_height_for(int height, int chroma_format)
+{
+    return (chroma_format == FUSED_CHROMA_422) ? height : (height / 2);
+}
+
 static void suppress_log(fused_scaler_ctx_t *ctx)
 {
     ctx->log_warnings.target = FUSED_LOG_SUPPRESS;
@@ -23,10 +28,11 @@ static void suppress_log(fused_scaler_ctx_t *ctx)
  * Run with a solid-16 source and check if any output pixel is non-zero.
  * Returns 1 if output was written (scalar kernel active), 0 if not (SIMD stub).
  */
-static int kernel_produces_output(int src_w, int src_h, uint32_t flags)
+static int kernel_produces_output_ex(int src_w, int src_h, int chroma_format,
+                                     uint32_t flags)
 {
     test_frame_t frame;
-    if (test_frame_create(&frame, src_w, src_h, PATTERN_SOLID, 0) != 0)
+    if (test_frame_create_ex(&frame, src_w, src_h, chroma_format, PATTERN_SOLID, 0) != 0)
         return 0;
 
     /* Override Y to 200 so we can detect zero output clearly */
@@ -39,6 +45,7 @@ static int kernel_produces_output(int src_w, int src_h, uint32_t flags)
     ctx.src_height    = frame.height;
     ctx.src_y_stride  = frame.y_stride;
     ctx.src_uv_stride = frame.uv_stride;
+    ctx.chroma_format = frame.chroma_format;
     ctx.requested_flags = flags;
     suppress_log(&ctx);
 
@@ -66,6 +73,11 @@ static int kernel_produces_output(int src_w, int src_h, uint32_t flags)
     fused_scaler_free(&ctx);
     test_frame_free(&frame);
     return written;
+}
+
+static int kernel_produces_output(int src_w, int src_h, uint32_t flags)
+{
+    return kernel_produces_output_ex(src_w, src_h, FUSED_CHROMA_420, flags);
 }
 
 /* --------------------------------------------------------------------------
@@ -129,6 +141,60 @@ static void test_solid_color_preservation(void)
         test_frame_free(&frame);
     }
 
+    TEST_PASS();
+}
+
+static void test_solid_color_preservation_422(void)
+{
+    uint32_t flags = FUSED_SCALE_2X | FUSED_SCALE_4X;
+
+    if (!kernel_produces_output_ex(1280, 720, FUSED_CHROMA_422, flags)) {
+        TEST_SKIP("SIMD kernel active but not yet implemented — skipping pixel checks");
+    }
+
+    test_frame_t frame;
+    int r = test_frame_create_ex(&frame, 1280, 720, FUSED_CHROMA_422, PATTERN_SOLID, 0);
+    TEST_ASSERT(r == 0, "test_frame_create_ex failed");
+
+    fused_scaler_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.src_width       = frame.width;
+    ctx.src_height      = frame.height;
+    ctx.src_y_stride    = frame.y_stride;
+    ctx.src_uv_stride   = frame.uv_stride;
+    ctx.chroma_format   = frame.chroma_format;
+    ctx.requested_flags = flags;
+    suppress_log(&ctx);
+
+    int rc = fused_scaler_init(&ctx);
+    TEST_ASSERT(rc >= 0, "fused_scaler_init failed");
+
+    fused_scaler_run(&ctx, frame.plane_y, frame.plane_u, frame.plane_v);
+
+    for (int i = 0; i < 8; i++) {
+        if (!ctx.outputs[i].plane_y) continue;
+        int cw = ctx.outputs[i].width / 2;
+        int ch = ctx.outputs[i].height;
+        for (int y = 0; y < ch; y++) {
+            const uint8_t *row_u = ctx.outputs[i].plane_u + y * ctx.outputs[i].uv_stride;
+            const uint8_t *row_v = ctx.outputs[i].plane_v + y * ctx.outputs[i].uv_stride;
+            for (int x = 0; x < cw; x++) {
+                int du = (int)row_u[x] - 128;
+                int dv = (int)row_v[x] - 128;
+                if (du < -1 || du > 1 || dv < -1 || dv > 1) {
+                    printf("\n  FAIL [%s:%d] solid 422 chroma: output[%d] pixel(%d,%d) U=%d V=%d, expected 128±1\n",
+                           __func__, __LINE__, i, x, y, row_u[x], row_v[x]);
+                    g_results.failed++;
+                    fused_scaler_free(&ctx);
+                    test_frame_free(&frame);
+                    return;
+                }
+            }
+        }
+    }
+
+    fused_scaler_free(&ctx);
+    test_frame_free(&frame);
     TEST_PASS();
 }
 
@@ -331,6 +397,28 @@ static void test_output_dimensions(void)
     TEST_PASS();
 }
 
+static void test_output_dimensions_422(void)
+{
+    fused_scaler_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.src_width       = 1280;
+    ctx.src_height      = 762;
+    ctx.src_y_stride    = align_up_32(1280);
+    ctx.src_uv_stride   = align_up_32(640);
+    ctx.chroma_format   = FUSED_CHROMA_422;
+    ctx.requested_flags = FUSED_SCALE_2X;
+    ctx.options         = FUSED_OPT_NO_CROP;
+    suppress_log(&ctx);
+
+    int rc = fused_scaler_init(&ctx);
+    TEST_ASSERT_EQ(rc, FUSED_OK, "422 output dimensions init failed");
+    TEST_ASSERT_EQ(ctx.outputs[1].width, 640, "422 output width");
+    TEST_ASSERT_EQ(ctx.outputs[1].height, 381, "422 output height");
+
+    fused_scaler_free(&ctx);
+    TEST_PASS();
+}
+
 /* --------------------------------------------------------------------------
  * 5. test_buffer_alignment
  *    For a 1920x1080 frame, verify all output plane pointers are 32-byte
@@ -413,7 +501,7 @@ static void test_random_pixel_range(void)
         int ys  = ctx.outputs[i].y_stride;
         int uvs = ctx.outputs[i].uv_stride;
         int cw  = ow / 2;
-        int ch  = oh / 2;
+        int ch  = chroma_height_for(oh, ctx.chroma_format);
         volatile uint8_t sink = 0;
         for (int y = 0; y < oh; y++)
             for (int x = 0; x < ow; x++)
@@ -513,9 +601,11 @@ static void test_checkerboard_scaling(void)
 void run_correctness_tests(void)
 {
     RUN_TEST(test_solid_color_preservation);
+    RUN_TEST(test_solid_color_preservation_422);
     RUN_TEST(test_hgradient_monotonicity);
     RUN_TEST(test_vgradient_monotonicity);
     RUN_TEST(test_output_dimensions);
+    RUN_TEST(test_output_dimensions_422);
     RUN_TEST(test_buffer_alignment);
     RUN_TEST(test_random_pixel_range);
     RUN_TEST(test_checkerboard_scaling);

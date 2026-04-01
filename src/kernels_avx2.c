@@ -5,7 +5,7 @@
  *   fused_kernel_pow2_avx2   — power-of-two family (2x/4x/8x/16x)
  *   fused_kernel_thirds_avx2 — thirds family (1.5x/3x/6x/12x)
  *
- * Both process YUV420 I420 frames plane-by-plane.  The vertical phase uses
+ * Both process planar 4:2:0 / 4:2:2 frames plane-by-plane. The vertical phase uses
  * AVX2 intrinsics (_mm256_avg_epu8, widening multiply for bilinear blends).
  * The horizontal phase uses AVX2 for pow2 (pairwise average cascade) and
  * SSE for thirds (deinterleave via _mm_shuffle_epi8, bilinear 3:2 and
@@ -1063,7 +1063,9 @@ void __attribute__((hot)) fused_kernel_pow2_avx2(const fused_kernel_params_t *p,
             u_planes[k]  = p->out[b].plane_u;
             v_planes[k]  = p->out[b].plane_v;
             uv_widths[k]  = p->out[b].width / 2;
-            uv_heights[k] = p->out[b].height / 2;
+            uv_heights[k] = (p->chroma_format == FUSED_CHROMA_422)
+                            ? p->out[b].height
+                            : (p->out[b].height / 2);
             uv_strides[k] = p->out[b].uv_stride;
         } else {
             y_planes[k] = u_planes[k] = v_planes[k] = NULL;
@@ -1078,15 +1080,15 @@ void __attribute__((hot)) fused_kernel_pow2_avx2(const fused_kernel_params_t *p,
                           p->active_outputs,
                           y_planes, y_widths, y_strides, y_heights);
 
-    /* U plane (half dimensions) */
+    /* U plane */
     scale_plane_pow2_avx2(src_u,
-                          p->src_width / 2, p->src_height / 2, p->src_uv_stride,
+                          p->src_width / 2, p->src_uv_height, p->src_uv_stride,
                           p->active_outputs,
                           u_planes, uv_widths, uv_strides, uv_heights);
 
-    /* V plane (half dimensions) */
+    /* V plane */
     scale_plane_pow2_avx2(src_v,
-                          p->src_width / 2, p->src_height / 2, p->src_uv_stride,
+                          p->src_width / 2, p->src_uv_height, p->src_uv_stride,
                           p->active_outputs,
                           v_planes, uv_widths, uv_strides, uv_heights);
 
@@ -1116,7 +1118,9 @@ void __attribute__((hot)) fused_kernel_thirds_avx2(const fused_kernel_params_t *
             u_planes[k]  = p->out[b].plane_u;
             v_planes[k]  = p->out[b].plane_v;
             uv_widths[k]  = p->out[b].width / 2;
-            uv_heights[k] = p->out[b].height / 2;
+            uv_heights[k] = (p->chroma_format == FUSED_CHROMA_422)
+                            ? p->out[b].height
+                            : (p->out[b].height / 2);
             uv_strides[k] = p->out[b].uv_stride;
         } else {
             y_planes[k] = u_planes[k] = v_planes[k] = NULL;
@@ -1131,15 +1135,15 @@ void __attribute__((hot)) fused_kernel_thirds_avx2(const fused_kernel_params_t *
                             p->active_outputs,
                             y_planes, y_widths, y_strides, y_heights);
 
-    /* U plane (half dimensions) */
+    /* U plane */
     scale_plane_thirds_avx2(src_u,
-                            p->src_width / 2, p->src_height / 2, p->src_uv_stride,
+                            p->src_width / 2, p->src_uv_height, p->src_uv_stride,
                             p->active_outputs,
                             u_planes, uv_widths, uv_strides, uv_heights);
 
-    /* V plane (half dimensions) */
+    /* V plane */
     scale_plane_thirds_avx2(src_v,
-                            p->src_width / 2, p->src_height / 2, p->src_uv_stride,
+                            p->src_width / 2, p->src_uv_height, p->src_uv_stride,
                             p->active_outputs,
                             v_planes, uv_widths, uv_strides, uv_heights);
 

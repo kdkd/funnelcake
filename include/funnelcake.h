@@ -93,6 +93,11 @@ extern "C" {
  * Types
  * -------------------------------------------------------------------------- */
 
+/* Supported planar YUV chroma layouts.
+ * Zero-initialised contexts default to YUV420 for backward compatibility. */
+#define FUSED_CHROMA_420 0   /* I420: chroma width = luma/2, height = luma/2 */
+#define FUSED_CHROMA_422 1   /* I422: chroma width = luma/2, height = luma    */
+
 /*
  * Logging configuration. Zero-initialised struct means FUSED_LOG_STDERR.
  *
@@ -140,6 +145,7 @@ typedef struct {
     int      src_height;
     int      src_y_stride;
     int      src_uv_stride;
+    int      chroma_format;   /* FUSED_CHROMA_*; zero-init defaults to 420 */
 
     /* Configuration — set by caller before init */
     uint32_t requested_flags;   /* FUSED_SCALE_* bitmask (one family only) */
@@ -182,11 +188,13 @@ int fused_scaler_init(fused_scaler_ctx_t *ctx);
 /*
  * fused_scaler_run — process one input frame and fill all achieved outputs.
  *
- * src_y, src_u, src_v must point to the start of the YUV420 I420 planes
- * for the current frame. Strides come from ctx->src_y_stride and
- * ctx->src_uv_stride. Buffers must remain valid for the duration of the
- * call. Only the effective region (ctx->effective_width x
- * ctx->effective_height) is read; pixels outside this region are ignored.
+ * src_y, src_u, src_v must point to the start of the planar source frame
+ * for the current frame. Supported chroma layouts are FUSED_CHROMA_420
+ * (I420) and FUSED_CHROMA_422 (I422). Strides come from
+ * ctx->src_y_stride and ctx->src_uv_stride. Buffers must remain valid for
+ * the duration of the call. Only the effective region
+ * (ctx->effective_width x ctx->effective_height) is read; pixels outside
+ * this region are ignored.
  *
  * Must only be called after a successful fused_scaler_init (return >= 0).
  */

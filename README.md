@@ -92,10 +92,12 @@ YUV420 frames using bilinear scaling:
 
 | Case | Funnelcake mean | `ffmpeg` avg / frame | Speedup |
 |------|----------------:|---------------------:|--------:|
-| 960×540 thirds | 68 µs | 1055 µs | 15.5× |
-| 1280×720 pow2 | 66 µs | 1425 µs | 21.6× |
-| 1920×1080 thirds | 296 µs | 5620 µs | 19.0× |
-| 3840×2160 thirds | 1575 µs | 28050 µs | 17.8× |
+| 960×540 thirds 420 | 68 µs | 1055 µs | 15.5× |
+| 1280×720 pow2 420 | 66 µs | 1425 µs | 21.6× |
+| 1280×720 pow2 422 | 87 µs | 1890 µs | 21.7× |
+| 1920×1080 thirds 420 | 296 µs | 5620 µs | 19.0× |
+| 1920×1080 thirds 422 | 413 µs | 7460 µs | 18.1× |
+| 3840×2160 thirds 420 | 1575 µs | 28050 µs | 17.8× |
 
 These `ffmpeg` numbers include CLI and filtergraph overhead, so they are not
 as clean as an in-process libswscale benchmark. Even with that caveat, the gap

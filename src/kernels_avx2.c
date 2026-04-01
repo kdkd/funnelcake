@@ -5,12 +5,24 @@
  *   fused_kernel_pow2_avx2   — power-of-two family (2x/4x/8x/16x)
  *   fused_kernel_thirds_avx2 — thirds family (1.5x/3x/6x/12x)
  *
- * Both process YUV420 I420 frames plane-by-plane.  The vertical phase uses
- * AVX2 intrinsics (_mm256_avg_epu8, widening multiply for bilinear blends).
- * The horizontal phase uses AVX2 for pow2 (pairwise average cascade) and
- * SSE for thirds (deinterleave via _mm_shuffle_epi8, bilinear 3:2 and
- * box-of-3 patterns).  The thirds horizontal filters use 128-bit SSE
- * operations to avoid vpshufb lane-crossing issues.
+ * Both process YUV420 I420 frames plane-by-plane.
+ *
+ * "Fused" means vertical and horizontal reduction happen in the same pass
+ * over source memory, rather than scaling vertically into an intermediate
+ * full-width row buffer and then horizontally in a second pass.
+ *
+ * The thirds kernel (1.5x/3x/6x/12x) reads source rows in groups of 6,
+ * which matches the vertical period of the thirds reduction.  All 6 rows
+ * are loaded simultaneously into YMM registers so the vertical intermediates
+ * (pair averages and bilinear blends) never need to be written to memory.
+ * For each 96-byte column chunk, horizontal filtering is applied immediately
+ * before moving to the next chunk, so no intermediate row buffer is needed.
+ *
+ * The pow2 kernel (2x/4x/8x/16x) uses a vertical cascade — pairwise row
+ * averaging written to temporary buffers — followed by a horizontal halving
+ * cascade from those buffers.  Power-of-two vertical reduction doesn't
+ * benefit from the fused approach in the same way because there is no fixed
+ * small row-group period to keep in registers.
  *
  * Guarded by __x86_64__ so this file is a no-op on other platforms.
  */
@@ -26,16 +38,37 @@
  * Scalar helpers (used for tail bytes and horizontal thirds phase)
  * ----------------------------------------------------------------------- */
 
+/* avg_u8: rounded average of two bytes, (a+b+1)>>1.  The +1 causes ties to
+ * round up, which matches the rounding behavior of vpavgb (x86) and
+ * vrhaddq_u8 (NEON).  Keeping scalar and SIMD paths consistent matters for
+ * correctness of the tail handling. */
 static inline uint8_t avg_u8(uint8_t a, uint8_t b)
 {
     return (uint8_t)(((uint16_t)a + (uint16_t)b + 1) >> 1);
 }
 
+/* blend_2_1: bilinear blend for the 3:2 horizontal reduction.
+ *
+ * In a 3:2 reduction, each source triplet (A, B, C) produces two output
+ * pixels.  The first output sits 1/3 of the way through the triplet
+ * (weighted toward A), the second sits 2/3 of the way (weighted toward C).
+ * B is the center pixel shared between both blends.
+ *
+ *   output at 1/3: (A*171 + B*85 + 128) >> 8   [call as blend_2_1(A, B)]
+ *   output at 2/3: (C*171 + B*85 + 128) >> 8   [call as blend_2_1(C, B)]
+ *
+ * The weights 171/256 ≈ 2/3 and 85/256 ≈ 1/3 implement bilinear
+ * interpolation via integer multiply-and-shift instead of division. */
 static inline uint8_t blend_2_1(uint8_t a, uint8_t b)
 {
     return (uint8_t)(((uint16_t)a * 171 + (uint16_t)b * 85 + 128) >> 8);
 }
 
+/* div3_u16: integer division by 3 for the 3x (box-of-3) horizontal filter.
+ *
+ * (x * 0x5556) >> 16 is an integer approximation of x/3.  The magic
+ * multiplier 0x5556/0x10000 = 21846/65536 ≈ 1/3, and the result is exact
+ * for all x in [0, 765] — the maximum sum of three uint8 values. */
 static inline uint8_t div3_u16(uint16_t sum)
 {
     return (uint8_t)((sum * (uint32_t)0x5556) >> 16);
@@ -44,12 +77,25 @@ static inline uint8_t div3_u16(uint16_t sum)
 /* -----------------------------------------------------------------------
  * SSE shuffle tables for 3-way deinterleave (used by horizontal thirds)
  *
+ * The thirds horizontal filter needs to operate separately on the first,
+ * second, and third pixel of each source triplet (A, B, C respectively)
+ * as SIMD vectors.  In memory the bytes are laid out ABCABCABCABC...  To
+ * process 16 output pixels we read 48 source bytes (16 triplets) and must
+ * separate them into three 16-element vectors.
+ *
+ * _mm_shuffle_epi8 can only move bytes within a single 128-bit register.
+ * The 48 bytes span three registers (r0, r1, r2), and each component's
+ * bytes are spread across all three depending on where in the ABC pattern
+ * they fall.  The solution is to apply a separate shuffle to each register
+ * with 0x80 zeroing the positions that belong to the other two registers,
+ * then OR the three partial results into the final vector.
+ *
  * Given 48 contiguous bytes in three 128-bit registers (r0, r1, r2),
  * extract three 16-byte component vectors:
  *   A[g] = src[3g], B[g] = src[3g+1], C[g] = src[3g+2]  for g=0..15
  *
- * Each component needs bytes from all three input registers.  The 0x80
- * value in _mm_shuffle_epi8 zeroes that output position.
+ * The 0x80 value in _mm_shuffle_epi8 zeroes that output position, so OR
+ * cleanly merges the three partial results.
  * ----------------------------------------------------------------------- */
 
 #define ALIGN16 __attribute__((aligned(16)))
@@ -69,10 +115,11 @@ static const uint8_t ALIGN16 shuf_C_r0[16] = { 2, 5, 8, 11, 14, 0x80,0x80,0x80,0
 static const uint8_t ALIGN16 shuf_C_r1[16] = { 0x80,0x80,0x80,0x80,0x80, 1, 4, 7, 10, 13, 0x80,0x80,0x80,0x80,0x80,0x80 };
 static const uint8_t ALIGN16 shuf_C_r2[16] = { 0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80, 0, 3, 6, 9, 12, 15 };
 
-/* Deinterleave 48 contiguous bytes (3 x __m128i) into three 16-byte
- * component vectors using SSSE3 _mm_shuffle_epi8.  Each output byte
- * comes from exactly one input register; the other two contribute 0x00
- * via the 0x80 mask, so OR combines them. */
+/* Separates 48 interleaved bytes (stored as ABC...ABC across r0, r1, r2)
+ * into three 16-element component vectors using the shuffle tables above.
+ * Each shuffle selects the bytes belonging to one component from one
+ * register and zeroes the rest via the 0x80 mask; OR combines the three
+ * partial results into the final vector. */
 static inline void deinterleave_3x16(__m128i r0, __m128i r1, __m128i r2,
                                       __m128i *out_A, __m128i *out_B, __m128i *out_C)
 {
@@ -104,7 +151,12 @@ static inline void deinterleave_3x16(__m128i r0, __m128i r1, __m128i r2,
 
 /* Horizontal 3x filter (SSE): box average of 3 source pixels.
  * Processes 48 input -> 16 output bytes per SSE chunk.
- * Division by 3 via (sum * 0x5556) >> 16 using _mm_mulhi_epu16. */
+ *
+ * The three uint8 components are widened to 16-bit before summing because
+ * their sum can reach 765 (3 * 255), which overflows uint8.  Division by 3
+ * is performed with _mm_mulhi_epu16 using the magic multiplier 0x5556
+ * (the same approximation as div3_u16), which avoids an actual division
+ * instruction and gives exact results for sums in [0, 765]. */
 static void h_filter_3x(const uint8_t *restrict src, int src_w,
                          uint8_t *restrict dst, int dst_w)
 {
@@ -143,7 +195,19 @@ static void h_filter_3x(const uint8_t *restrict src, int src_w,
 
 /* Horizontal 1.5x filter (SSE): 3:2 bilinear reduction.
  * Every 3 source pixels -> 2 output pixels via weighted blend.
- * Processes 48 input -> 32 output bytes per SSE chunk. */
+ * Processes 48 input -> 32 output bytes per SSE chunk.
+ *
+ * Geometry: each source triplet (A, B, C) produces two output pixels.
+ * Output pixel 0 sits 1/3 of the way through the triplet (closer to A)
+ * and is computed as (A*171 + B*85 + 128) >> 8.  Output pixel 1 sits
+ * 2/3 of the way (closer to C) and is (C*171 + B*85 + 128) >> 8.  Both
+ * share B as the center influence.  The inputs are widened to 16-bit
+ * before multiplying because the weighted sum can slightly exceed 255
+ * before the shift.
+ *
+ * The interleave step at the end reorders the data from [all out0 pixels,
+ * all out1 pixels] into the correct memory layout [out0[0], out1[0],
+ * out0[1], out1[1], ...] using _mm_unpacklo/hi_epi8. */
 static void h_filter_1_5x(const uint8_t *restrict src, int src_w,
                            uint8_t *restrict dst, int dst_w)
 {
@@ -225,9 +289,11 @@ static void h_filter_halve(const uint8_t *restrict src,
 /* -----------------------------------------------------------------------
  * AVX2 vertical blend helper
  *
- * Computes (a * 171 + b * 85 + 128) >> 8 for 32 bytes using AVX2.
- * Widens to 16-bit, multiplies, accumulates, narrows back.
- * Uses _mm256_permute4x64_epi64 to fix packus lane-crossing.
+ * Computes (a * 171 + b * 85 + 128) >> 8 across 32 bytes using AVX2.
+ * Widens both inputs to 16-bit per lane, multiplies with the 2/3 and 1/3
+ * blend weights, accumulates the rounding constant, shifts right by 8,
+ * and packs back to 8-bit.  This is the SIMD equivalent of the scalar
+ * blend_2_1 function.
  * ----------------------------------------------------------------------- */
 
 static inline __m256i avx2_blend_2_1(__m256i a, __m256i b)
@@ -262,43 +328,42 @@ static inline __m256i avx2_blend_2_1(__m256i a, __m256i b)
     );
     blend_hi = _mm256_srli_epi16(blend_hi, 8);
 
-    /* Pack 16-bit back to 8-bit unsigned.
-     * _mm256_packus_epi16 interleaves the two 128-bit lanes:
-     *   result lane 0 = pack(blend_lo lane 0, blend_hi lane 0)
-     *   result lane 1 = pack(blend_lo lane 1, blend_hi lane 1)
-     * This is already the correct byte order within each lane,
-     * matching the original interleave from unpacklo/unpackhi. */
-    __m256i packed = _mm256_packus_epi16(blend_lo, blend_hi);
-
-    /* Fix the lane crossing from packus:
-     * packus puts:
-     *   lane 0: blend_lo[lane0] | blend_hi[lane0]  (bytes 0-7 | 8-15)
-     *   lane 1: blend_lo[lane1] | blend_hi[lane1]  (bytes 16-23 | 24-31)
-     * which is correct -- the 64-bit quadwords are already in the right order.
-     * Actually, packus with (lo, hi) gives:
-     *   lane 0: lo.lane0_8x16 | hi.lane0_8x16  = qwords 0,1
-     *   lane 1: lo.lane1_8x16 | hi.lane1_8x16  = qwords 2,3
-     * Our unpack put bytes [0-7] in lo.lane0 and [16-23] in lo.lane1,
-     * bytes [8-15] in hi.lane0 and [24-31] in hi.lane1.
-     * So after packus we have:
-     *   lane 0: bytes [0-7] | bytes [8-15]    = correct!
-     *   lane 1: bytes [16-23] | bytes [24-31] = correct!
-     * No permute needed -- the data is in order. */
-
-    return packed;
+    /* _mm256_packus_epi16(lo, hi) narrows per-lane: lane 0 gets
+     * lo.lane0 (bytes 0-7) | hi.lane0 (bytes 8-15), lane 1 gets
+     * lo.lane1 (bytes 16-23) | hi.lane1 (bytes 24-31).  Since
+     * unpacklo/unpackhi also operate per-lane, each half's lane
+     * affiliation is preserved through the widen-multiply-narrow cycle,
+     * and the packed result is already in the correct byte order across
+     * both lanes. */
+    return _mm256_packus_epi16(blend_lo, blend_hi);
 }
 
 /* -----------------------------------------------------------------------
  * AVX2 horizontal halving helper
  *
  * Takes 32 input bytes, produces 16 output bytes by averaging adjacent
- * pairs: out[i] = avg(in[2i], in[2i+1]).
+ * pairs: out[i] = avg(in[2i], in[2i+1]).  Returns a __m128i.
  *
- * Strategy: shuffle to separate even and odd bytes within each 128-bit
- * lane, then average, then fix lane ordering with permute4x64.
+ * We can't simply vpavgb two registers directly, because the pairs we
+ * want to average (bytes 0&1, 2&3, etc.) are interleaved within a single
+ * 32-byte register, not split across two registers.  The strategy is to
+ * first gather all even-indexed bytes into one register and all
+ * odd-indexed bytes into another, then average them.
  *
- * Returns a 128-bit result in the low half of a 256-bit register.
- * The caller should extract with _mm256_castsi256_si128 or store 16 bytes.
+ * Step 1: _mm256_shuffle_epi8 with the shuf_even_odd mask reorders bytes
+ * within each 128-bit lane so even-indexed bytes occupy the low 8 bytes
+ * and odd-indexed bytes occupy the high 8 bytes.
+ *
+ * Step 2: _mm256_permute4x64_epi64 with control 0xD8 = 0b_11_01_10_00
+ * rearranges the four 64-bit quadwords across the 256-bit register:
+ *   output qword 0 <- src qword 0 (even bytes from lane 0)
+ *   output qword 1 <- src qword 2 (even bytes from lane 1)
+ *   output qword 2 <- src qword 1 (odd bytes from lane 0)
+ *   output qword 3 <- src qword 3 (odd bytes from lane 1)
+ * After this, the low 128 bits hold all 16 even bytes and the high 128
+ * bits hold all 16 odd bytes.
+ *
+ * Step 3: extract the two halves and _mm_avg_epu8 them.
  * ----------------------------------------------------------------------- */
 
 static inline __m128i avx2_halve_32_to_16(__m256i v)
@@ -342,18 +407,45 @@ static inline __m128i avx2_halve_32_to_16(__m256i v)
 
 
 /* -----------------------------------------------------------------------
- * AVX2 256-bit deinterleave: 96 contiguous bytes (3 x __m256i) → three
+ * AVX2 256-bit deinterleave: 96 contiguous bytes (3 x __m256i) into three
  * 32-byte component vectors.
  *
  * Input: reg_a (bytes 0-31), reg_b (bytes 32-63), reg_c (bytes 64-95).
  * Output: A[g]=src[3g], B[g]=src[3g+1], C[g]=src[3g+2] for g=0..31.
  *
- * Strategy: rearrange with vperm2i128 so each 128-bit lane holds one
- * independent 48-byte group, then broadcast the existing 128-bit shuffle
- * masks and apply vpshufb per-lane.
+ * The 96 bytes are interleaved ABCABC... and we need to separate them into
+ * three 32-byte component vectors.
  *
- *   Group 1 (bytes  0-47): a.lo, a.hi, b.lo
- *   Group 2 (bytes 48-95): b.hi, c.lo, c.hi
+ * AVX2's vpshufb works independently within each 128-bit lane — a byte
+ * can only be moved to another position within the same 16-byte lane, not
+ * across the lane boundary.  This means we can't apply 32-byte shuffles
+ * directly to reg_a/reg_b/reg_c as loaded.
+ *
+ * The solution is to split the 96 bytes into two independent 48-byte groups
+ * and place each group's three 16-byte sub-blocks into the corresponding
+ * lanes of three new registers.  Then vpshufb with a broadcast mask
+ * processes both groups in parallel, one per lane.
+ *
+ *   Group 1 (bytes  0-47): a.lo = bytes  0-15 ("r0")
+ *                           a.hi = bytes 16-31 ("r1")
+ *                           b.lo = bytes 32-47 ("r2")
+ *   Group 2 (bytes 48-95): b.hi = bytes 48-63 ("r0")
+ *                           c.lo = bytes 64-79 ("r1")
+ *                           c.hi = bytes 80-95 ("r2")
+ *
+ * _mm256_permute2x128_si256(a, b, imm8): bits [1:0] select which
+ * 128-bit source from a/b goes to output lane 0; bits [5:4] select
+ * output lane 1.
+ *   0x30 = 0b00_11_00_00: lane0 <- a.lane0, lane1 <- b.lane1
+ *   0x21 = 0b00_10_00_01: lane0 <- a.lane1, lane1 <- b.lane0
+ *
+ * This produces:
+ *   nr0 = permute(reg_a, reg_b, 0x30): [a.lo | b.hi]  ("r0" for each group)
+ *   nr1 = permute(reg_a, reg_c, 0x21): [a.hi | c.lo]  ("r1" for each group)
+ *   nr2 = permute(reg_b, reg_c, 0x30): [b.lo | c.hi]  ("r2" for each group)
+ *
+ * Broadcasting the same 128-bit shuffle masks to both lanes and applying
+ * vpshufb then deinterleaves both groups simultaneously.
  * ----------------------------------------------------------------------- */
 
 static inline void deinterleave_3x32(__m256i reg_a, __m256i reg_b, __m256i reg_c,
@@ -403,16 +495,18 @@ static inline void deinterleave_3x32(__m256i reg_a, __m256i reg_b, __m256i reg_c
  *
  * Produces 64 output bytes (32 per group) stored at dst.
  *
- * Lane crossing note: _mm256_unpacklo/hi_epi8 and _mm256_packus_epi16
- * both operate per-lane, so after packus we have:
- *   out0 lane 0 = group1 blend results (16 bytes)
- *   out0 lane 1 = group2 blend results (16 bytes)
- * After interleaving out0/out1 with unpacklo/hi, we get:
- *   interl_lo: [group1_interl_lo(16) | group2_interl_lo(16)]
- *   interl_hi: [group1_interl_hi(16) | group2_interl_hi(16)]
- * We need contiguous group output, so permute to:
- *   store0 = [group1_lo(16) | group1_hi(16)]
- *   store1 = [group2_lo(16) | group2_hi(16)]
+ * We process two 48-byte source groups in parallel — one per YMM lane.
+ * After blending, each lane of out0 holds 16 blend-result bytes for its
+ * group, and similarly for out1.
+ *
+ * unpacklo/hi interleaves out0 and out1 within each lane, producing the
+ * correct [out0[i], out1[i], ...] pixel order for each group.  However,
+ * unpacklo puts group1's first half in lane 0 and group2's first half in
+ * lane 1, while unpackhi puts group1's second half in lane 0 and group2's
+ * second half in lane 1.  The two permute2x128 calls reorganize this into
+ * contiguous 32-byte output for each group:
+ *   store0 = [group1_lo | group1_hi]
+ *   store1 = [group2_lo | group2_hi]
  * ----------------------------------------------------------------------- */
 
 static inline void h_chunk_1_5x_avx2(__m256i A, __m256i B, __m256i C,
@@ -456,8 +550,8 @@ static inline void h_chunk_1_5x_avx2(__m256i A, __m256i B, __m256i C,
     __m256i store0 = _mm256_permute2x128_si256(interl_lo, interl_hi, 0x20);
     __m256i store1 = _mm256_permute2x128_si256(interl_lo, interl_hi, 0x31);
 
-    /* Output buffers are posix_memalign(32) and strides are multiples of 32.
-     * out_off_1_5x = ci*64; 64 is a multiple of 32, so dst is 32-byte aligned. */
+    /* dst is 32-byte aligned: output buffers are posix_memalign(32) and
+     * out_off_1_5x = ci*64, which is always a multiple of 32. */
     _mm256_store_si256((__m256i *)(dst),      store0);
     _mm256_store_si256((__m256i *)(dst + 32), store1);
 }
@@ -518,6 +612,13 @@ static inline void h_chunk_6x_avx2(__m256i result_3x, uint8_t *restrict dst)
  *
  * Vertical: AVX2 _mm256_avg_epu8 cascade (32 bytes per chunk)
  * Horizontal: AVX2 pairwise average cascade + scalar tail
+ *
+ * This kernel uses two separate phases: a vertical cascade that writes
+ * intermediate row averages to temporary buffers, followed by a horizontal
+ * cascade that reads from those buffers.  This differs from the thirds
+ * kernel because power-of-two vertical reduction has no small fixed
+ * row-group period, so there is no advantage to keeping vertical
+ * intermediates in registers per column chunk.
  * ----------------------------------------------------------------------- */
 
 static void __attribute__((hot)) scale_plane_pow2_avx2(
@@ -664,16 +765,20 @@ static void __attribute__((hot)) scale_plane_pow2_avx2(
 /* -----------------------------------------------------------------------
  * Thirds kernel: scale a single plane (AVX2 fused vertical+horizontal)
  *
- * Per-chunk architecture: 96 source bytes (3 x 32-byte YMM) per iteration.
- * Vertical intermediates stay in registers; horizontal filtering is applied
- * immediately per chunk via 256-bit deinterleave and arithmetic.
+ * Per-chunk fused architecture: source rows are processed in groups of 6
+ * (matching the vertical period of the thirds reduction).  For each 96-byte
+ * column chunk, all 6 rows are loaded, vertical pair averages and bilinear
+ * blends are computed entirely in YMM registers, and horizontal filtering
+ * is applied immediately via 256-bit deinterleave and arithmetic — no
+ * intermediate row buffer needed.
  *
  * Vertical: AVX2 _mm256_avg_epu8 for pairwise avgs, avx2_blend_2_1 for
  *           bilinear blends (1.5x)
  * Horizontal: AVX2 deinterleave_3x32 + h_chunk_{1_5x,3x,6x}_avx2
  *
- * 12x: buffer-based (same approach as NEON fused version — saves one
- *      full-width 6x vertical intermediate row, averages on next group).
+ * A 6-source-row group produces 4 output rows at 1.5x, 2 rows at 3x, and
+ * 1 row at 6x.  12x requires pairing two consecutive 6x rows via a
+ * ping-pong buffer scheme.
  * ----------------------------------------------------------------------- */
 
 static void __attribute__((hot)) scale_plane_thirds_avx2(
@@ -795,7 +900,10 @@ static void __attribute__((hot)) scale_plane_thirds_avx2(
             /* --- LOAD 6 rows x 3 YMM = 18 loads ---
              * Source rows are 32-byte aligned (validated at init) and cx is
              * always a multiple of 96 = 32*3, so all three offsets cx,
-             * cx+32, cx+64 are multiples of 32: use aligned loads. */
+             * cx+32, cx+64 are multiples of 32: use aligned loads.
+             * Loading all 6 rows before any computation lets the CPU's
+             * out-of-order engine overlap the loads with subsequent
+             * arithmetic. */
             __m256i r0a = _mm256_load_si256((const __m256i *)(row0 + cx));
             __m256i r0b = _mm256_load_si256((const __m256i *)(row0 + cx + 32));
             __m256i r0c = _mm256_load_si256((const __m256i *)(row0 + cx + 64));
@@ -815,7 +923,11 @@ static void __attribute__((hot)) scale_plane_thirds_avx2(
             __m256i r5b = _mm256_load_si256((const __m256i *)(row5 + cx + 32));
             __m256i r5c = _mm256_load_si256((const __m256i *)(row5 + cx + 64));
 
-            /* --- VERTICAL PAIRWISE AVERAGES (9 x vpavgb) --- */
+            /* --- VERTICAL PAIRWISE AVERAGES ---
+             * Average adjacent row pairs: rows 0+1 -> v01, rows 2+3 -> v23,
+             * rows 4+5 -> v45.  These three intermediates represent the
+             * vertical center of each pair and are reused across all output
+             * levels without writing to memory. */
             __m256i v01a = _mm256_avg_epu8(r0a, r1a);
             __m256i v01b = _mm256_avg_epu8(r0b, r1b);
             __m256i v01c = _mm256_avg_epu8(r0c, r1c);
@@ -826,7 +938,13 @@ static void __attribute__((hot)) scale_plane_thirds_avx2(
             __m256i v45b = _mm256_avg_epu8(r4b, r5b);
             __m256i v45c = _mm256_avg_epu8(r4c, r5c);
 
-            /* --- 1.5x OUTPUT (4 rows x 64 bytes) --- */
+            /* --- 1.5x OUTPUT (4 rows x 64 bytes) ---
+             * A 6-source-row group produces 4 output rows at 1.5x.  Rows 0
+             * and 3 come directly from v01 and v45 (the pair averages
+             * themselves).  Rows 1 and 2 are bilinear blends between
+             * adjacent pair averages — blend(v01,v23) and blend(v23,v45) —
+             * representing the vertical positions 1/3 and 2/3 of the way
+             * through the group. */
             if (need_1_5x) {
                 __m256i A, B, C;
 
@@ -857,7 +975,11 @@ static void __attribute__((hot)) scale_plane_thirds_avx2(
                 h_chunk_1_5x_avx2(A, B, C, dst_1_5x_r3 + out_off_1_5x);
             }
 
-            /* --- 3x VERTICAL + HORIZONTAL (2 rows x 32 bytes) --- */
+            /* --- 3x VERTICAL + HORIZONTAL (2 rows x 32 bytes) ---
+             * A 6-source-row group produces 2 output rows at 3x.  The 3x
+             * vertical reduction averages each pair-average with the next:
+             * avg(v01,v23) and avg(v23,v45), which together represent a
+             * 3:1 reduction of the 6 source rows. */
             __m256i v3x0a = _mm256_setzero_si256();
             __m256i v3x0b = _mm256_setzero_si256();
             __m256i v3x0c = _mm256_setzero_si256();
@@ -883,7 +1005,10 @@ static void __attribute__((hot)) scale_plane_thirds_avx2(
                 }
             }
 
-            /* --- 6x VERTICAL (1 row) + save for 12x + horizontal --- */
+            /* --- 6x VERTICAL (1 row) + save for 12x + horizontal ---
+             * A 6-source-row group produces 1 output row at 6x, by averaging
+             * the two 3x intermediates: avg(v3x0, v3x1) =
+             * avg(avg(v01,v23), avg(v23,v45)). */
             if (need_6x) {
                 __m256i v6xa = _mm256_avg_epu8(v3x0a, v3x1a);
                 __m256i v6xb = _mm256_avg_epu8(v3x0b, v3x1b);
@@ -996,6 +1121,12 @@ static void __attribute__((hot)) scale_plane_thirds_avx2(
          * v6x_cur holds this group's 6x vertical intermediate (src_w bytes).
          * On even groups: swap pointers so current becomes previous.
          * On odd groups: average prev with current, apply horizontal, output.
+         *
+         * 12x requires averaging two consecutive 6x rows, each derived from
+         * a different 6-row source group.  Since the two 6x rows come from
+         * different iterations of the outer loop, we save each 6x
+         * intermediate in v6x_cur and pair them every two iterations.
+         * The ping-pong swap avoids copying.
          * ============================================================ */
         if (need_12x) {
             if ((g6 & 1) == 0) {
@@ -1039,6 +1170,10 @@ static void __attribute__((hot)) scale_plane_thirds_avx2(
 
 /* -----------------------------------------------------------------------
  * Public entry points
+ *
+ * YUV420 I420 has the chroma planes at half the luma dimensions in both
+ * axes.  We process the Y plane at full size, then U and V at half width
+ * and half height with the same kernel.
  * ----------------------------------------------------------------------- */
 
 void __attribute__((hot)) fused_kernel_pow2_avx2(const fused_kernel_params_t *p,

@@ -82,6 +82,41 @@ Times are the minimum observed over 1000 frames (single-threaded).
 3840×2160 thirds      1872 µs   11.2%
 ```
 
+### Local comparison against `ffmpeg` / `libswscale`
+
+On **April 1, 2026**, on an **Intel Core i7-9700** Ubuntu x86-64 workstation,
+the in-tree `make bench` results were compared against single-threaded `ffmpeg`
+`scale` filter graphs that produced the same output ladders from raw I420
+frames using bilinear scaling:
+
+| Case | Funnelcake mean | `ffmpeg` avg / frame | Speedup |
+|------|----------------:|---------------------:|--------:|
+| 960×540 thirds | 68 µs | 1055 µs | 15.5× |
+| 1280×720 pow2 | 66 µs | 1425 µs | 21.6× |
+| 1920×1080 thirds | 296 µs | 5620 µs | 19.0× |
+| 3840×2160 thirds | 1575 µs | 28050 µs | 17.8× |
+
+These `ffmpeg` numbers include CLI and filtergraph overhead, so they are not
+as clean as an in-process libswscale benchmark. Even with that caveat, the gap
+is large enough to confirm the expected order-of-magnitude advantage for fused
+multi-output downscaling.
+
+To reproduce the Funnelcake side, run:
+
+```sh
+make bench
+```
+
+To reproduce one comparable `ffmpeg` case:
+
+```sh
+ffmpeg -v error -nostdin -threads 1 -filter_threads 1 -filter_complex_threads 1 \
+  -stream_loop 999 -f rawvideo -pix_fmt yuv420p -video_size 1920x1080 \
+  -i /path/to/1920x1080.i420 -frames:v 1000 \
+  -filter_complex '[0:v]split=3[a][b][c];[a]scale=1280:720:flags=bilinear[o0];[b]scale=640:360:flags=bilinear[o1];[c]scale=320:180:flags=bilinear[o2]' \
+  -map '[o0]' -f null - -map '[o1]' -f null - -map '[o2]' -f null -
+```
+
 The thirds kernel is slower than the pow2 kernel at the same source resolution
 because thirds vertical periods (3 rows) fit less cleanly into cache than
 power-of-two periods (2 rows), and the horizontal thirds filter requires

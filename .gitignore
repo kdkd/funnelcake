@@ -11,3 +11,10 @@ output/
 # Editor backup files
 *~
 .DS_Store
+.vscode/
+
+# Agentic files
+AGENTS.md
+.codex/
+CLAUDE.md
+.claude/

@@ -3,14 +3,17 @@
 Funnelcake is a fused multi-resolution YUV420 downscaler. A single call
 produces up to four downscaled outputs simultaneously in one pass over the
 source data, using AVX2 (x86-64) or NEON (aarch64) SIMD kernels, with a
-portable scalar fallback.
+portable scalar fallback. An HDR10 path handles 10-bit PQ and HLG input
+with optional built-in tone mapping to SDR.
 
 It is designed for video pipelines that need to derive multiple lower-resolution
-copies of each frame — thumbnail generation, adaptive bitrate encoding ladders,
-preview streams — where calling a general-purpose scaler once per output is
+copies of each frame - thumbnail generation, adaptive bitrate encoding ladders,
+preview streams - where calling a general-purpose scaler once per output is
 prohibitively slow.
 
-Input and output are I420 planar (separate Y, U, V planes), 8-bit unsigned.
+The 8-bit SDR path accepts I420 planar (separate Y, U, V planes), 8-bit
+unsigned. The 10-bit HDR path accepts I010, P010, I210, and P210 formats
+and can produce both HDR and tone-mapped SDR outputs at each scale step.
 
 
 ## How it works
@@ -42,7 +45,7 @@ All results use `make pgo LTO=1` with the CPU-specific `TUNE` value, comparing
 against calling libswscale once per output at the equivalent quality setting.
 Times are the minimum observed over 1000 frames (single-threaded).
 
-**AMD EPYC 7302 (Zen 2) — 20–40× faster than libswscale**
+**AMD EPYC 7302 (Zen 2) - 20–40× faster than libswscale**
 ```
 640×360   pow2 (2×)     12 µs    0.1% of 60fps budget
 960×540   thirds        87 µs    0.5%
@@ -52,7 +55,7 @@ Times are the minimum observed over 1000 frames (single-threaded).
 3840×2160 thirds      2021 µs   12.1%
 ```
 
-**AMD EPYC 7301 (Zen 1) — 8–20× faster than libswscale**
+**AMD EPYC 7301 (Zen 1) - 8–20× faster than libswscale**
 ```
 640×360   pow2 (2×)     20 µs    0.1% of 60fps budget
 960×540   thirds       156 µs    0.9%
@@ -62,7 +65,7 @@ Times are the minimum observed over 1000 frames (single-threaded).
 3840×2160 thirds      3529 µs   21.2%
 ```
 
-**Intel E5-2680v4 (Broadwell) — 10–25× faster than libswscale**
+**Intel E5-2680v4 (Broadwell) - 10–25× faster than libswscale**
 ```
 640×360   pow2 (2×)     22 µs    0.1% of 60fps budget
 960×540   thirds       120 µs    0.7%
@@ -72,7 +75,7 @@ Times are the minimum observed over 1000 frames (single-threaded).
 3840×2160 thirds      1854 µs   11.1%
 ```
 
-**Intel Xeon 6132 (Skylake) — 15–30× faster than libswscale**
+**Intel Xeon 6132 (Skylake) - 15–30× faster than libswscale**
 ```
 640×360   pow2 (2×)     12 µs    0.1% of 60fps budget
 960×540   thirds       102 µs    0.6%
@@ -201,15 +204,15 @@ scaler.src_uv_stride = (960  + 31) & ~31;   /* 960  */
 scaler.requested_flags = FUSED_SCALE_1_5X | FUSED_SCALE_3X | FUSED_SCALE_6X;
 
 int rc = fused_scaler_init(&scaler);
-if (rc < 0) { /* hard error — nothing allocated */ }
+if (rc < 0) { /* hard error - nothing allocated */ }
 
 /* Call once per decoded frame */
 fused_scaler_run(&scaler, frame_y, frame_u, frame_v);
 
-/* Outputs indexed by bit position of the flag */
-fused_scale_output_t *out_1280x720 = &scaler.outputs[0]; /* FUSED_SCALE_1_5X */
-fused_scale_output_t *out_640x360  = &scaler.outputs[2]; /* FUSED_SCALE_3X   */
-fused_scale_output_t *out_320x180  = &scaler.outputs[4]; /* FUSED_SCALE_6X   */
+/* Outputs indexed by FUSED_IDX_* constants */
+fused_scale_output_t *out_1280x720 = &scaler.outputs[FUSED_IDX_1_5X];
+fused_scale_output_t *out_640x360  = &scaler.outputs[FUSED_IDX_3X];
+fused_scale_output_t *out_320x180  = &scaler.outputs[FUSED_IDX_6X];
 
 fused_scaler_free(&scaler);
 ```
@@ -227,3 +230,73 @@ fused_scaler_free(&scaler);
 The scalar fallback is correct on all platforms but significantly slower.
 On hardware without AVX2 or NEON, the library logs a one-time notice to
 stderr at first init.
+
+
+## HDR10 support
+
+The HDR API (`fused_hdr_*`) scales 10-bit PQ or HLG content and optionally
+tone-maps to 8-bit SDR in the same pass. Each scale step can independently
+produce an HDR output, an SDR output, or both.
+
+### Input formats
+
+| Constant | Subsampling | Layout | Notes |
+|----------|-------------|--------|-------|
+| `FUSED_PIX_I010` | 4:2:0 | Planar Y + U + V | Preferred - no deinterleave cost |
+| `FUSED_PIX_P010` | 4:2:0 | Y + interleaved UV | Deinterleaved on-the-fly (slight penalty) |
+| `FUSED_PIX_I210` | 4:2:2 | Planar Y + U + V | Chroma rows decimated to 4:2:0 internally |
+| `FUSED_PIX_P210` | 4:2:2 | Y + interleaved UV | Combined deinterleave + row-skip |
+
+All formats use 10-bit samples in the low bits of `uint16_t`.
+
+### Tone mapping
+
+Built-in curves applied to SDR outputs:
+
+| Preset | Description |
+|--------|-------------|
+| `FUSED_TONEMAP_HABLE` | Hable/Uncharted 2 filmic (default) |
+| `FUSED_TONEMAP_REINHARD` | Reinhard global operator |
+| `FUSED_TONEMAP_BT2390` | ITU-R BT.2390 EETF (broadcast reference) |
+| `FUSED_TONEMAP_CUSTOM` | Caller-supplied 1024-entry Y LUT |
+
+### Example: 4K HDR to 1080p HDR + SDR ladder
+
+```c
+#include "funnelcake.h"
+
+fused_hdr_ctx_t hdr = {0};
+hdr.src_width      = 3840;
+hdr.src_height     = 2160;
+hdr.src_y_stride   = 3840 * 2;          /* 10-bit: 2 bytes per sample */
+hdr.src_uv_stride  = 1920 * 2;
+hdr.src_format     = FUSED_PIX_I010;
+hdr.src_transfer   = FUSED_TRC_PQ;
+
+/* Request thirds cascade: 1.5x, 3x, 6x */
+hdr.requested_flags = FUSED_SCALE_1_5X | FUSED_SCALE_3X | FUSED_SCALE_6X;
+hdr.hdr_flags       = FUSED_SCALE_1_5X;                   /* 1080p HDR */
+hdr.sdr_flags       = FUSED_SCALE_1_5X | FUSED_SCALE_3X;  /* 1080p + 720p SDR */
+hdr.tonemap_1x      = 1;                                  /* 4K SDR copy */
+
+/* Tone mapping: BT.2390 for broadcast-grade SDR */
+hdr.tonemap.curve       = FUSED_TONEMAP_BT2390;
+hdr.tonemap.peak_nits   = 1000;
+hdr.tonemap.target_nits = 100;
+
+int rc = fused_hdr_init(&hdr);
+if (rc < 0) { /* handle error */ }
+
+/* Per-frame */
+fused_hdr_run(&hdr, frame_y, frame_u, frame_v);
+
+/* Access outputs */
+fused_hdr_output_t   *hdr_1080p = &hdr.hdr_outputs[FUSED_IDX_1_5X];
+fused_scale_output_t *sdr_1080p = &hdr.sdr_outputs[FUSED_IDX_1_5X];
+fused_scale_output_t *sdr_720p  = &hdr.sdr_outputs[FUSED_IDX_3X];
+fused_scale_output_t *sdr_4k    = &hdr.output_1x;      /* 8-bit 4K     */
+
+fused_hdr_free(&hdr);
+```
+
+See **[docs/API.md](docs/API.md)** for the full HDR10 API reference.

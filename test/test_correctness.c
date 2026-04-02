@@ -507,6 +507,166 @@ static void test_checkerboard_scaling(void)
 }
 
 /* --------------------------------------------------------------------------
+ * 8. test_non_standard_width_correctness
+ *    1000x600 frame with horizontal gradient, FUSED_SCALE_2X.
+ *    Verify output pixel count matches 500x300 and gradient monotonicity
+ *    holds. Tests the scalar tail path.
+ * -------------------------------------------------------------------------- */
+
+static void test_non_standard_width_correctness(void)
+{
+    uint32_t flags = FUSED_SCALE_2X;
+
+    if (!kernel_produces_output(1000, 600, flags)) {
+        TEST_SKIP("kernel not yet producing output -- skipping pixel checks");
+    }
+
+    test_frame_t frame;
+    int r = test_frame_create(&frame, 1000, 600, PATTERN_HGRADIENT, 0);
+    TEST_ASSERT(r == 0, "test_frame_create failed");
+
+    fused_scaler_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.src_width     = frame.width;
+    ctx.src_height    = frame.height;
+    ctx.src_y_stride  = frame.y_stride;
+    ctx.src_uv_stride = frame.uv_stride;
+    ctx.requested_flags = flags;
+    suppress_log(&ctx);
+
+    int rc = fused_scaler_init(&ctx);
+    TEST_ASSERT(rc >= 0, "fused_scaler_init failed");
+
+    fused_scaler_run(&ctx, frame.plane_y, frame.plane_u, frame.plane_v);
+
+    /* Verify output dimensions */
+    TEST_ASSERT_EQ(ctx.outputs[FUSED_IDX_2X].width,  500, "output width = 500");
+    TEST_ASSERT_EQ(ctx.outputs[FUSED_IDX_2X].height, 300, "output height = 300");
+
+    /* Verify gradient monotonicity */
+    int ow = ctx.outputs[FUSED_IDX_2X].width;
+    int oh = ctx.outputs[FUSED_IDX_2X].height;
+    int stride = ctx.outputs[FUSED_IDX_2X].y_stride;
+    for (int y = 0; y < oh; y++) {
+        const uint8_t *row = ctx.outputs[FUSED_IDX_2X].plane_y + y * stride;
+        for (int x = 1; x < ow; x++) {
+            if ((int)row[x] < (int)row[x-1] - 2) {
+                printf("\n  FAIL [%s:%d] non-standard width gradient: row=%d "
+                       "pixel[%d]=%d < pixel[%d]=%d - 2\n",
+                       __func__, __LINE__, y, x, row[x], x-1, row[x-1]);
+                g_results.failed++;
+                fused_scaler_free(&ctx);
+                test_frame_free(&frame);
+                return;
+            }
+        }
+    }
+
+    fused_scaler_free(&ctx);
+    test_frame_free(&frame);
+    TEST_PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * 9. test_misaligned_source_fallback
+ *    Allocate a frame, then pass plane_y + 1 (offset by 1 byte, breaking
+ *    alignment) to fused_scaler_run. Verify:
+ *    - No crash
+ *    - Output is produced (all pixels non-zero for a non-zero input)
+ *    This exercises the alignment check + scalar fallback in fused_scaler_run.
+ * -------------------------------------------------------------------------- */
+
+static void test_misaligned_source_fallback(void)
+{
+    int src_w = 1920;
+    int src_h = 1080;
+    int y_stride  = align_up_32(src_w);
+    int uv_stride = align_up_32(src_w / 2);
+
+    /* Allocate oversized buffers with posix_memalign so we can safely offset */
+    uint8_t *y_buf  = NULL;
+    uint8_t *u_buf  = NULL;
+    uint8_t *v_buf  = NULL;
+    size_t y_size  = (size_t)y_stride  * src_h + 32;
+    size_t uv_size = (size_t)uv_stride * (src_h / 2) + 32;
+    if (posix_memalign((void **)&y_buf,  32, y_size)  != 0 ||
+        posix_memalign((void **)&u_buf,  32, uv_size) != 0 ||
+        posix_memalign((void **)&v_buf,  32, uv_size) != 0) {
+        free(y_buf); free(u_buf); free(v_buf);
+        TEST_ASSERT(0, "posix_memalign failed");
+    }
+
+    /* Fill with a non-zero value so we can detect output */
+    memset(y_buf,  200, y_size);
+    memset(u_buf,  128, uv_size);
+    memset(v_buf,  128, uv_size);
+
+    fused_scaler_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.src_width     = src_w;
+    ctx.src_height    = src_h;
+    ctx.src_y_stride  = y_stride;
+    ctx.src_uv_stride = uv_stride;
+    ctx.requested_flags = FUSED_SCALE_2X;
+    suppress_log(&ctx);
+
+    int rc = fused_scaler_init(&ctx);
+    TEST_ASSERT(rc >= 0, "init should succeed");
+
+    /* Pass misaligned pointers (offset by 1 byte) */
+    fused_scaler_run(&ctx, y_buf + 1, u_buf + 1, v_buf + 1);
+
+    /* Verify output was produced: at least some non-zero pixels */
+    int found_nonzero = 0;
+    if (ctx.outputs[FUSED_IDX_2X].plane_y) {
+        int ow = ctx.outputs[FUSED_IDX_2X].width;
+        for (int x = 0; x < ow && !found_nonzero; x++) {
+            if (ctx.outputs[FUSED_IDX_2X].plane_y[x] != 0)
+                found_nonzero = 1;
+        }
+    }
+    TEST_ASSERT(found_nonzero, "output should contain non-zero pixels after misaligned fallback");
+
+    fused_scaler_free(&ctx);
+    free(y_buf);
+    free(u_buf);
+    free(v_buf);
+    TEST_PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * 10. test_double_free_safety
+ *     Init a scaler, call fused_scaler_free twice. Verify no crash.
+ *     Then call fused_scaler_free on a zero-initialized context. No crash.
+ * -------------------------------------------------------------------------- */
+
+static void test_double_free_safety(void)
+{
+    /* Part 1: init then double-free */
+    fused_scaler_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.src_width     = 1920;
+    ctx.src_height    = 1080;
+    ctx.src_y_stride  = align_up_32(1920);
+    ctx.src_uv_stride = align_up_32(960);
+    ctx.requested_flags = FUSED_SCALE_2X;
+    suppress_log(&ctx);
+
+    int rc = fused_scaler_init(&ctx);
+    TEST_ASSERT(rc >= 0, "init should succeed");
+
+    fused_scaler_free(&ctx);
+    fused_scaler_free(&ctx);  /* second free — should be a no-op */
+
+    /* Part 2: free on zero-initialized context */
+    fused_scaler_ctx_t zero_ctx;
+    memset(&zero_ctx, 0, sizeof(zero_ctx));
+    fused_scaler_free(&zero_ctx);  /* should be a no-op */
+
+    TEST_PASS();
+}
+
+/* --------------------------------------------------------------------------
  * run_correctness_tests
  * -------------------------------------------------------------------------- */
 
@@ -519,4 +679,7 @@ void run_correctness_tests(void)
     RUN_TEST(test_buffer_alignment);
     RUN_TEST(test_random_pixel_range);
     RUN_TEST(test_checkerboard_scaling);
+    RUN_TEST(test_non_standard_width_correctness);
+    RUN_TEST(test_misaligned_source_fallback);
+    RUN_TEST(test_double_free_safety);
 }

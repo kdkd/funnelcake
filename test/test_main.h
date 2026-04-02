@@ -74,13 +74,18 @@ void run_validation_tests(void);
 void run_correctness_tests(void);
 void run_visual_tests(void);
 void run_bench_tests(const char *filter);
+void run_hdr_validation_tests(void);
+void run_hdr_correctness_tests(void);
+void run_hdr_bench_tests(const char *filter);
 
 /* --------------------------------------------------------------------------
  * Options parsed from command-line arguments
  * -------------------------------------------------------------------------- */
 
 typedef struct {
-    int         run_bench;
+    int         run_bench;      /* --bench: runs both SDR and HDR benches */
+    int         run_bench_sdr;  /* --bench-sdr: SDR benchmarks only */
+    int         run_bench_hdr;  /* --bench-hdr: HDR benchmarks only */
     int         run_visual;
     const char *bench_filter;
 } test_options_t;

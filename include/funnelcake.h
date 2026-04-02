@@ -32,6 +32,20 @@ extern "C" {
 #define FUSED_SCALE_POW2_MASK \
     (FUSED_SCALE_2X | FUSED_SCALE_4X | FUSED_SCALE_8X | FUSED_SCALE_16X)
 
+/* Output array indices — use these to index into outputs[], hdr_outputs[],
+ * and sdr_outputs[] instead of hard-coding bit positions.
+ *
+ *   fused_scale_output_t *out = &scaler.outputs[FUSED_IDX_3X];
+ */
+#define FUSED_IDX_1_5X   0
+#define FUSED_IDX_2X     1
+#define FUSED_IDX_3X     2
+#define FUSED_IDX_4X     3
+#define FUSED_IDX_6X     4
+#define FUSED_IDX_8X     5
+#define FUSED_IDX_12X    6
+#define FUSED_IDX_16X    7
+
 
 /* --------------------------------------------------------------------------
  * Option flags (fused_scaler_ctx_t.options)
@@ -203,6 +217,179 @@ void fused_scaler_run(fused_scaler_ctx_t *ctx,
  * with new parameters.
  */
 void fused_scaler_free(fused_scaler_ctx_t *ctx);
+
+
+/* ==========================================================================
+ * HDR10 API — 10-bit scaling with optional tone mapping to SDR
+ *
+ * Completely separate from the 8-bit API above. The existing SDR types,
+ * functions, and behavior are unchanged.
+ * ========================================================================== */
+
+
+/* --------------------------------------------------------------------------
+ * Input pixel formats (fused_hdr_ctx_t.src_format)
+ *
+ * All formats use 10-bit samples stored in the low 10 bits of uint16_t.
+ * 4:2:2 formats are accepted but internally decimated to 4:2:0 by
+ * skipping every other chroma row (nearest-neighbor). P010/P210 formats
+ * deinterleave chroma on-the-fly during the kernel load phase.
+ * -------------------------------------------------------------------------- */
+
+#define FUSED_PIX_I010     0   /* 4:2:0 planar: separate Y, U, V planes     */
+#define FUSED_PIX_P010     1   /* 4:2:0 semi-planar: Y plane + interleaved UV */
+#define FUSED_PIX_I210     2   /* 4:2:2 planar: decimated to 4:2:0 internally */
+#define FUSED_PIX_P210     3   /* 4:2:2 semi-planar: decimated to 4:2:0       */
+
+
+/* --------------------------------------------------------------------------
+ * Transfer function (fused_hdr_ctx_t.src_transfer)
+ *
+ * Determines the EOTF used when generating tone mapping LUTs.
+ * BT.2020 and BT.2100 share the same color primaries; only the transfer
+ * function differs.
+ * -------------------------------------------------------------------------- */
+
+#define FUSED_TRC_PQ       0   /* SMPTE ST 2084 — Perceptual Quantizer (HDR10)  */
+#define FUSED_TRC_HLG      1   /* Hybrid Log-Gamma (BBC/NHK, backward-compat)   */
+
+
+/* --------------------------------------------------------------------------
+ * Tone mapping curve presets (fused_tonemap_config_t.curve)
+ *
+ * Applied to SDR outputs and the 1:1 tone map output. The LUT is
+ * precomputed at init time from the selected curve, peak_nits, and
+ * target_nits.
+ * -------------------------------------------------------------------------- */
+
+#define FUSED_TONEMAP_HABLE    0   /* Hable/Uncharted 2 filmic — good default    */
+#define FUSED_TONEMAP_REINHARD 1   /* Reinhard global — simple, lower contrast    */
+#define FUSED_TONEMAP_BT2390   2   /* ITU-R BT.2390 EETF — broadcast reference   */
+#define FUSED_TONEMAP_CUSTOM   3   /* Caller-supplied 1024-entry Y LUT            */
+
+
+/* --------------------------------------------------------------------------
+ * HDR types
+ * -------------------------------------------------------------------------- */
+
+/*
+ * 10-bit output plane descriptor.
+ * Same structure as fused_scale_output_t but with uint16_t planes.
+ * Strides are in bytes. Planes are 32-byte aligned.
+ */
+typedef struct {
+    int       width;
+    int       height;
+    int       y_stride;
+    int       uv_stride;
+    uint16_t *plane_y;
+    uint16_t *plane_u;
+    uint16_t *plane_v;
+    int       fallback;     /* 0 = SIMD kernel used, 1 = scalar kernel used */
+} fused_hdr_output_t;
+
+/*
+ * Tone mapping configuration for SDR outputs.
+ * Zero-initialised struct means: Hable curve, 1000-nit peak, 100-nit target.
+ */
+typedef struct {
+    int            curve;          /* FUSED_TONEMAP_* preset                    */
+    int            peak_nits;      /* source peak brightness (0 = default 1000) */
+    int            target_nits;    /* SDR target (0 = default 100)              */
+    const uint8_t *custom_lut;     /* 1024-entry Y LUT for FUSED_TONEMAP_CUSTOM */
+} fused_tonemap_config_t;
+
+/*
+ * HDR scaler context.
+ * Caller-allocated, typically on the stack or as a struct member.
+ * Zero-initialise before use, fill source/config fields, then call
+ * fused_hdr_init.
+ *
+ * Each scale step can produce an HDR (10-bit) output, an SDR (8-bit,
+ * tone-mapped) output, or both. Set the corresponding bit in hdr_flags
+ * and/or sdr_flags. Both must be subsets of requested_flags.
+ */
+typedef struct {
+    /* Source description — set by caller before init */
+    int      src_width;
+    int      src_height;
+    int      src_y_stride;       /* bytes per row of Y plane                   */
+    int      src_uv_stride;      /* bytes per row of U/V (or UV interleaved)   */
+    int      src_format;         /* FUSED_PIX_* — pixel layout                 */
+    int      src_transfer;       /* FUSED_TRC_* — transfer function            */
+
+    /* Configuration — set by caller before init */
+    uint32_t requested_flags;    /* FUSED_SCALE_* bitmask (one family only)    */
+    uint32_t hdr_flags;          /* subset: produce 10-bit HDR outputs         */
+    uint32_t sdr_flags;          /* subset: produce 8-bit tone-mapped outputs  */
+    uint32_t options;            /* FUSED_OPT_* bitmask (NO_CROP, NO_FALLBACK) */
+
+    /* 1:1 tone map — if set, produce an SDR copy at source resolution */
+    int      tonemap_1x;
+
+    /* Tone mapping configuration (applied to all SDR outputs + tonemap_1x) */
+    fused_tonemap_config_t tonemap;
+
+    /* Logging — zero struct = stderr defaults */
+    fused_log_config_t log_errors;
+    fused_log_config_t log_warnings;
+
+    /* Results — written by fused_hdr_init */
+    uint32_t achieved_hdr_flags;     /* HDR steps that will be produced          */
+    uint32_t achieved_sdr_flags;     /* SDR steps that will be produced          */
+    uint32_t rejected_flags;         /* steps that were rejected                 */
+    int      effective_width;        /* actual source width used (after crop)    */
+    int      effective_height;       /* actual source height used (after crop)   */
+
+    /* Outputs — indexed by bit position of FUSED_SCALE_* flag */
+    fused_hdr_output_t   hdr_outputs[8];  /* 10-bit; NULL planes if not in hdr_flags */
+    fused_scale_output_t sdr_outputs[8];  /* 8-bit;  NULL planes if not in sdr_flags */
+    fused_scale_output_t output_1x;       /* 8-bit tone-mapped at source res         */
+
+    /* Internal — opaque, managed by init/free; do not read or write */
+    void *_internal;
+} fused_hdr_ctx_t;
+
+
+/* --------------------------------------------------------------------------
+ * HDR functions
+ * -------------------------------------------------------------------------- */
+
+/*
+ * fused_hdr_init — validate configuration, generate tone mapping LUTs,
+ * and allocate output buffers.
+ *
+ * Returns FUSED_OK (0) on perfect success, a positive bitmask of
+ * FUSED_WARN_BIT_* on partial success, or a negative FUSED_ERR_* on hard
+ * error. Same return code semantics as fused_scaler_init.
+ *
+ * Additional error: returns FUSED_ERR_INVALID_FLAGS if hdr_flags or
+ * sdr_flags contain bits not in requested_flags, or if src_format or
+ * src_transfer is invalid.
+ */
+int fused_hdr_init(fused_hdr_ctx_t *ctx);
+
+/*
+ * fused_hdr_run — process one 10-bit input frame, produce all HDR and
+ * SDR outputs, and apply tone mapping to SDR outputs.
+ *
+ * src_y: pointer to luma plane (uint16_t, 10-bit values in low bits).
+ * src_u: pointer to U plane (I010/I210) or interleaved UV plane (P010/P210).
+ * src_v: pointer to V plane (I010/I210) or NULL (P010/P210).
+ *
+ * All pointers must be 32-byte aligned for SIMD. Misaligned pointers
+ * cause fallback to the scalar kernel with a one-time warning.
+ */
+void fused_hdr_run(fused_hdr_ctx_t *ctx,
+                   const uint16_t *src_y,
+                   const uint16_t *src_u,
+                   const uint16_t *src_v);
+
+/*
+ * fused_hdr_free — release all resources allocated by fused_hdr_init.
+ * Same safety semantics as fused_scaler_free.
+ */
+void fused_hdr_free(fused_hdr_ctx_t *ctx);
 
 
 #ifdef __cplusplus

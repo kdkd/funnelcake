@@ -38,14 +38,14 @@ static void test_valid_1080p_thirds(void)
 
     int rc = fused_scaler_init(&ctx);
     TEST_ASSERT_EQ(rc, FUSED_OK, "rc should be FUSED_OK");
-    /* outputs[0] = FUSED_SCALE_1_5X (bit 0) */
-    TEST_ASSERT_EQ(ctx.outputs[0].width,  1280, "outputs[0].width");
-    TEST_ASSERT_EQ(ctx.outputs[0].height, 720,  "outputs[0].height");
-    /* outputs[2] = FUSED_SCALE_3X (bit 2) */
-    TEST_ASSERT_EQ(ctx.outputs[2].width, 640, "outputs[2].width");
-    /* outputs[4] = FUSED_SCALE_6X (bit 4) */
-    TEST_ASSERT_EQ(ctx.outputs[4].width, 320, "outputs[4].width");
-    TEST_ASSERT(ctx.outputs[0].plane_y != NULL, "outputs[0].plane_y != NULL");
+    /* outputs[FUSED_IDX_1_5X] = FUSED_SCALE_1_5X (bit 0) */
+    TEST_ASSERT_EQ(ctx.outputs[FUSED_IDX_1_5X].width,  1280, "outputs[0].width");
+    TEST_ASSERT_EQ(ctx.outputs[FUSED_IDX_1_5X].height, 720,  "outputs[0].height");
+    /* outputs[FUSED_IDX_3X] = FUSED_SCALE_3X (bit 2) */
+    TEST_ASSERT_EQ(ctx.outputs[FUSED_IDX_3X].width, 640, "outputs[2].width");
+    /* outputs[FUSED_IDX_6X] = FUSED_SCALE_6X (bit 4) */
+    TEST_ASSERT_EQ(ctx.outputs[FUSED_IDX_6X].width, 320, "outputs[4].width");
+    TEST_ASSERT(ctx.outputs[FUSED_IDX_1_5X].plane_y != NULL, "outputs[0].plane_y != NULL");
 
     fused_scaler_free(&ctx);
     TEST_PASS();
@@ -69,10 +69,10 @@ static void test_valid_720p_pow2(void)
 
     int rc = fused_scaler_init(&ctx);
     TEST_ASSERT_EQ(rc, FUSED_OK, "rc should be FUSED_OK");
-    /* outputs[1] = FUSED_SCALE_2X (bit 1) */
-    TEST_ASSERT_EQ(ctx.outputs[1].width, 640, "outputs[1].width");
-    /* outputs[3] = FUSED_SCALE_4X (bit 3) */
-    TEST_ASSERT_EQ(ctx.outputs[3].width, 320, "outputs[3].width");
+    /* outputs[FUSED_IDX_2X] = FUSED_SCALE_2X (bit 1) */
+    TEST_ASSERT_EQ(ctx.outputs[FUSED_IDX_2X].width, 640, "outputs[1].width");
+    /* outputs[FUSED_IDX_4X] = FUSED_SCALE_4X (bit 3) */
+    TEST_ASSERT_EQ(ctx.outputs[FUSED_IDX_4X].width, 320, "outputs[3].width");
 
     fused_scaler_free(&ctx);
     TEST_PASS();
@@ -97,8 +97,8 @@ static void test_valid_4k_full_thirds(void)
 
     int rc = fused_scaler_init(&ctx);
     TEST_ASSERT_EQ(rc, FUSED_OK, "rc should be FUSED_OK");
-    TEST_ASSERT(ctx.outputs[0].plane_y != NULL, "outputs[0] allocated");
-    TEST_ASSERT(ctx.outputs[6].plane_y != NULL, "outputs[6] allocated");
+    TEST_ASSERT(ctx.outputs[FUSED_IDX_1_5X].plane_y != NULL, "outputs[0] allocated");
+    TEST_ASSERT(ctx.outputs[FUSED_IDX_12X].plane_y != NULL, "outputs[6] allocated");
 
     fused_scaler_free(&ctx);
     TEST_PASS();
@@ -239,8 +239,8 @@ static void test_crop_to_fit(void)
     TEST_ASSERT(rc & FUSED_WARN_BIT_CROPPED, "should have CROPPED warning");
     TEST_ASSERT_EQ(ctx.effective_height, 760, "effective height cropped to 760");
     TEST_ASSERT_EQ(ctx.effective_width, 1360, "effective width unchanged");
-    TEST_ASSERT_EQ(ctx.outputs[1].height, 380, "2x output height = 380");
-    TEST_ASSERT_EQ(ctx.outputs[1].width, 680, "2x output width = 680");
+    TEST_ASSERT_EQ(ctx.outputs[FUSED_IDX_2X].height, 380, "2x output height = 380");
+    TEST_ASSERT_EQ(ctx.outputs[FUSED_IDX_2X].width, 680, "2x output width = 680");
 
     fused_scaler_free(&ctx);
     TEST_PASS();
@@ -294,8 +294,8 @@ static void test_scalar_fallback_oddball(void)
     int rc = fused_scaler_init(&ctx);
     TEST_ASSERT(rc >= 0, "scalar fallback case should succeed");
     TEST_ASSERT((rc & FUSED_WARN_BIT_SCALAR) != 0, "FUSED_WARN_BIT_SCALAR should be set");
-    TEST_ASSERT_EQ(ctx.outputs[1].fallback, 1, "outputs[1].fallback should be 1");
-    TEST_ASSERT_EQ(ctx.outputs[1].width, 592, "outputs[1].width");
+    TEST_ASSERT_EQ(ctx.outputs[FUSED_IDX_2X].fallback, 1, "outputs[1].fallback should be 1");
+    TEST_ASSERT_EQ(ctx.outputs[FUSED_IDX_2X].width, 592, "outputs[1].width");
 
     fused_scaler_free(&ctx);
     TEST_PASS();
@@ -347,10 +347,10 @@ static void test_deep_step_only(void)
 
     int rc = fused_scaler_init(&ctx);
     TEST_ASSERT(rc >= 0, "deep step only should succeed");
-    TEST_ASSERT_EQ(ctx.outputs[0].width, 0, "outputs[0].width should be 0 (not requested)");
-    TEST_ASSERT(ctx.outputs[0].plane_y == NULL, "outputs[0].plane_y should be NULL");
-    TEST_ASSERT_EQ(ctx.outputs[2].width, 0, "outputs[2].width should be 0 (not requested)");
-    TEST_ASSERT_EQ(ctx.outputs[4].width, 320, "outputs[4].width should be 320");
+    TEST_ASSERT_EQ(ctx.outputs[FUSED_IDX_1_5X].width, 0, "outputs[0].width should be 0 (not requested)");
+    TEST_ASSERT(ctx.outputs[FUSED_IDX_1_5X].plane_y == NULL, "outputs[0].plane_y should be NULL");
+    TEST_ASSERT_EQ(ctx.outputs[FUSED_IDX_3X].width, 0, "outputs[2].width should be 0 (not requested)");
+    TEST_ASSERT_EQ(ctx.outputs[FUSED_IDX_6X].width, 320, "outputs[4].width should be 320");
 
     fused_scaler_free(&ctx);
     TEST_PASS();
@@ -524,6 +524,164 @@ static void test_diagnostic_callback(void)
 }
 
 /* --------------------------------------------------------------------------
+ * 18. test_minimum_dimensions_pow2
+ *     64x4 with FUSED_SCALE_2X → init succeeds, output 32x2.
+ *     This is the minimum valid configuration for pow2.
+ * -------------------------------------------------------------------------- */
+
+static void test_minimum_dimensions_pow2(void)
+{
+    fused_scaler_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.src_width     = 64;
+    ctx.src_height    = 4;
+    ctx.src_y_stride  = align_up_32(64);
+    ctx.src_uv_stride = align_up_32(32);
+    ctx.requested_flags = FUSED_SCALE_2X;
+    suppress_log(&ctx);
+
+    int rc = fused_scaler_init(&ctx);
+    TEST_ASSERT(rc >= 0, "64x4 2x init should succeed");
+    TEST_ASSERT_EQ(ctx.outputs[FUSED_IDX_2X].width,  32, "output width = 32");
+    TEST_ASSERT_EQ(ctx.outputs[FUSED_IDX_2X].height,  2, "output height = 2");
+
+    fused_scaler_free(&ctx);
+    TEST_PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * 19. test_minimum_dimensions_thirds
+ *     96x6 with FUSED_SCALE_1_5X → init succeeds, output 64x4.
+ *     Minimum valid configuration for thirds.
+ * -------------------------------------------------------------------------- */
+
+static void test_minimum_dimensions_thirds(void)
+{
+    fused_scaler_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.src_width     = 96;
+    ctx.src_height    = 6;
+    ctx.src_y_stride  = align_up_32(96);
+    ctx.src_uv_stride = align_up_32(48);
+    ctx.requested_flags = FUSED_SCALE_1_5X;
+    suppress_log(&ctx);
+
+    int rc = fused_scaler_init(&ctx);
+    TEST_ASSERT(rc >= 0, "96x6 1.5x init should succeed");
+    TEST_ASSERT_EQ(ctx.outputs[FUSED_IDX_1_5X].width,  64, "output width = 64");
+    TEST_ASSERT_EQ(ctx.outputs[FUSED_IDX_1_5X].height,  4, "output height = 4");
+
+    fused_scaler_free(&ctx);
+    TEST_PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * 20. test_non_standard_width
+ *     1000x600 with FUSED_SCALE_2X. Width 1000 is not a multiple of 32
+ *     (chunks_per_row = 31, tail_bytes = 8). Verify init succeeds and
+ *     output dimensions are correct (500x300).
+ * -------------------------------------------------------------------------- */
+
+static void test_non_standard_width(void)
+{
+    fused_scaler_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.src_width     = 1000;
+    ctx.src_height    = 600;
+    ctx.src_y_stride  = align_up_32(1000);
+    ctx.src_uv_stride = align_up_32(500);
+    ctx.requested_flags = FUSED_SCALE_2X;
+    suppress_log(&ctx);
+
+    int rc = fused_scaler_init(&ctx);
+    TEST_ASSERT(rc >= 0, "1000x600 2x init should succeed");
+    TEST_ASSERT_EQ(ctx.outputs[FUSED_IDX_2X].width,  500, "output width = 500");
+    TEST_ASSERT_EQ(ctx.outputs[FUSED_IDX_2X].height, 300, "output height = 300");
+
+    fused_scaler_free(&ctx);
+    TEST_PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * 21. test_16x_deep_step
+ *     1920x1088 with FUSED_SCALE_16X only → output 120x68.
+ *     Tests the deepest pow2 cascade in isolation.
+ * -------------------------------------------------------------------------- */
+
+static void test_16x_deep_step(void)
+{
+    fused_scaler_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.src_width     = 1920;
+    ctx.src_height    = 1088;
+    ctx.src_y_stride  = align_up_32(1920);
+    ctx.src_uv_stride = align_up_32(960);
+    ctx.requested_flags = FUSED_SCALE_16X;
+    suppress_log(&ctx);
+
+    int rc = fused_scaler_init(&ctx);
+    TEST_ASSERT(rc >= 0, "1920x1088 16x init should succeed");
+    TEST_ASSERT_EQ(ctx.outputs[FUSED_IDX_16X].width,  120, "output width = 120");
+    TEST_ASSERT_EQ(ctx.outputs[FUSED_IDX_16X].height,  68, "output height = 68");
+
+    fused_scaler_free(&ctx);
+    TEST_PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * 22. test_12x_deep_step
+ *     1920x1080 with FUSED_SCALE_12X only → output 160x90.
+ *     Tests 12x ping-pong in isolation without 1.5x/3x/6x.
+ * -------------------------------------------------------------------------- */
+
+static void test_12x_deep_step(void)
+{
+    fused_scaler_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.src_width     = 1920;
+    ctx.src_height    = 1080;
+    ctx.src_y_stride  = align_up_32(1920);
+    ctx.src_uv_stride = align_up_32(960);
+    ctx.requested_flags = FUSED_SCALE_12X;
+    suppress_log(&ctx);
+
+    int rc = fused_scaler_init(&ctx);
+    TEST_ASSERT(rc >= 0, "1920x1080 12x init should succeed");
+    TEST_ASSERT_EQ(ctx.outputs[FUSED_IDX_12X].width,  160, "output width = 160");
+    TEST_ASSERT_EQ(ctx.outputs[FUSED_IDX_12X].height,  90, "output height = 90");
+
+    fused_scaler_free(&ctx);
+    TEST_PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * 23. test_combined_warnings
+ *     1184x662, FUSED_SCALE_2X → triggers BOTH FUSED_WARN_BIT_CROPPED
+ *     (height 662 → 660) AND FUSED_WARN_BIT_SCALAR (chroma width 296,
+ *     not %32). Verify both warning bits are set.
+ * -------------------------------------------------------------------------- */
+
+static void test_combined_warnings(void)
+{
+    fused_scaler_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.src_width     = 1184;
+    ctx.src_height    = 662;
+    ctx.src_y_stride  = align_up_32(1184);
+    ctx.src_uv_stride = align_up_32(592);
+    ctx.requested_flags = FUSED_SCALE_2X;
+    suppress_log(&ctx);
+
+    int rc = fused_scaler_init(&ctx);
+    TEST_ASSERT(rc >= 0, "1184x662 2x init should succeed");
+    TEST_ASSERT((rc & FUSED_WARN_BIT_CROPPED) != 0, "FUSED_WARN_BIT_CROPPED should be set");
+    TEST_ASSERT((rc & FUSED_WARN_BIT_SCALAR)  != 0, "FUSED_WARN_BIT_SCALAR should be set");
+
+    fused_scaler_free(&ctx);
+    TEST_PASS();
+}
+
+/* --------------------------------------------------------------------------
  * run_validation_tests
  * -------------------------------------------------------------------------- */
 
@@ -546,4 +704,10 @@ void run_validation_tests(void)
     RUN_TEST(test_all_production_ladders);
     RUN_TEST(test_free_cleans_up);
     RUN_TEST(test_diagnostic_callback);
+    RUN_TEST(test_minimum_dimensions_pow2);
+    RUN_TEST(test_minimum_dimensions_thirds);
+    RUN_TEST(test_non_standard_width);
+    RUN_TEST(test_16x_deep_step);
+    RUN_TEST(test_12x_deep_step);
+    RUN_TEST(test_combined_warnings);
 }

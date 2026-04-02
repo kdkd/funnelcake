@@ -22,9 +22,9 @@
     make TUNE=skylake           # optimize scheduling for Intel Xeon 6132
     make TUNE=native            # optimize for the build machine's CPU
 
-> **Note — Skylake vs Broadwell tuning:** On Xeon Scalable (Skylake-SP) hardware,
+> **Note - Skylake vs Broadwell tuning:** On Xeon Scalable (Skylake-SP) hardware,
 > `TUNE=skylake` does not always outperform `TUNE=broadwell`.  In our benchmarks on
-> a Xeon 6132, `broadwell` produced consistently better results (3–4% lower latency
+> a Xeon 6132, `broadwell` produced consistently better results (3-4% lower latency
 > across all workloads).  GCC's `-mtune=skylake` adjusts prefetch distances and
 > micro-op scheduling in ways that can conflict with the shuffle-heavy AVX2 inner
 > loops used here.  When deploying to Skylake hardware, benchmark both options with

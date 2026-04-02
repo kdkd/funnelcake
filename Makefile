@@ -71,26 +71,29 @@ TEST_CFLAGS = $(CFLAGS_BASE) $(TEST_OPT) $(TUNE_CFLAGS) $(LTO_CFLAGS)
 DETECT_CFLAGS = $(CFLAGS_BASE) -O2 $(TUNE_CFLAGS)
 
 # Library sources (always compiled)
-LIB_SRCS = src/funnelcake.c src/log.c src/detect.c src/kernels_scalar.c
+LIB_SRCS = src/funnelcake.c src/funnelcake_hdr.c src/log.c src/detect.c \
+           src/kernels_scalar.c src/kernels_hdr_scalar.c src/tonemap.c
 
-# Platform-specific SIMD kernel
+# Platform-specific SIMD kernels (SDR + HDR)
 ifeq ($(UNAME_M),x86_64)
-  LIB_SRCS += src/kernels_avx2.c
+  LIB_SRCS += src/kernels_avx2.c src/kernels_hdr_avx2.c
 else ifeq ($(UNAME_M),aarch64)
-  LIB_SRCS += src/kernels_neon.c
+  LIB_SRCS += src/kernels_neon.c src/kernels_hdr_neon.c
 else ifeq ($(UNAME_M),arm64)
-  LIB_SRCS += src/kernels_neon.c
+  LIB_SRCS += src/kernels_neon.c src/kernels_hdr_neon.c
 endif
 
 LIB_OBJS = $(LIB_SRCS:.c=.o)
 
 # Test sources
 TEST_SRCS = test/test_main.c test/test_validation.c test/test_correctness.c \
-            test/test_patterns.c test/test_visual.c test/test_bench.c
+            test/test_patterns.c test/test_visual.c test/test_bench.c \
+            test/test_hdr_validation.c test/test_hdr_correctness.c \
+            test/test_hdr_bench.c
 TEST_OBJS = $(TEST_SRCS:.c=.o)
 
 # Default target
-.PHONY: all lib test bench visual clean pgo pgo-clean
+.PHONY: all lib test bench bench-sdr bench-hdr visual fetch-samples clean pgo pgo-clean
 
 all: lib
 
@@ -108,14 +111,109 @@ test: funnelcake_test
 bench: funnelcake_test
 	./funnelcake_test --bench
 
+bench-sdr: funnelcake_test
+	./funnelcake_test --bench-sdr
+
+bench-hdr: funnelcake_test
+	./funnelcake_test --bench-hdr
+
 visual: funnelcake_test
 	@mkdir -p output
 	./funnelcake_test --visual
 
+# --- Sample HDR frames for visual testing ---
+# Generates synthetic PQ-encoded 10-bit test frames using ffmpeg.
+# Also downloads a small EXR reference image from the OpenEXR test suite.
+# Output goes to test/samples/ (gitignored). Requires ffmpeg.
+fetch-samples:
+	@command -v ffmpeg >/dev/null 2>&1 || { echo "Error: ffmpeg is required for fetch-samples"; exit 1; }
+	@command -v curl >/dev/null 2>&1 || { echo "Error: curl is required for fetch-samples"; exit 1; }
+	@mkdir -p test/samples
+	@echo ""
+	@echo "=== Generating PQ-encoded 10-bit test frames ==="
+	@echo "    (requires ffmpeg with zscale filter for proper PQ OETF)"
+	@echo ""
+	@echo "  SMPTE HD bars (1080p, PQ I010)..."
+	@ffmpeg -y -f lavfi -i "smptehdbars=size=1920x1080:rate=1:duration=1" \
+		-vf "zscale=tin=bt709:min=bt709:pin=bt709:t=smpte2084:m=bt2020nc:p=bt2020,format=yuv420p10le" \
+		-f rawvideo -frames:v 1 \
+		test/samples/bars_1080p_i010_pq.yuv 2>/dev/null \
+		&& echo "    test/samples/bars_1080p_i010_pq.yuv" || echo "    (failed — zscale filter may not be available)"
+	@echo "  Color gradients (1080p, PQ I010)..."
+	@ffmpeg -y -f lavfi -i "gradients=size=1920x1080:rate=1:duration=1:nb_colors=6" \
+		-vf "zscale=tin=bt709:min=bt709:pin=bt709:t=smpte2084:m=bt2020nc:p=bt2020,format=yuv420p10le" \
+		-f rawvideo -frames:v 1 \
+		test/samples/gradients_1080p_i010_pq.yuv 2>/dev/null \
+		&& echo "    test/samples/gradients_1080p_i010_pq.yuv" || echo "    (failed)"
+	@echo "  Mandelbrot (1080p, PQ I010)..."
+	@ffmpeg -y -f lavfi -i "mandelbrot=size=1920x1080:rate=1:maxiter=500" \
+		-vf "zscale=tin=bt709:min=bt709:pin=bt709:t=smpte2084:m=bt2020nc:p=bt2020,format=yuv420p10le" \
+		-f rawvideo -frames:v 1 \
+		test/samples/mandelbrot_1080p_i010_pq.yuv 2>/dev/null \
+		&& echo "    test/samples/mandelbrot_1080p_i010_pq.yuv" || echo "    (failed)"
+	@echo "  Test source v2 (1080p, PQ I010)..."
+	@ffmpeg -y -f lavfi -i "testsrc2=size=1920x1080:rate=1:duration=1" \
+		-vf "zscale=tin=bt709:min=bt709:pin=bt709:t=smpte2084:m=bt2020nc:p=bt2020,format=yuv420p10le" \
+		-f rawvideo -frames:v 1 \
+		test/samples/testsrc2_1080p_i010_pq.yuv 2>/dev/null \
+		&& echo "    test/samples/testsrc2_1080p_i010_pq.yuv" || echo "    (failed)"
+	@echo ""
+	@echo "=== Downloading real-world HDR test content ==="
+	@echo ""
+	@echo "  haasn/hdr-tests colorbars (1080p HEVC HDR10, 258 KB) → extracting 1 frame..."
+	@curl -fsSL -o test/samples/hdr_colorbars.mp4 \
+		"https://github.com/haasn/hdr-tests/raw/master/colorbars.mp4" 2>/dev/null \
+		&& ffmpeg -y -i test/samples/hdr_colorbars.mp4 -frames:v 1 \
+			-f rawvideo -pix_fmt yuv420p10le \
+			test/samples/hdr_colorbars_1080p_i010_pq.yuv 2>/dev/null \
+		&& rm -f test/samples/hdr_colorbars.mp4 \
+		&& echo "    test/samples/hdr_colorbars_1080p_i010_pq.yuv (1080p PQ, from haasn/hdr-tests)" \
+		|| { rm -f test/samples/hdr_colorbars.mp4; echo "    (skipped: download or conversion failed)"; }
+	@echo "  haasn/hdr-tests snow-fades (1080p HEVC HDR10, 3.4 MB) → extracting 1 frame..."
+	@curl -fsSL -o test/samples/hdr_snow.mp4 \
+		"https://github.com/haasn/hdr-tests/raw/master/snow-fades.mp4" 2>/dev/null \
+		&& ffmpeg -y -i test/samples/hdr_snow.mp4 -frames:v 1 \
+			-f rawvideo -pix_fmt yuv420p10le \
+			test/samples/hdr_snow_i010_pq.yuv 2>/dev/null \
+		&& rm -f test/samples/hdr_snow.mp4 \
+		&& echo "    test/samples/hdr_snow_i010_pq.yuv (PQ, from haasn/hdr-tests)" \
+		|| { rm -f test/samples/hdr_snow.mp4; echo "    (skipped: download or conversion failed)"; }
+	@echo "  OpenEXR StillLife → PQ I010 via zscale..."
+	@curl -fsSL -o test/samples/StillLife.exr \
+		"https://raw.githubusercontent.com/AcademySoftwareFoundation/openexr-images/main/ScanLines/StillLife.exr" 2>/dev/null \
+		&& ffmpeg -y -i test/samples/StillLife.exr \
+			-vf "zscale=tin=linear:min=bt709:pin=bt709:t=smpte2084:m=bt2020nc:p=bt2020,format=yuv420p10le" \
+			-f rawvideo test/samples/stilllife_i010_pq.yuv 2>/dev/null \
+		&& rm -f test/samples/StillLife.exr \
+		&& echo "    test/samples/stilllife_i010_pq.yuv (1240x846, from OpenEXR, BSD license)" \
+		|| { rm -f test/samples/StillLife.exr; echo "    (skipped: download or conversion failed)"; }
+	@echo ""
+	@echo "=== Converting local JPEG photographs to PQ I010 ==="
+	@echo ""
+	@for src in test/samples/*.jpg; do \
+		[ -f "$$src" ] || continue; \
+		base=$$(basename "$$src" .jpg | sed 's/[^a-zA-Z0-9]/_/g' | tr 'A-Z' 'a-z'); \
+		out="test/samples/$${base}_i010_pq.yuv"; \
+		if [ -f "$$out" ]; then continue; fi; \
+		dims=$$(ffmpeg -i "$$src" 2>&1 | grep -oP '\d+x\d+' | head -1); \
+		w=$$(echo "$$dims" | cut -dx -f1); \
+		h=$$(echo "$$dims" | cut -dx -f2); \
+		h=$$(( (h / 2) * 2 )); \
+		echo "  $$src → $$out ($${w}x$${h})..."; \
+		ffmpeg -y -i "$$src" \
+			-vf "crop=$${w}:$${h},zscale=tin=bt709:min=bt709:pin=bt709:t=smpte2084:m=bt2020nc:p=bt2020,format=yuv420p10le" \
+			-f rawvideo -frames:v 1 "$$out" 2>/dev/null \
+			&& echo "    $$out" || echo "    (failed)"; \
+	done
+	@echo ""
+	@echo "=== Done. Run 'make visual' to generate output PNGs. ==="
+	@echo "    Sample frames are in test/samples/ (gitignored)."
+	@echo ""
+
 clean:
 	rm -f $(LIB_OBJS) $(TEST_OBJS) libfunnelcake.a funnelcake_test
-	rm -f $(LIB_SRCS:.c=.gcda) $(TEST_SRCS:.c=.gcda)
-	rm -f $(LIB_SRCS:.c=.profraw) default.profdata
+	rm -f src/*.gcda test/*.gcda
+	rm -f src/*.profraw default.profdata
 	rm -rf output/*
 
 # --- Profile-Guided Optimization ---
@@ -159,10 +257,26 @@ src/log.o: src/log.c
 src/detect.o: src/detect.c
 	$(CC) $(DETECT_CFLAGS) -c -o $@ $<
 
+# HDR library sources use LIB_CFLAGS (O3)
+src/funnelcake_hdr.o: src/funnelcake_hdr.c
+	$(CC) $(LIB_CFLAGS) -c -o $@ $<
+
+src/tonemap.o: src/tonemap.c
+	$(CC) $(LIB_CFLAGS) -c -o $@ $<
+
+src/kernels_hdr_scalar.o: src/kernels_hdr_scalar.c
+	$(CC) $(LIB_CFLAGS) $(SCALAR_CFLAGS) -c -o $@ $<
+
+src/kernels_hdr_avx2.o: src/kernels_hdr_avx2.c
+	$(CC) $(LIB_CFLAGS) -mavx2 -c -o $@ $<
+
+src/kernels_hdr_neon.o: src/kernels_hdr_neon.c
+	$(CC) $(LIB_CFLAGS) -c -o $@ $<
+
 # Test source files use TEST_CFLAGS (O2)
 test/%.o: test/%.c
 	$(CC) $(TEST_CFLAGS) -c -o $@ $<
 
 # Header dependencies (conservative: rebuild all on header change)
-$(LIB_OBJS): include/funnelcake.h src/internal.h src/log.h src/detect.h
+$(LIB_OBJS): include/funnelcake.h src/internal.h src/log.h src/detect.h src/tonemap.h
 $(TEST_OBJS): include/funnelcake.h test/test_main.h test/test_patterns.h

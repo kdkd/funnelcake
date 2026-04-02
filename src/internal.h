@@ -132,4 +132,159 @@ void fused_kernel_pow2_neon(const fused_kernel_params_t *p,
 #endif /* __aarch64__ */
 
 
+
+/* ==========================================================================
+ * HDR10 internal types
+ *
+ * Parallel to the 8-bit types above, but with uint16_t planes for 10-bit
+ * samples. Used by the HDR kernel files and funnelcake_hdr.c.
+ * ========================================================================== */
+
+
+/* --------------------------------------------------------------------------
+ * fused_hdr_kernel_params_t
+ *
+ * 10-bit analog of fused_kernel_params_t. Same structure, wider plane
+ * pointers. Filled by fused_hdr_init; read-only during fused_hdr_run.
+ * -------------------------------------------------------------------------- */
+
+typedef struct {
+    int src_width;
+    int src_height;
+    int src_y_stride;       /* bytes per luma row in source                */
+    int src_uv_stride;      /* bytes per chroma row (or interleaved UV)    */
+
+    int family;
+    int cascade_depth;
+    int vert_period;
+
+    uint32_t active_outputs;
+
+    struct {
+        int       width;
+        int       height;
+        int       y_stride;     /* bytes per row */
+        int       uv_stride;    /* bytes per row */
+        uint16_t *plane_y;
+        uint16_t *plane_u;
+        uint16_t *plane_v;
+    } out[FUSED_MAX_STEPS];
+
+    int chunks_per_row;     /* full SIMD-width chunks per row (16-bit elements) */
+    int tail_elements;      /* leftover luma elements after full chunks         */
+    int row_groups;
+
+    /* Pre-computed element strides (stride / sizeof(uint16_t)).  Avoids a
+     * division in the kernel entry points on every frame. */
+    int src_y_el_stride;
+    int src_uv_el_stride;
+
+    /* P010 format: kernel deinterleaves chroma at load time */
+    int is_p010;            /* 1 = interleaved UV source, 0 = planar */
+
+    /* Pre-allocated P010 deinterleave buffers (avoids per-frame malloc).
+     * Only allocated when is_p010 == 1.  Each holds one chroma plane at
+     * source chroma dimensions with 32-byte aligned stride. */
+    uint16_t *p010_tmp_u;   /* NULL if !is_p010 */
+    uint16_t *p010_tmp_v;   /* NULL if !is_p010 */
+    int       p010_tmp_stride;  /* bytes per row (32-byte aligned) */
+} fused_hdr_kernel_params_t;
+
+
+/* --------------------------------------------------------------------------
+ * fused_hdr_kernel_fn
+ *
+ * 10-bit kernel entry point signature. Same pattern as fused_kernel_fn
+ * but with uint16_t source planes.
+ * -------------------------------------------------------------------------- */
+
+typedef void (*fused_hdr_kernel_fn)(const fused_hdr_kernel_params_t *p,
+                                    const uint16_t *src_y,
+                                    const uint16_t *src_u,
+                                    const uint16_t *src_v);
+
+
+/* --------------------------------------------------------------------------
+ * fused_hdr_internal_t
+ *
+ * Opaque blob stored in fused_hdr_ctx_t._internal.
+ * -------------------------------------------------------------------------- */
+
+typedef struct {
+    fused_hdr_kernel_params_t params;
+    fused_hdr_kernel_fn       kernel_fn;
+    int                       has_simd;
+
+    /* Tone mapping LUTs — generated at init from transfer + curve config.
+     *
+     * lut_y: 10-bit PQ/HLG input → 8-bit BT.709 gamma output (1024 entries).
+     *   Used by the luma pass for fast per-pixel tone mapping.
+     *
+     * pq_to_linear: 10-bit PQ code → linear luminance as float [0, 1]
+     *   where 1.0 = 10000 nits.  Used by the chroma pass to reconstruct
+     *   linear-light R, G, B from YCbCr for correct gamut mapping.
+     *
+     * linear_to_sdr: linear luminance [0, 1] quantized to 12 bits → 8-bit
+     *   SDR gamma output.  Incorporates tone curve + BT.709 OETF.
+     *   Indexed by (linear_value * 4095).  Used by the chroma pass to
+     *   tone-map the reconstructed R, G, B channels individually.
+     */
+    uint8_t  lut_y[1024];
+    float    pq_to_linear[1024];    /* PQ code → linear [0,1] */
+    uint8_t  linear_to_sdr[4096];   /* linear 12-bit → 8-bit SDR gamma */
+
+    /* Temp 10-bit buffers for SDR-only outputs (no HDR output requested
+     * at that step, but we need a 10-bit intermediate to tone map from).
+     * Only allocated for steps in sdr_flags but not in hdr_flags. */
+    struct { uint16_t *y, *u, *v; } sdr_temp[FUSED_MAX_STEPS];
+
+    /* Which outputs need tone mapping after scaling */
+    uint32_t sdr_flags;
+    int      tonemap_1x;
+    int      is_custom_lut;  /* 1 if using FUSED_TONEMAP_CUSTOM (skip RGB chroma path) */
+} fused_hdr_internal_t;
+
+
+/* --------------------------------------------------------------------------
+ * HDR kernel entry point declarations
+ * -------------------------------------------------------------------------- */
+
+/* Scalar (always compiled) */
+void fused_kernel_thirds_hdr_scalar(const fused_hdr_kernel_params_t *p,
+                                    const uint16_t *src_y,
+                                    const uint16_t *src_u,
+                                    const uint16_t *src_v);
+
+void fused_kernel_pow2_hdr_scalar(const fused_hdr_kernel_params_t *p,
+                                  const uint16_t *src_y,
+                                  const uint16_t *src_u,
+                                  const uint16_t *src_v);
+
+#if defined(__x86_64__)
+/* AVX2 (x86_64 only) */
+void fused_kernel_thirds_hdr_avx2(const fused_hdr_kernel_params_t *p,
+                                   const uint16_t *src_y,
+                                   const uint16_t *src_u,
+                                   const uint16_t *src_v);
+
+void fused_kernel_pow2_hdr_avx2(const fused_hdr_kernel_params_t *p,
+                                 const uint16_t *src_y,
+                                 const uint16_t *src_u,
+                                 const uint16_t *src_v);
+#endif /* __x86_64__ */
+
+#if defined(__aarch64__)
+/* NEON (aarch64 only) */
+void fused_kernel_thirds_hdr_neon(const fused_hdr_kernel_params_t *p,
+                                   const uint16_t *src_y,
+                                   const uint16_t *src_u,
+                                   const uint16_t *src_v);
+
+void fused_kernel_pow2_hdr_neon(const fused_hdr_kernel_params_t *p,
+                                 const uint16_t *src_y,
+                                 const uint16_t *src_u,
+                                 const uint16_t *src_v);
+#endif /* __aarch64__ */
+
+
 #endif /* FUNNELCAKE_INTERNAL_H */

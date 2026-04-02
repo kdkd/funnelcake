@@ -598,3 +598,166 @@ rounding — equivalent to `avg(in[2i], in[2i+1])`.
 | `h_chunk_3x` | kernels_neon.c | NEON horizontal 3× on deinterleaved chunk |
 | `h_chunk_6x` | kernels_neon.c | NEON horizontal 6× (cascade from 3×) |
 | `neon_blend_reg` | kernels_neon.c | NEON bilinear blend (16 bytes) |
+
+---
+
+## 10-bit HDR kernel architecture
+
+The HDR path reuses the same vertical/horizontal structure as the 8-bit
+kernels but operates on `uint16_t` samples (10-bit values in the low
+bits). After scaling, SDR outputs pass through a LUT-based tone mapping
+stage.
+
+
+### Arithmetic differences from 8-bit
+
+Moving from 8-bit to 10-bit halves the number of pixels per SIMD
+register and requires wider intermediate arithmetic:
+
+| Operation | 8-bit kernel | 10-bit kernel |
+|-----------|-------------|--------------|
+| Pixels per YMM register | 32 | 16 |
+| Pixels per NEON Q register | 16 | 8 |
+| Pairwise average | `vpavgb` (8-bit) | Manual: add + shift (see below) |
+| Bilinear blend | 16-bit intermediate, 8-bit result | 32-bit intermediate, 16-bit result |
+| Thirds chunk size (AVX2) | 96 bytes (32 triplets) | 96 bytes (16 triplets) |
+| Thirds chunk size (NEON) | 48 bytes (16 triplets) | 48 bytes (8 triplets) |
+
+**Why `_mm256_avg_epu16` does not exist.** AVX2 provides `vpavgb`
+(`_mm256_avg_epu8`) for unsigned 8-bit averaging but has no 16-bit
+equivalent. The 10-bit kernel works around this with an explicit
+add-and-shift sequence:
+
+```
+avg(a, b) = (a + b + 1) >> 1
+```
+
+Implemented as:
+
+```c
+/* 10-bit unsigned average of two __m256i vectors */
+__m256i sum  = _mm256_add_epi16(a, b);
+__m256i one  = _mm256_set1_epi16(1);
+__m256i rnd  = _mm256_add_epi16(sum, one);
+__m256i avg  = _mm256_srli_epi16(rnd, 1);
+```
+
+This costs 3 instructions versus 1 for the 8-bit `vpavgb`. The blend
+operation similarly widens: the 8-bit blend uses `_mm256_mulhi_epu16`
+on 16-bit intermediates, while the 10-bit blend must use
+`_mm256_mullo_epi32` / `_mm256_srli_epi32` on 32-bit intermediates,
+processing half as many elements per instruction.
+
+
+### 10-bit deinterleave
+
+The triplet deinterleave (ABC pattern) uses the same structural approach
+as the 8-bit version but with 16-bit element granularity.
+
+**NEON:** uses `vld3q_u16` — the 16-bit variant of the hardware
+deinterleave instruction. Loads 24 elements (48 bytes) and separates
+them into three 8-element vectors. The store-reload technique is
+identical to the 8-bit path:
+
+```
+Vertical result       48-byte         vld3q_u16       Deinterleaved
+  (3 × Q reg)   -->  stack buf  -->  reload    -->   (3 × Q reg)
+  u16 elements        vst1q×3                         A[], B[], C[]
+```
+
+**AVX2:** uses new shuffle tables for 16-bit elements. The byte-pair
+movement pattern mirrors the 8-bit approach but each shuffle mask entry
+moves two bytes at a time:
+
+```
+8-bit shuffle mask byte:   [0, 3, 6, 9, ...]     (pick every 3rd byte)
+10-bit shuffle mask bytes: [0,1, 6,7, 12,13, ...] (pick every 3rd uint16)
+```
+
+The `vperm2i128` / `vpshufb` pipeline is the same three-step structure
+(load, lane rearrange, broadcast-mask shuffle). Each mask pair moves
+16-bit elements rather than individual bytes, producing 16 deinterleaved
+`uint16_t` values per component instead of 32 `uint8_t` values.
+
+
+### Tone mapping pipeline
+
+Tone mapping is applied after scaling to produce SDR outputs. The
+pipeline runs per-step for scaled SDR outputs and once at source
+resolution for the `tonemap_1x` output:
+
+```
+10-bit source
+     |
+     v
+ [ Vertical + Horizontal scaling ]  (same structure as 8-bit)
+     |
+     +---> HDR output  (10-bit, written directly)
+     |
+     v
+ [ LUT-based tone map ]
+     |
+     v
+   SDR output  (8-bit)
+```
+
+**LUT structure:**
+
+The tone map uses three precomputed LUTs, generated at init time from
+the selected curve, transfer function, and peak/target nits:
+
+| LUT | Size | Input | Output |
+|-----|------|-------|--------|
+| `lut_y` | 1024 entries, `uint8_t` | 10-bit luma [0..1023] | 8-bit luma [0..255] |
+| `lut_u_scale` | 1024 entries, `uint16_t` | 10-bit luma (co-located) | Chroma scale factor |
+| `lut_v_scale` | 1024 entries, `uint16_t` | 10-bit luma (co-located) | Chroma scale factor |
+
+Luma mapping is a direct table lookup. Chroma mapping is luma-dependent:
+the tone map reads the co-located Y value from the (already scaled)
+luma plane to index `lut_u_scale` / `lut_v_scale`, then applies the
+scale factor to convert 10-bit chroma to 8-bit. For 4:2:0 subsampling,
+each chroma sample's co-located luma is the average of the four
+surrounding luma pixels.
+
+
+### Format conversion
+
+**P010 deinterleave at load time.** P010 stores chroma as interleaved
+UV pairs in a single plane. The kernel deinterleaves U and V during the
+SIMD load phase — no intermediate buffer is allocated. Even elements
+become U, odd elements become V. On AVX2 this uses a `vpshufb` mask
+that separates even/odd 16-bit elements within each lane.
+
+**4:2:2 row-skipping.** I210 and P210 provide chroma at full vertical
+resolution (4:2:2). Since the scaler produces 4:2:0 output, every
+other chroma row is skipped by doubling the chroma stride in the
+kernel's row iteration. No conversion buffer is needed.
+
+
+### Updated summary: buffers and register usage
+
+#### 10-bit thirds kernel
+
+| Resource | What | Size | Notes |
+|----------|------|------|-------|
+| SIMD registers | v01, v23, v45, blends, cascades | 9-18 regs (16-bit elements) | Never written to memory; half the pixel throughput vs 8-bit |
+| Stack buffer | Deinterleave scratch (NEON only) | 48 bytes | For vld3q_u16 store-reload |
+| Heap buffer A | 12x ping-pong (even group) | src_width * 2 bytes | Only if 12x is active (uint16_t per sample) |
+| Heap buffer B | 12x ping-pong (odd group) | src_width * 2 bytes | Only if 12x is active |
+| Heap LUTs | Tone mapping tables | 1024 + 2x2048 bytes | lut_y (uint8) + lut_u/v_scale (uint16) |
+
+#### 10-bit pow2 kernel
+
+| Resource | What | Size | Notes |
+|----------|------|------|-------|
+| Heap buffer | vert_buf[k] for each level k | (group_rows >> (k+1)) * src_width * 2 bytes | Up to 4 levels; uint16_t per sample |
+| Heap buffer | h_buf horizontal scratch | src_width * 2 bytes | Reused across all halvings |
+| Heap LUTs | Tone mapping tables | 1024 + 2x2048 bytes | Shared with thirds if both active |
+
+#### 10-bit chunk sizes
+
+| Platform | Thirds chunk | Pow2 vertical chunk | Pow2 horizontal chunk |
+|----------|-------------|--------------------|-----------------------|
+| AVX2 | 96 bytes (16 triplets, 3 x YMM) | 32 bytes (16 pixels, 1 x YMM) | 32 bytes (16 pixels) -> 16 bytes (8 pixels) |
+| NEON | 48 bytes (8 triplets, 3 x Q) | 16 bytes (8 pixels, 1 x Q) | 16 bytes (8 pixels) -> 8 bytes (4 pixels) |
+| Scalar | 2 bytes (1 pixel) | 2 bytes (1 pixel) | 2 bytes -> 2 bytes |

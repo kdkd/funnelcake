@@ -27,6 +27,7 @@ build_arch() {
   local platform
   local package_dir="funnelcake-linux-ubuntu20-${arch}"
   local export_dir="${DIST_DIR}/.${package_dir}.tmp"
+  local output_root
 
   case "${arch}" in
     amd64) platform="linux/amd64" ;;
@@ -90,11 +91,12 @@ RUN pkg="funnelcake-linux-ubuntu20-${TARGETARCH}" \
     && sha256sum "${pkg}.tar.gz" > "${pkg}.tar.gz.sha256"
 EOF
 
+  output_root="${export_dir}/out"
   rm -rf "${DIST_DIR}/${package_dir}"
   rm -f "${DIST_DIR}/${package_dir}.tar.gz" "${DIST_DIR}/${package_dir}.tar.gz.sha256"
-  mv "${export_dir}/${package_dir}" "${DIST_DIR}/${package_dir}"
-  mv "${export_dir}/${package_dir}.tar.gz" "${DIST_DIR}/${package_dir}.tar.gz"
-  mv "${export_dir}/${package_dir}.tar.gz.sha256" "${DIST_DIR}/${package_dir}.tar.gz.sha256"
+  mv "${output_root}/${package_dir}" "${DIST_DIR}/${package_dir}"
+  mv "${output_root}/${package_dir}.tar.gz" "${DIST_DIR}/${package_dir}.tar.gz"
+  mv "${output_root}/${package_dir}.tar.gz.sha256" "${DIST_DIR}/${package_dir}.tar.gz.sha256"
   rm -rf "${export_dir}"
 }
 

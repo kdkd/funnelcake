@@ -77,15 +77,31 @@ void run_bench_tests(const char *filter);
 void run_hdr_validation_tests(void);
 void run_hdr_correctness_tests(void);
 void run_hdr_bench_tests(const char *filter);
+void run_swscale_bench_tests(const char *filter);
+
+/* Shared benchmark results for comparison table */
+#define BENCH_MAX_CONFIGS 8
+typedef struct {
+    const char *label;
+    double      funnelcake_med;     /* funnelcake median µs (0 = not run) */
+    double      swscale_indep_med;  /* swscale independent median µs */
+    double      swscale_cascade_med;/* swscale cascaded median µs */
+} bench_comparison_t;
+
+extern bench_comparison_t g_bench_comparison[BENCH_MAX_CONFIGS];
+extern int                g_bench_comparison_count;
+
+void print_bench_comparison_table(void);
 
 /* --------------------------------------------------------------------------
  * Options parsed from command-line arguments
  * -------------------------------------------------------------------------- */
 
 typedef struct {
-    int         run_bench;      /* --bench: runs both SDR and HDR benches */
-    int         run_bench_sdr;  /* --bench-sdr: SDR benchmarks only */
-    int         run_bench_hdr;  /* --bench-hdr: HDR benchmarks only */
+    int         run_bench;         /* --bench: runs SDR + HDR + swscale benches */
+    int         run_bench_sdr;     /* --bench-sdr: SDR benchmarks only */
+    int         run_bench_hdr;     /* --bench-hdr: HDR benchmarks only */
+    int         run_bench_swscale; /* --bench-swscale: libswscale comparison only */
     int         run_visual;
     const char *bench_filter;
 } test_options_t;

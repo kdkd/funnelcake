@@ -70,6 +70,38 @@ TEST_CFLAGS = $(CFLAGS_BASE) $(TEST_OPT) $(TUNE_CFLAGS) $(LTO_CFLAGS)
 # This variable intentionally excludes LIB_OPT (where -fprofile-* lives).
 DETECT_CFLAGS = $(CFLAGS_BASE) -O2 $(TUNE_CFLAGS)
 
+# --- Optional: libswscale for comparison benchmarks ---
+# Try pkg-config first, then probe common paths
+SWSCALE_CFLAGS := $(shell pkg-config --cflags libswscale libavutil 2>/dev/null)
+SWSCALE_LIBS   := $(shell pkg-config --libs libswscale libavutil 2>/dev/null)
+
+ifeq ($(SWSCALE_LIBS),)
+  # macOS Homebrew
+  ifneq ($(wildcard /opt/homebrew/include/libswscale/swscale.h),)
+    SWSCALE_CFLAGS := -I/opt/homebrew/include
+    SWSCALE_LIBS   := -L/opt/homebrew/lib -lswscale -lavutil
+  endif
+endif
+ifeq ($(SWSCALE_LIBS),)
+  # Linux x86_64
+  ifneq ($(wildcard /usr/include/x86_64-linux-gnu/libswscale/swscale.h),)
+    SWSCALE_CFLAGS := -I/usr/include/x86_64-linux-gnu
+    SWSCALE_LIBS   := -lswscale -lavutil
+  endif
+endif
+ifeq ($(SWSCALE_LIBS),)
+  # Linux aarch64
+  ifneq ($(wildcard /usr/include/aarch64-linux-gnu/libswscale/swscale.h),)
+    SWSCALE_CFLAGS := -I/usr/include/aarch64-linux-gnu
+    SWSCALE_LIBS   := -lswscale -lavutil
+  endif
+endif
+
+ifneq ($(SWSCALE_LIBS),)
+  SWSCALE_TEST_CFLAGS = $(SWSCALE_CFLAGS) -DHAVE_LIBSWSCALE
+  SWSCALE_TEST_LDFLAGS = $(SWSCALE_LIBS)
+endif
+
 # Library sources (always compiled)
 LIB_SRCS = src/funnelcake.c src/funnelcake_hdr.c src/log.c src/detect.c \
            src/kernels_scalar.c src/kernels_hdr_scalar.c src/tonemap.c
@@ -89,11 +121,11 @@ LIB_OBJS = $(LIB_SRCS:.c=.o)
 TEST_SRCS = test/test_main.c test/test_validation.c test/test_correctness.c \
             test/test_patterns.c test/test_visual.c test/test_bench.c \
             test/test_hdr_validation.c test/test_hdr_correctness.c \
-            test/test_hdr_bench.c
+            test/test_hdr_bench.c test/test_swscale_bench.c
 TEST_OBJS = $(TEST_SRCS:.c=.o)
 
 # Default target
-.PHONY: all lib test bench bench-sdr bench-hdr visual fetch-samples clean pgo pgo-clean
+.PHONY: all lib test bench bench-sdr bench-hdr bench-swscale visual fetch-samples clean pgo pgo-clean
 
 all: lib
 
@@ -103,7 +135,7 @@ libfunnelcake.a: $(LIB_OBJS)
 	$(AR) rcs $@ $^
 
 funnelcake_test: $(TEST_OBJS) libfunnelcake.a
-	$(CC) $(TEST_CFLAGS) $(LTO_LDFLAGS) -o $@ $(TEST_OBJS) -L. -lfunnelcake $(LDFLAGS)
+	$(CC) $(TEST_CFLAGS) $(LTO_LDFLAGS) -o $@ $(TEST_OBJS) -L. -lfunnelcake $(LDFLAGS) $(SWSCALE_TEST_LDFLAGS)
 
 test: funnelcake_test
 	./funnelcake_test
@@ -116,6 +148,9 @@ bench-sdr: funnelcake_test
 
 bench-hdr: funnelcake_test
 	./funnelcake_test --bench-hdr
+
+bench-swscale: funnelcake_test
+	./funnelcake_test --bench-swscale
 
 visual: funnelcake_test
 	@mkdir -p output
@@ -276,6 +311,10 @@ src/kernels_hdr_neon.o: src/kernels_hdr_neon.c
 # Test source files use TEST_CFLAGS (O2)
 test/%.o: test/%.c
 	$(CC) $(TEST_CFLAGS) -c -o $@ $<
+
+# swscale bench needs extra include paths and -DHAVE_LIBSWSCALE
+test/test_swscale_bench.o: test/test_swscale_bench.c
+	$(CC) $(TEST_CFLAGS) $(SWSCALE_TEST_CFLAGS) -c -o $@ $<
 
 # Header dependencies (conservative: rebuild all on header change)
 $(LIB_OBJS): include/funnelcake.h src/internal.h src/log.h src/detect.h src/tonemap.h

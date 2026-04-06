@@ -112,6 +112,25 @@ static void bench_config(const char *label, int width, int height,
            t_min, t_median, t_mean, t_max,
            budget_pct);
 
+    /* Record median for comparison table */
+    if (g_bench_comparison_count < BENCH_MAX_CONFIGS) {
+        bench_comparison_t *c = &g_bench_comparison[g_bench_comparison_count];
+        /* Check if this label already exists (from a previous run) */
+        int found = -1;
+        for (int ci = 0; ci < g_bench_comparison_count; ci++) {
+            if (strcmp(g_bench_comparison[ci].label, label) == 0) { found = ci; break; }
+        }
+        if (found >= 0) {
+            g_bench_comparison[found].funnelcake_med = t_median;
+        } else {
+            c->label = label;
+            c->funnelcake_med = t_median;
+            c->swscale_indep_med = 0;
+            c->swscale_cascade_med = 0;
+            g_bench_comparison_count++;
+        }
+    }
+
     fused_scaler_free(&ctx);
     test_frame_free(&frame);
 }

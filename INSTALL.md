@@ -68,3 +68,13 @@ Install Xcode command line tools:
 ### Ubuntu / Debian (aarch64)
 
     sudo apt install build-essential clang
+
+## Ubuntu 20 Release Artifacts
+
+To build portable Ubuntu 20.04 release tarballs for both `amd64` and `arm64`
+from any Docker host with `buildx` enabled:
+
+    ./scripts/build-linux-ubuntu20.sh
+
+Artifacts are written to `dist/` as per-architecture tarballs containing
+`libfunnelcake.a`, `include/funnelcake.h`, and basic build metadata.

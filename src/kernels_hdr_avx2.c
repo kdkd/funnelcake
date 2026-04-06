@@ -313,41 +313,6 @@ static const uint8_t ALIGN16 shuf_C16_r2[16] = {
 
 
 /* -----------------------------------------------------------------------
- * SSE 128-bit deinterleave: 48 bytes (3 x __m128i, 24 uint16_t elements
- * = 8 triplets) into three 8-element component vectors.
- *
- * Each shuffle selects the uint16_t elements belonging to one component
- * from one register and zeroes the rest via the 0x80 mask.  OR combines
- * the three partial results into the complete 8-element vector.
- * ----------------------------------------------------------------------- */
-
-static inline void deinterleave_3x8_hdr(__m128i r0, __m128i r1, __m128i r2,
-                                         __m128i *out_A, __m128i *out_B, __m128i *out_C)
-{
-    __m128i mA0 = _mm_load_si128((const __m128i *)shuf_A16_r0);
-    __m128i mA1 = _mm_load_si128((const __m128i *)shuf_A16_r1);
-    __m128i mA2 = _mm_load_si128((const __m128i *)shuf_A16_r2);
-    *out_A = _mm_or_si128(_mm_or_si128(
-        _mm_shuffle_epi8(r0, mA0), _mm_shuffle_epi8(r1, mA1)),
-        _mm_shuffle_epi8(r2, mA2));
-
-    __m128i mB0 = _mm_load_si128((const __m128i *)shuf_B16_r0);
-    __m128i mB1 = _mm_load_si128((const __m128i *)shuf_B16_r1);
-    __m128i mB2 = _mm_load_si128((const __m128i *)shuf_B16_r2);
-    *out_B = _mm_or_si128(_mm_or_si128(
-        _mm_shuffle_epi8(r0, mB0), _mm_shuffle_epi8(r1, mB1)),
-        _mm_shuffle_epi8(r2, mB2));
-
-    __m128i mC0 = _mm_load_si128((const __m128i *)shuf_C16_r0);
-    __m128i mC1 = _mm_load_si128((const __m128i *)shuf_C16_r1);
-    __m128i mC2 = _mm_load_si128((const __m128i *)shuf_C16_r2);
-    *out_C = _mm_or_si128(_mm_or_si128(
-        _mm_shuffle_epi8(r0, mC0), _mm_shuffle_epi8(r1, mC1)),
-        _mm_shuffle_epi8(r2, mC2));
-}
-
-
-/* -----------------------------------------------------------------------
  * AVX2 256-bit deinterleave for 10-bit: 96 bytes (3 x __m256i,
  * 48 uint16_t elements = 16 triplets) into three 16-element vectors.
  *

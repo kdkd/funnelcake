@@ -31,7 +31,7 @@
 > `make pgo TUNE=broadwell LTO=1` and `make pgo TUNE=skylake LTO=1` and keep
 > whichever is faster.
 
-    make LTO=1                  # enable link-time optimization (recommended for production)
+    make LTO=1                  # enable link-time optimization for in-tree binaries
     make LTO=1 TUNE=znver2      # combine LTO with CPU tuning
 
     make pgo                    # profile-guided optimization (compile, benchmark, recompile)
@@ -53,6 +53,10 @@ For maximum performance on a specific machine:
 
     make pgo TUNE=native LTO=1
 
+If you are shipping `libfunnelcake.a` to another build system, keep `LTO=0`
+(the default). `clang -flto` archives can contain LLVM bitcode members instead
+of standard ELF `.o` files, which some consumers reject.
+
 ## Platform Notes
 
 ### macOS (Apple Silicon)
@@ -68,3 +72,16 @@ Install Xcode command line tools:
 ### Ubuntu / Debian (aarch64)
 
     sudo apt install build-essential clang
+
+## Ubuntu 20 Release Artifacts
+
+To build portable Ubuntu 20.04 release tarballs for both `amd64` and `arm64`
+from any Docker host with `buildx` enabled:
+
+    ./scripts/build-linux-ubuntu20.sh
+
+Artifacts are written to `dist/` as per-architecture tarballs containing
+`libfunnelcake.a`, `include/funnelcake.h`, and basic build metadata. These
+release archives are built with `CC=clang LTO=0` so the static library contains
+standard object files suitable for downstream linkers that do not understand
+Clang LTO bitcode.

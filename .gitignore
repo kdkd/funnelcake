@@ -3,6 +3,7 @@
 *.a
 *.d
 build/
+dist/
 funnelcake_test
 
 # Test output

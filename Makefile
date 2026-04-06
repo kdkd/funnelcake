@@ -1,6 +1,6 @@
 CC ?= clang
 AR ?= ar
-CFLAGS_BASE = -std=c11 -D_POSIX_C_SOURCE=200112L -Wall -Wextra -Werror -Iinclude -Isrc
+CFLAGS_BASE = -std=c11 -D_POSIX_C_SOURCE=200112L -Wall -Wextra -Werror -fPIC -Iinclude -Isrc
 LDFLAGS = -lm
 
 # Optimization level: O3 for library, O2 for tests (tests don't need aggressive opts)

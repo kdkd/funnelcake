@@ -531,8 +531,10 @@ static void fill_hdr_pq_colorbars(test_hdr_frame_t *f)
 
         int cb_code = (int)(Cb * 1023.0 + 512.0 + 0.5);
         int cr_code = (int)(Cr * 1023.0 + 512.0 + 0.5);
-        if (cb_code < 0) cb_code = 0; if (cb_code > 1023) cb_code = 1023;
-        if (cr_code < 0) cr_code = 0; if (cr_code > 1023) cr_code = 1023;
+        if (cb_code < 0) cb_code = 0;
+        if (cb_code > 1023) cb_code = 1023;
+        if (cr_code < 0) cr_code = 0;
+        if (cr_code > 1023) cr_code = 1023;
         bar_cb[i] = (uint16_t)cb_code;
         bar_cr[i] = (uint16_t)cr_code;
     }

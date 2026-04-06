@@ -185,7 +185,8 @@ Concurrent reads from separate contexts on the same source data are safe.
 ## Getting started
 
 See **[INSTALL.md](INSTALL.md)** for build instructions, compiler requirements,
-PGO and LTO setup, and CPU-specific tuning recommendations.
+PGO and LTO setup, CPU-specific tuning recommendations, and static-library
+compatibility notes for downstream consumers.
 
 See **[docs/API.md](docs/API.md)** for the full API reference including data
 types, return codes, logging configuration, and libavcodec integration examples.

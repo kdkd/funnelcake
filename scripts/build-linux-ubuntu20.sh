@@ -68,7 +68,7 @@ WORKDIR /src
 COPY . .
 
 RUN make clean
-RUN make lib CC=clang LTO=1
+RUN make lib CC=clang LTO=0
 
 RUN pkg="/out/funnelcake-linux-ubuntu20-${TARGETARCH}" \
     && mkdir -p "${pkg}/include" \
@@ -81,7 +81,7 @@ RUN pkg="/out/funnelcake-linux-ubuntu20-${TARGETARCH}" \
        "base_distribution=ubuntu20.04" \
        "target_arch=${TARGETARCH}" \
        "compiler=clang" \
-       "lto=1" \
+       "lto=0" \
        "build_date=${BUILD_DATE}" \
        > "${pkg}/BUILD_INFO"
 

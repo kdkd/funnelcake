@@ -545,8 +545,10 @@ static inline void tonemap_pixel_rgb(
 
     int pq_r = (int)((y_norm + NCL_CR_SCALE * cr_norm) * 1023.0 + 0.5);
     int pq_b = (int)((y_norm + NCL_CB_SCALE * cb_norm) * 1023.0 + 0.5);
-    if (pq_r < 0) pq_r = 0; if (pq_r > 1023) pq_r = 1023;
-    if (pq_b < 0) pq_b = 0; if (pq_b > 1023) pq_b = 1023;
+    if (pq_r < 0) pq_r = 0;
+    if (pq_r > 1023) pq_r = 1023;
+    if (pq_b < 0) pq_b = 0;
+    if (pq_b > 1023) pq_b = 1023;
 
     float y_lin = pq_to_linear[y_pq];
     float r_lin = pq_to_linear[pq_r];

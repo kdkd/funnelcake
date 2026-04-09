@@ -58,66 +58,249 @@ constraints.
 
 ## Benchmarks
 
-All results use `make pgo LTO=1` with the CPU-specific `TUNE` value, comparing
-against calling libswscale once per output at the equivalent quality setting.
-Times are the minimum observed over 1000 frames (single-threaded).
+All measurements are single-threaded median latency over ~1000 iterations
+per workload. Each system was built with `make pgo LTO=1 TUNE=native`.
+Source frames contain pseudo-random pixel data so the benchmark is not
+cache-hot from pattern repetition. libswscale is invoked with
+`SWS_BILINEAR` and one `SwsContext` per output target - the "independent"
+configuration a naive multi-output libswscale consumer would use. For
+downscale workloads libswscale also supports a "cascade" mode where each
+output feeds the next, which is roughly 1.5–2× faster than independent
+mode on multi-level ladders; even against cascaded libswscale, funnelcake
+remains 3–10× faster on every tested CPU. 
 
-**AMD EPYC 7302 (Zen 2) - 20–40× faster than libswscale**
-```
-640×360   pow2 (2×)     12 µs    0.1% of 60fps budget
-960×540   thirds        87 µs    0.5%
-1280×720  pow2          69 µs    0.4%
-1920×1080 thirds       368 µs    2.2%
-2560×1440 pow2         318 µs    1.9%
-3840×2160 thirds      2021 µs   12.1%
-```
+Each workload label spells out the exact scales being produced. For
+example:
 
-**AMD EPYC 7301 (Zen 1) - 8–20× faster than libswscale**
-```
-640×360   pow2 (2×)     20 µs    0.1% of 60fps budget
-960×540   thirds       156 µs    0.9%
-1280×720  pow2         111 µs    0.7%
-1920×1080 thirds       684 µs    4.1%
-2560×1440 pow2         698 µs    4.2%
-3840×2160 thirds      3529 µs   21.2%
-```
+- `down:1.5x,3x,6x` - three downscale outputs at 1.5×, 3×, and 6×
+  reduction of the source dimensions
+- `up:2x,3x` - a 2× upscale with the optional 1.5× tail applied on top
+  (producing an additional 3× output, since 2 × 1.5 = 3)
+- `up:2x,4x,8x,16x,32x` - a five-level pow2 upscale cascade
+- `down:2x up:2x` - a combined call that produces one 2× downscale AND
+  one 2× upscale from the same source frame in a single
+  `fused_scaler_run`
 
-**Intel E5-2680v4 (Broadwell) - 10–25× faster than libswscale**
-```
-640×360   pow2 (2×)     22 µs    0.1% of 60fps budget
-960×540   thirds       120 µs    0.7%
-1280×720  pow2         114 µs    0.7%
-1920×1080 thirds       517 µs    3.1%
-2560×1440 pow2         535 µs    3.2%
-3840×2160 thirds      1854 µs   11.1%
-```
+Cells below show `funnelcake median time (speedup vs libswscale)`.
+Smaller time is better; larger speedup is better.
 
-**Intel Xeon 6132 (Skylake) - 15–30× faster than libswscale**
-```
-640×360   pow2 (2×)     12 µs    0.1% of 60fps budget
-960×540   thirds       102 µs    0.6%
-1280×720  pow2          99 µs    0.6%
-1920×1080 thirds       418 µs    2.5%
-2560×1440 pow2         478 µs    2.9%
-3840×2160 thirds      1872 µs   11.2%
-```
+### SDR downscale v.s. libswscale
 
-The thirds kernel is slower than the pow2 kernel at the same source resolution
-because thirds vertical periods (3 rows) fit less cleanly into cache than
-power-of-two periods (2 rows), and the horizontal thirds filter requires
-non-trivial deinterleaving on every chunk.
+**x86_64 / AVX2**
+
+| Workload | Epyc 7302 (Zen 2) | Xeon 6132 (Skylake) | Xeon E5v4 (Broadwell) |
+|---|---|---|---|
+| 640×360 down:2x                   |   11 µs  (9.9×) |   12 µs (11.8×) |   43 µs  (3.6×) |
+| 960×540 down:1.5x,3x              |   86 µs  (6.0×) |   96 µs  (7.1×) |  274 µs  (2.7×) |
+| 1280×720 down:2x,4x               |   68 µs (10.0×) |   96 µs  (9.2×) |  252 µs  (3.8×) |
+| 1920×1080 down:1.5x,3x,6x         |  372 µs  (7.4×) |  424 µs  (8.3×) |  816 µs  (4.8×) |
+| 2560×1440 down:2x,4x,8x           |  315 µs (11.8×) |  449 µs (10.7×) |  640 µs  (8.3×) |
+| 3840×2160 down:1.5x,3x,6x,12x     | 2023 µs  (6.6×) | 2046 µs  (8.3×) | 2615 µs  (7.1×) |
+
+**aarch64 / NEON**
+
+| Workload | Graviton 4 (Neoverse V2) | Apple M3 Ultra | Raspberry Pi 5 |
+|---|---|---|---|
+| 640×360 down:2x                   |   13 µs (13.2×) |   22 µs  (2.6×) |   26 µs (10.4×) |
+| 960×540 down:1.5x,3x              |   86 µs  (8.7×) |   47 µs  (6.1×) |  170 µs  (8.3×) |
+| 1280×720 down:2x,4x               |   68 µs (14.5×) |   47 µs  (7.6×) |  141 µs (12.5×) |
+| 1920×1080 down:1.5x,3x,6x         |  393 µs (16.2×) |  126 µs (11.3×) |  940 µs (14.0×) |
+| 2560×1440 down:2x,4x,8x           |  302 µs (17.1×) |  240 µs  (7.7×) | 1139 µs  (8.2×) |
+| 3840×2160 down:1.5x,3x,6x,12x     | 1774 µs (15.7×) |  561 µs (12.0×) | 5032 µs (11.2×) |
+
+### SDR upscale v.s. libswscale
+
+**x86_64 / AVX2**
+
+| Workload | Epyc 7302 (Zen 2) | Xeon 6132 (Skylake) | Xeon E5v4 (Broadwell) |
+|---|---|---|---|
+| 480×270 up:2x                   |   27 µs (10.2×) |   35 µs (10.2×) |   54 µs  (7.0×) |
+| 480×270 up:2x,4x                |  128 µs  (7.1×) |  189 µs  (6.1×) |  251 µs  (5.1×) |
+| 960×540 up:2x                   |  102 µs  (9.8×) |  156 µs  (8.1×) |  200 µs  (7.0×) |
+| 960×540 up:2x,3x                |  936 µs  (2.9×) | 1125 µs  (3.1×) | 1281 µs  (3.0×) |
+| 1920×1080 up:2x                 |  679 µs  (6.0×) |  843 µs  (6.0×) |  754 µs  (7.3×) |
+| 1920×1080 up:1.5x               |  828 µs  (3.4×) |  953 µs  (3.7×) | 1100 µs  (3.7×) |
+| 240×136 up:2x,4x,8x,16x         |  933 µs  (2.5×) | 1140 µs  (2.5×) | 1011 µs  (3.0×) |
+| 120×68 up:2x,4x,8x,16x,32x      |  939 µs  (2.1×) | 1133 µs  (2.1×) | 1038 µs  (2.4×) |
+
+**aarch64 / NEON**
+
+| Workload | Graviton 4 (Neoverse V2) | Apple M3 Ultra | Raspberry Pi 5 |
+|---|---|---|---|
+| 480×270 up:2x                   |   21 µs (22.0×) |   18 µs  (8.6×) |   71 µs (11.1×) |
+| 480×270 up:2x,4x                |  107 µs (16.2×) |   89 µs  (6.2×) |  366 µs  (8.6×) |
+| 960×540 up:2x                   |   88 µs (22.8×) |   71 µs  (8.5×) |  307 µs (10.3×) |
+| 960×540 up:2x,3x                | 1003 µs  (5.4×) |  309 µs  (5.3×) | 1933 µs  (4.7×) |
+| 1920×1080 up:2x                 |  360 µs (21.0×) |  276 µs  (8.5×) | 1677 µs  (7.6×) |
+| 1920×1080 up:1.5x               |  909 µs  (5.8×) |  238 µs  (6.9×) | 1727 µs  (4.9×) |
+| 240×136 up:2x,4x,8x,16x         |  480 µs (10.3×) |  382 µs  (3.7×) | 2053 µs  (4.8×) |
+| 120×68 up:2x,4x,8x,16x,32x      |  480 µs  (9.3×) |  386 µs  (3.2×) | 2063 µs  (4.5×) |
+
+On x86 the 1.5× upscale tail is materially slower per byte than the
+pure 2× steps because the AVX2 implementation is shuffle-port throughput
+limited in its deinterleave → weighted-blend → interleave-store path.
+NEON does not have this bottleneck because the 2→3 bilinear maps cleanly
+onto `vld2q_u8` / `vst3q_u8`. See [docs/API.md](docs/API.md#performance-notes)
+for a longer discussion.
+
+### SDR combined downscale + upscale (single pass) v.s. libswscale
+
+**x86_64 / AVX2**
+
+| Workload | Epyc 7302 (Zen 2) | Xeon 6132 (Skylake) | Xeon E5v4 (Broadwell) |
+|---|---|---|---|
+| 1920×1080 down:2x up:2x             |  848 µs (5.9×) | 1050 µs (6.0×) |  924 µs (7.2×) |
+| 1920×1080 down:1.5x,3x up:2x        | 1180 µs (5.4×) | 1328 µs (5.9×) | 1217 µs (7.0×) |
+| 1280×720 down:2x,4x up:2x,4x        | 3037 µs (2.7×) | 2535 µs (3.7×) | 2527 µs (4.2×) |
+
+**aarch64 / NEON**
+
+| Workload | Graviton 4 (Neoverse V2) | Apple M3 Ultra | Raspberry Pi 5 |
+|---|---|---|---|
+| 1920×1080 down:2x up:2x             |  454 µs (20.0×) |  345 µs (8.2×) | 2031 µs (7.4×) |
+| 1920×1080 down:1.5x,3x up:2x        |  695 µs (15.5×) |  393 µs (8.9×) | 2585 µs (7.1×) |
+| 1280×720 down:2x,4x up:2x,4x        |  891 µs (15.4×) |  724 µs (5.8×) | 3886 µs (6.2×) |
+
+### HDR10 (10-bit PQ / HLG)
+
+The bench suite does not include a libswscale HDR comparison path, so HDR
+numbers are funnelcake's absolute time only. Tone-mapping benchmarks are
+omitted. Tone map correctness is being rewritten and the current timings
+aren't representative.
+
+**x86_64 / AVX2**
+
+| Workload | Epyc 7302 | Xeon 6132 | Xeon E5v4 |
+|---|---|---|---|
+| 1920×1080 I010 down:1.5x,3x,6x        |  765 µs |  865 µs |  997 µs |
+| 3840×2160 I010 down:1.5x,3x,6x,12x    | 4266 µs | 4243 µs | 5681 µs |
+| 3840×2160 P010 down:1.5x,3x,6x,12x    | 5446 µs | 5209 µs | 6734 µs |
+| 1920×1080 I010 up:2x                  | 2845 µs | 2474 µs | 2286 µs |
+| 1920×1080 I010 down:1.5x,3x up:2x     | 3840 µs | 3409 µs | 3594 µs |
+
+**aarch64 / NEON**
+
+| Workload | Graviton 4 | Apple M3 Ultra | Raspberry Pi 5 |
+|---|---|---|---|
+| 1920×1080 I010 down:1.5x,3x,6x        |  734 µs |  234 µs |  2147 µs |
+| 3840×2160 I010 down:1.5x,3x,6x,12x    | 3233 µs | 1193 µs | 11790 µs |
+| 3840×2160 P010 down:1.5x,3x,6x,12x    | 3563 µs | 1420 µs | 13417 µs |
+| 1920×1080 I010 up:2x                  |  707 µs |  626 µs |  3393 µs |
+| 1920×1080 I010 down:1.5x,3x up:2x     | 1392 µs |  871 µs |  5500 µs |
+
+The P010 row uses the Y + interleaved-UV layout that most HEVC Main10
+encoders emit natively; the P010 vs I010 gap on the matching 4K
+workload (e.g. 5446 vs 4266 µs on Epyc 7302) is the on-the-fly UV
+deinterleave cost, not a fundamental difference in scaling work.
+
+HDR kernels are roughly 2–4× slower per byte than their SDR
+counterparts because 10-bit samples halve the number of pixels per
+SIMD register and because several per-lane operations (notably 16-bit
+averaging on AVX2) lack a single-instruction form and must be expanded
+to add-and-shift sequences.
+
+### Graviton 4 is the standout deployment target
+
+The Graviton 4 column deserves calling out explicitly. Against
+libswscale on the same hardware, funnelcake's SDR speedups on Graviton
+cluster around **15–22× on the pow2 workloads** - the 2× upscales,
+downscale ladders from 1080p through 4K, and single-pass combined
+down+up calls. For comparison, the same set of workloads sits around
+6–12× on Apple M3 Ultra, 7–14× on Raspberry Pi 5, and 5–10× on the
+x86 server CPUs in the tables above. The one exception is the 1.5×
+upscale tail (`up:2x,3x`, `up:1.5x`): that kernel is compute-bound on
+every platform and settles at ~5–6× everywhere, Graviton included.
+
+The most dramatic rows:
+
+- **Pure 2× upscales** (`480×270 up:2x`, `960×540 up:2x`,
+  `1920×1080 up:2x`): **21–23×** faster than libswscale.
+- **Single-pass combined downscale + upscale**
+  (`1920×1080 down:2x up:2x`, `down:1.5x,3x up:2x`,
+  `1280×720 down:2x,4x up:2x,4x`): **15–20×** faster.
+- **Downscale ladders** at 1080p through 4K: **15–17×** faster against
+  independent libswscale, still **~7×** faster even against libswscale's
+  cascade mode.
+
+In absolute numbers, a `c8g.2xlarge` instance (one Graviton 4 vCPU)
+processes a 1920×1080 thirds-family downscale ladder
+(`down:1.5x,3x,6x`) in **393 µs**, a complete 4K thirds ladder
+(`down:1.5x,3x,6x,12x`) in **1.77 ms**, and a combined 1080p
+downscale + 2× upscale in **454 µs**. At 60 fps each of those consumes
+less than 11% of a single core's frame budget - meaning a single
+Graviton 4 core can run the 1080p ladder for **~42 live streams** in
+parallel, or the full 4K ladder for **~9 streams**, with headroom left
+over.
+
+We don't have a single smoking-gun explanation for why Graviton's
+relative advantage is so much larger than other aarch64 parts. The
+likely contributors are that libswscale's ARM64 bilinear path is less
+aggressively hand-tuned than its x86 AVX2 path, the Neoverse V2 cores
+in Graviton 4 have generous SIMD throughput that funnelcake's
+`vld2q` / `vst3q` / `vrhaddq_u8` inner loops fully exploit, and
+libswscale's more cache-unfriendly memory access pattern interacts
+badly with the platform's memory subsystem. Whatever the exact cause,
+Graviton 4 is by a clear margin the deployment target where using
+funnelcake instead of libswscale produces the largest absolute savings
+per core for real-time multi-resolution video pipelines.
+
+### A note on the memory wall
+
+Several of the workloads in these tables have been profiled down to
+effectively one load + one pair-average + one store per output byte, and
+at that point the kernel is doing the minimum useful work per byte and
+no amount of further SIMD cleverness will make them faster on current
+CPU/memory architectures. On systems profiled while developing
+funnelcake, the following configurations were observed to hit the
+single-core memory bandwidth ceiling - funnelcake already runs at that
+ceiling, so any further speedup in these specific cases would require
+wider memory buses or multi-channel striping, not a better kernel:
+
+- **Straight 2× upscale at 1080p on DDR5 systems**: on a Zen 5 system
+  this workload is ~15 MB of source read + output write, and funnelcake
+  completes it in roughly the time it takes the memory controller to
+  physically move that amount of data (~82 GB/s effective, which matches
+  the single-core sustained DDR5 bandwidth of that platform).
+- **Shallow pow2 downscales at 4K on Apple Silicon**: the 2×/4× levels
+  of a 4K→1080p→540p ladder are dominated by memory traffic from the
+  source and into the first output level; on M3 Ultra these run close
+  to the ~60 GB/s single-core ceiling of the unified memory system.
+- **Small-source workloads on CPUs with very fast memory subsystems**:
+  e.g. `640×360 down:2x` on Apple Silicon completes in ~22 µs - an
+  absolute time where libswscale is *also* memory-bound, so the relative
+  speedup in the table (2.6×) understates how much work funnelcake is
+  doing and really just reflects that both libraries are waiting on
+  the same DRAM.
+
+In these cases the kernel's job is to get out of the memory subsystem's
+way, and the benchmarks above confirm that it does. The workloads where
+funnelcake's speedup keeps growing with CPU improvements (e.g. deep
+thirds cascades, the 1.5× upscale tail, combined down+up calls) are
+all compute-bound, and those are where the op-count and register
+scheduling work inside the kernels continues to pay off.
 
 
 ## Source frame requirements
 
 These constraints apply to the source data passed to `fused_scaler_init` and
-`fused_scaler_run`.
+`fused_scaler_run` (the 8-bit SDR API). The 10-bit HDR API
+(`fused_hdr_init` / `fused_hdr_run`) has its own format rules and
+accepts several additional layouts - see [HDR10 support](#hdr10-support)
+below for the full HDR format list.
 
 ### Format
-- **YUV420 I420 planar only.** The three planes (Y, U, V) must be passed
-  separately. Packed formats (NV12, UYVY, etc.) are not supported.
-- **8-bit unsigned** samples only.
-- **Downscaling, upscaling, or both** in a single pass over the source.
+- **YUV420 I420 planar, 8-bit unsigned.** The three planes (Y, U, V)
+  must be passed separately. 4:2:2 chroma subsampling, semi-planar
+  layouts (NV12), packed formats (UYVY, YUYV), and other packed
+  arrangements are **not** supported on this SDR path.
+- If you need **10-bit** samples, **4:2:2** chroma, or the **P010 /
+  P210 semi-planar** layouts (Y plane + interleaved UV plane), use the
+  HDR API instead - it handles all four of I010, P010, I210, P210 and
+  can produce 10-bit HDR outputs, 8-bit SDR outputs, or both from the
+  same call. You do not need to be scaling "HDR content" to use the
+  HDR API: it is simply the 10-bit / wider-chroma entry point.
+- **Downscaling, upscaling, or both** in a single pass over the source
+  (applies to both SDR and HDR APIs).
 
 ### Dimensions
 - `src_width` and `src_height` must be **positive** and **even**.

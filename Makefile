@@ -1,4 +1,8 @@
-CC ?= clang
+# Compiler: defaults to the system `cc` (Apple clang on macOS, gcc on most
+# Linux distros via /usr/bin/cc). Override with `make CC=gcc-15` or
+# `make CC=clang-17` to pick a specific toolchain. Both gcc >= 10 and
+# clang >= 6 are known to work; older gcc may not support -flto=auto.
+CC ?= cc
 AR ?= ar
 CFLAGS_BASE = -std=c11 -D_POSIX_C_SOURCE=200112L -Wall -Wextra -Werror -fPIC -Iinclude -Isrc
 LDFLAGS = -lm
@@ -48,19 +52,44 @@ endif
 # optimization. Recommended for production builds.
 # Options: 0 (off, default for dev), 1 (on)
 # Example: make LTO=1
+#
+# Compiler-specific LTO flag selection:
+#   clang: -flto=thin produces roughly the same optimization quality as
+#          full LTO but parallelizes the backend via the linker plugin's
+#          thread pool; build time is much faster and we avoid Apple ld64's
+#          single-threaded full-LTO path.
+#   gcc:   -flto=auto spawns parallel LTRANS jobs (the "lto-wrapper:
+#          warning: using serial compilation of N LTRANS jobs" message
+#          from plain -flto). Requires GCC 10 or newer. On older GCC,
+#          -flto still works but runs serially.
 LTO ?= 0
 
+# (CC_IS_CLANG is detected below in the PGO section, after TUNE handling.
+# This block picks the LTO flag once we know which compiler family we have.)
+# To keep the Makefile readable we resolve it here using the same probe.
+CC_FAMILY_IS_CLANG := $(shell $(CC) --version 2>/dev/null | grep -qi clang && echo 1)
+
 ifeq ($(LTO),1)
-  LTO_CFLAGS = -flto
-  LTO_LDFLAGS = -flto
+  ifeq ($(CC_FAMILY_IS_CLANG),1)
+    LTO_CFLAGS = -flto=thin
+  else
+    LTO_CFLAGS = -flto=auto
+  endif
 else
   LTO_CFLAGS =
-  LTO_LDFLAGS =
 endif
 
-# Assemble final CFLAGS
+# Assemble final CFLAGS. LTO_CFLAGS appears in both LIB_CFLAGS and
+# TEST_CFLAGS so the same flag drives both compile and link (the link
+# step re-invokes the compiler driver with TEST_CFLAGS and the driver
+# forwards the LTO flag to the linker plugin).
 LIB_CFLAGS = $(CFLAGS_BASE) $(LIB_OPT) $(TUNE_CFLAGS) $(LTO_CFLAGS)
 TEST_CFLAGS = $(CFLAGS_BASE) $(TEST_OPT) $(TUNE_CFLAGS) $(LTO_CFLAGS)
+
+# EXTRA_LDFLAGS is an injection point used by the pgo target to pass
+# -fprofile-generate (and any other step-1-only link flag) into the
+# final link step. Normal builds leave this empty.
+EXTRA_LDFLAGS ?=
 
 # detect.c runs exactly once at startup. Never compile it with PGO flags.
 # -fprofile-generate changes register allocation inside the xgetbv inline asm,
@@ -70,29 +99,73 @@ TEST_CFLAGS = $(CFLAGS_BASE) $(TEST_OPT) $(TUNE_CFLAGS) $(LTO_CFLAGS)
 # This variable intentionally excludes LIB_OPT (where -fprofile-* lives).
 DETECT_CFLAGS = $(CFLAGS_BASE) -O2 $(TUNE_CFLAGS)
 
+# --- PGO compiler-family handling ---
+# GCC and clang have very different PGO workflows:
+#   GCC:   -fprofile-generate produces .gcda files next to the .o files;
+#          -fprofile-use reads them directly. No merge step needed.
+#   clang: -fprofile-generate produces default.profraw in the CWD;
+#          -fprofile-use expects default.profdata, which must be produced
+#          by running "llvm-profdata merge" on the .profraw files.
+# CC_FAMILY_IS_CLANG is defined earlier in the LTO block.
+
+# llvm-profdata lookup: on macOS the Xcode toolchain ships it alongside
+# clang but not always in PATH, so prefer `xcrun` there. On Linux the
+# tool is typically in PATH as `llvm-profdata`; if the user installed
+# a versioned package (e.g. llvm-profdata-17) they can override via
+# `make LLVM_PROFDATA=llvm-profdata-17 pgo`.
+ifeq ($(UNAME_S),Darwin)
+  LLVM_PROFDATA ?= xcrun llvm-profdata
+else
+  LLVM_PROFDATA ?= llvm-profdata
+endif
+
+# Suppress the "no profile data for this TU" warning that both compilers
+# emit for files that weren't exercised by the PGO training run (e.g. the
+# test harness, cold-path code, detect.c which is deliberately excluded).
+# GCC and clang spell the flag differently.
+ifeq ($(CC_FAMILY_IS_CLANG),1)
+  PGO_USE_FLAGS = -fprofile-use -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date
+else
+  PGO_USE_FLAGS = -fprofile-use -Wno-missing-profile
+endif
+
 # --- Optional: libswscale for comparison benchmarks ---
 # Try pkg-config first, then probe common paths
 SWSCALE_CFLAGS := $(shell pkg-config --cflags libswscale libavutil 2>/dev/null)
 SWSCALE_LIBS   := $(shell pkg-config --libs libswscale libavutil 2>/dev/null)
 
 ifeq ($(SWSCALE_LIBS),)
-  # macOS Homebrew
+  # macOS Homebrew on Apple Silicon
   ifneq ($(wildcard /opt/homebrew/include/libswscale/swscale.h),)
     SWSCALE_CFLAGS := -I/opt/homebrew/include
     SWSCALE_LIBS   := -L/opt/homebrew/lib -lswscale -lavutil
   endif
 endif
 ifeq ($(SWSCALE_LIBS),)
-  # Linux x86_64
+  # Intel Mac Homebrew / FreeBSD / manually installed /usr/local
+  ifneq ($(wildcard /usr/local/include/libswscale/swscale.h),)
+    SWSCALE_CFLAGS := -I/usr/local/include
+    SWSCALE_LIBS   := -L/usr/local/lib -lswscale -lavutil
+  endif
+endif
+ifeq ($(SWSCALE_LIBS),)
+  # Debian/Ubuntu multiarch x86_64
   ifneq ($(wildcard /usr/include/x86_64-linux-gnu/libswscale/swscale.h),)
     SWSCALE_CFLAGS := -I/usr/include/x86_64-linux-gnu
     SWSCALE_LIBS   := -lswscale -lavutil
   endif
 endif
 ifeq ($(SWSCALE_LIBS),)
-  # Linux aarch64
+  # Debian/Ubuntu multiarch aarch64
   ifneq ($(wildcard /usr/include/aarch64-linux-gnu/libswscale/swscale.h),)
     SWSCALE_CFLAGS := -I/usr/include/aarch64-linux-gnu
+    SWSCALE_LIBS   := -lswscale -lavutil
+  endif
+endif
+ifeq ($(SWSCALE_LIBS),)
+  # Arch / Fedora / Alpine - libraries live directly under /usr/include
+  ifneq ($(wildcard /usr/include/libswscale/swscale.h),)
+    SWSCALE_CFLAGS :=
     SWSCALE_LIBS   := -lswscale -lavutil
   endif
 endif
@@ -139,7 +212,7 @@ libfunnelcake.a: $(LIB_OBJS)
 	$(AR) rcs $@ $^
 
 funnelcake_test: $(TEST_OBJS) libfunnelcake.a
-	$(CC) $(TEST_CFLAGS) $(LTO_LDFLAGS) -o $@ $(TEST_OBJS) -L. -lfunnelcake $(LDFLAGS) $(SWSCALE_TEST_LDFLAGS)
+	$(CC) $(TEST_CFLAGS) $(EXTRA_LDFLAGS) -o $@ $(TEST_OBJS) -L. -lfunnelcake $(LDFLAGS) $(SWSCALE_TEST_LDFLAGS)
 
 test: funnelcake_test
 	./funnelcake_test
@@ -260,21 +333,32 @@ clean:
 # This compiles with instrumentation, runs benchmarks to collect profile data,
 # then recompiles the LIBRARY ONLY using the profile for optimal branch layout
 # and inlining. Test code is compiled normally (no PGO).
+#
+# Each instrumented run is given an explicit LLVM_PROFILE_FILE so the bench
+# and test profiles don't overwrite each other on clang (clang's default
+# `default.profraw` would be truncated by the second run, discarding the
+# bench data which is what we actually want to optimize for).
 pgo: pgo-clean
 	@echo "=== PGO Step 1: Compile with instrumentation ==="
 	$(MAKE) clean
-	$(MAKE) funnelcake_test LIB_OPT="-O3 -fprofile-generate" LTO_LDFLAGS="-fprofile-generate"
+	$(MAKE) funnelcake_test LIB_OPT="-O3 -fprofile-generate" EXTRA_LDFLAGS="-fprofile-generate"
 	@echo "=== PGO Step 2: Run benchmarks to collect profile ==="
-	./funnelcake_test --bench
-	./funnelcake_test
+	LLVM_PROFILE_FILE="pgo-bench.profraw" ./funnelcake_test --bench
+	LLVM_PROFILE_FILE="pgo-tests.profraw" ./funnelcake_test
+ifeq ($(CC_FAMILY_IS_CLANG),1)
+	@echo "=== PGO Step 2a: Merge raw profiles (clang) ==="
+	$(LLVM_PROFDATA) merge -output=default.profdata \
+	    pgo-bench.profraw pgo-tests.profraw
+endif
 	@echo "=== PGO Step 3: Recompile library with profile data ==="
 	rm -f $(LIB_OBJS) libfunnelcake.a funnelcake_test
-	$(MAKE) funnelcake_test LIB_OPT="-O3 -fprofile-use -Wno-missing-profile"
+	$(MAKE) funnelcake_test LIB_OPT="-O3 $(PGO_USE_FLAGS)"
 	@echo "=== PGO complete. Run 'make bench' to see results. ==="
 
 pgo-clean:
 	rm -f $(LIB_SRCS:.c=.gcda) $(TEST_SRCS:.c=.gcda)
 	rm -f *.profraw default.profdata
+	rm -f pgo-bench.profraw pgo-tests.profraw
 
 # --- Per-file flag overrides ---
 src/kernels_scalar.o: src/kernels_scalar.c

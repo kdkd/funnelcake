@@ -2,9 +2,16 @@
 
 ## Requirements
 
-- C compiler: clang (recommended) or gcc
+- C compiler: clang >= 6 or gcc >= 10 (gcc 10 is required for `-flto=auto`;
+  older gcc still builds but LTO will run serially)
 - GNU make
-- No external libraries required
+- No external libraries required for the library itself
+
+The Makefile defaults to the system compiler (`cc`), which is Apple clang on
+macOS and usually gcc on Linux. Both compiler families are fully supported,
+including the `make pgo` pipeline which auto-detects the compiler and uses
+the appropriate PGO workflow (gcc reads `.gcda` files directly; clang runs
+`llvm-profdata merge` between the instrumented run and the optimized build).
 
 ## Build
 
@@ -12,7 +19,9 @@
     make test                   # build and run tests
     make bench                  # build and run benchmarks
     make visual                 # generate test output PNGs to output/
-    make CC=gcc                 # use gcc instead of clang
+    make CC=gcc                 # pick a specific compiler
+    make CC=clang-17            # any compiler binary works
+    make -j8                    # parallel builds are fully supported
 
 ## Performance Tuning
 
@@ -36,6 +45,12 @@
 
     make pgo                    # profile-guided optimization (compile, benchmark, recompile)
 
+LTO automatically picks the compiler's preferred flavor: `-flto=thin` on
+clang (ThinLTO, parallelized by the linker plugin) and `-flto=auto` on gcc
+(parallel LTRANS across all cores). Both deliver substantially the same
+optimization quality as full LTO with much faster builds and no
+"using serial compilation of N LTRANS jobs" warning.
+
     make SCALAR_ARCH=native     # optimize scalar fallback for build machine
     make SCALAR_ARCH=baseline   # maximum portability for scalar fallback (default)
 
@@ -54,8 +69,10 @@ For maximum performance on a specific machine:
     make pgo TUNE=native LTO=1
 
 If you are shipping `libfunnelcake.a` to another build system, keep `LTO=0`
-(the default). `clang -flto` archives can contain LLVM bitcode members instead
-of standard ELF `.o` files, which some consumers reject.
+(the default). Both `clang -flto=thin` and `gcc -flto=auto` archives can
+contain compiler-specific intermediate representation instead of standard
+object files, which some downstream linkers reject unless they use the same
+compiler toolchain.
 
 ## Platform Notes
 
@@ -67,11 +84,34 @@ Install Xcode command line tools:
 
 ### Ubuntu / Debian (x86_64)
 
-    sudo apt install build-essential clang
+    sudo apt install build-essential        # gcc (recommended on Linux)
+    # or
+    sudo apt install build-essential clang  # clang alternative
 
 ### Ubuntu / Debian (aarch64)
 
+    sudo apt install build-essential
+    # or
     sudo apt install build-essential clang
+
+### Fedora / RHEL
+
+    sudo dnf install gcc make
+    # or
+    sudo dnf install clang make
+
+### Arch Linux
+
+    sudo pacman -S base-devel  # gcc + make
+    # or
+    sudo pacman -S clang make
+
+### macOS (Homebrew GCC)
+
+If you want to build with a real GCC (not Apple clang aliased as gcc):
+
+    brew install gcc
+    make CC=gcc-15 LTO=1 TUNE=native
 
 ## Ubuntu 20 Release Artifacts
 

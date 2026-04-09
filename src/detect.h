@@ -10,12 +10,12 @@
  */
 
 typedef struct {
-    int has_avx2;   /* x86_64 only — 1 if AVX2 + OS XSAVE for YMM is available */
-    int has_neon;   /* aarch64 only — 1 if NEON is available                    */
+    int has_avx2;   /* x86_64 only - 1 if AVX2 + OS XSAVE for YMM is available */
+    int has_neon;   /* aarch64 only - 1 if NEON is available                    */
 } fused_cpu_caps_t;
 
 /*
- * fused_detect_cpu — detect and cache CPU capabilities.
+ * fused_detect_cpu - detect and cache CPU capabilities.
  *
  * Returns a pointer to the static capability struct. Never returns NULL.
  * The pointed-to memory is read-only after first initialisation.

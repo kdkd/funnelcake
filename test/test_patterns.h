@@ -30,7 +30,7 @@ typedef enum {
     PATTERN_COUNT        = 5
 } test_pattern_t;
 
-/* Human-readable pattern names — defined in test_patterns.c */
+/* Human-readable pattern names - defined in test_patterns.c */
 extern const char *pattern_names[];
 
 /* --------------------------------------------------------------------------

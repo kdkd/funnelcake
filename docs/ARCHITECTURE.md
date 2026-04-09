@@ -30,18 +30,25 @@ Each plane is scaled independently with the same kernel. The chroma planes
 
 ## Scale families
 
-Funnelcake supports two families of fixed scale ratios. A single scaler
-context uses one family at a time.
+Funnelcake supports two downscale families and an independent upscale
+direction. A single scaler context uses one downscale family at a time
+but may combine it with upscaling in the same init call.
 
-| Family | Steps | Vertical period |
-|--------|-------|-----------------|
-| **Thirds** | 1.5×, 3×, 6×, 12× | 6 source rows |
-| **Pow2** | 2×, 4×, 8×, 16× | 2^n source rows |
+| Direction | Family | Steps | Vertical period |
+|-----------|--------|-------|-----------------|
+| Downscale | **Thirds** | 1.5×, 3×, 6×, 12× | 6 source rows |
+| Downscale | **Pow2**   | 2×, 4×, 8×, 16× | 2^n source rows |
+| Upscale   | **Pow2 cascade** | 2×, 4×, 8×, 16×, 32× (+1.5× tail) | per-level (see [Upscale kernel architecture](#upscale-kernel-architecture)) |
 
-The thirds family uses a **fused** kernel — vertical and horizontal
-reduction happen in the same pass over source memory. The pow2 family uses
-a **cascade** kernel — vertical reduction into temporary buffers, then
-horizontal reduction from those buffers.
+The thirds downscale family uses a **fused** kernel - vertical and
+horizontal reduction happen in the same pass over source memory. The
+pow2 downscale family uses a **cascade** kernel - vertical reduction
+into temporary buffers, then horizontal reduction from those buffers.
+
+The upscale direction uses a **cascade** structure: each level reads
+from the previous level's output buffer rather than from the source.
+This amortizes source reads - the source is loaded exactly once (for
+level 0 / 2×) regardless of how many upscale levels are requested.
 
 
 ## SIMD tiers
@@ -52,7 +59,7 @@ Three implementations exist for each family:
 |------|----------|------------|---------------------|
 | AVX2 | x86-64 | 256-bit (YMM) | 96 bytes |
 | NEON | aarch64 | 128-bit (Q) | 48 bytes |
-| Scalar | any | — | 1 byte |
+| Scalar | any | - | 1 byte |
 
 All three tiers produce identical output. The scalar tier is the reference
 implementation and fallback.
@@ -151,7 +158,7 @@ graph LR
     end
 
     subgraph deint["Deinterleave"]
-        D["ABCABC...\n→ A[], B[], C[]"]
+        D["ABCABC...\n-> A[], B[], C[]"]
     end
 
     subgraph horiz["Horizontal filter"]
@@ -191,11 +198,11 @@ tail after the main SIMD loop.
 
 ## Horizontal filters (thirds family)
 
-All thirds horizontal filters operate on **deinterleaved** data — three
+All thirds horizontal filters operate on **deinterleaved** data - three
 separate vectors containing the first, second, and third pixel of each
 source triplet.
 
-### 1.5× bilinear (3 pixels → 2 pixels)
+### 1.5× bilinear (3 pixels -> 2 pixels)
 
 Every 3 source pixels produce 2 output pixels at the ⅓ and ⅔ positions:
 
@@ -221,7 +228,7 @@ Before interleave:  out0 = [a0  a1  a2  a3  ...]
 After interleave:   memory = [a0 b0 a1 b1 a2 b2 a3 b3 ...]
 ```
 
-### 3× box average (3 pixels → 1 pixel)
+### 3× box average (3 pixels -> 1 pixel)
 
 ```
 Source pixels:     A     B     C
@@ -250,14 +257,14 @@ The 6× filter is a 3× box average followed by a pairwise halving:
 ## Deinterleave: NEON vs AVX2
 
 The thirds horizontal filters need source bytes grouped by triplet
-position — all A's in one vector, all B's in another, all C's in a third.
+position - all A's in one vector, all B's in another, all C's in a third.
 In memory, they're stored interleaved: `A₀B₀C₀A₁B₁C₁A₂B₂C₂...`
 
 The two platforms solve this very differently.
 
 ### NEON: hardware deinterleave
 
-ARM NEON provides `vld3q_u8` — a single instruction that loads 48
+ARM NEON provides `vld3q_u8` - a single instruction that loads 48
 consecutive bytes and automatically deinterleaves them into three 16-byte
 vectors:
 
@@ -289,7 +296,7 @@ Vertical result       48-byte         vld3q_u8        Deinterleaved
 
 AVX2 has no equivalent to `vld3q_u8`. The byte-shuffle instruction
 `vpshufb` can rearrange bytes, but it operates **independently within each
-128-bit lane** — a byte in lane 0 cannot be moved to lane 1 or vice versa.
+128-bit lane** - a byte in lane 0 cannot be moved to lane 1 or vice versa.
 
 ```
 AVX2 YMM register (256 bits = 32 bytes):
@@ -347,7 +354,7 @@ Now each register has:
 #### Step 3: vpshufb with broadcast masks
 
 The same 128-bit shuffle masks from the SSE deinterleave are broadcast to
-both lanes. `vpshufb` then deinterleaves both groups simultaneously —
+both lanes. `vpshufb` then deinterleaves both groups simultaneously -
 each lane processes its own independent 48-byte group:
 
 ```
@@ -377,7 +384,7 @@ bytes **within** a single register.
 Input:   [p0 p1 p2 p3 p4 p5 p6 p7 | p8 p9 p10 p11 p12 p13 p14 p15 | ... ]
 Want:    [avg(p0,p1) avg(p2,p3) avg(p4,p5) ... ]
 
-Can't use vpavgb directly — it averages byte i of reg A with byte i of reg B,
+Can't use vpavgb directly - it averages byte i of reg A with byte i of reg B,
 but our pairs (p0,p1) are in bytes 0 and 1 of the SAME register.
 ```
 
@@ -398,7 +405,7 @@ Step 2: vpermq (0xD8) gathers evens and odds across lanes
   Low 128 bits  = all 16 even bytes
   High 128 bits = all 16 odd bytes
 
-Step 3: extract low/high halves, pavgb → 16 output bytes
+Step 3: extract low/high halves, pavgb -> 16 output bytes
 
   result = avg(even_bytes, odd_bytes)
 ```
@@ -417,7 +424,7 @@ graph TD
     subgraph even["Even group (g6 = 0, 2, 4, ...)"]
         E1["Compute 6× vertical intermediate"]
         E2["Store to buffer A"]
-        E3["Swap A ↔ B\n(A's data becomes 'previous')"]
+        E3["Swap A <-> B\n(A's data becomes 'previous')"]
     end
 
     subgraph odd["Odd group (g6 = 1, 3, 5, ...)"]
@@ -460,19 +467,19 @@ graph TD
         R7["row 7"]
     end
 
-    subgraph L0["Level 0 buffer (4 rows) → 2× output"]
+    subgraph L0["Level 0 buffer (4 rows) -> 2× output"]
         A0["avg(row0, row1)"]
         A1["avg(row2, row3)"]
         A2["avg(row4, row5)"]
         A3["avg(row6, row7)"]
     end
 
-    subgraph L1["Level 1 buffer (2 rows) → 4× output"]
+    subgraph L1["Level 1 buffer (2 rows) -> 4× output"]
         B0["avg(L0[0], L0[1])"]
         B1["avg(L0[2], L0[3])"]
     end
 
-    subgraph L2["Level 2 buffer (1 row) → 8× output"]
+    subgraph L2["Level 2 buffer (1 row) -> 8× output"]
         C0["avg(L1[0], L1[1])"]
     end
 
@@ -500,7 +507,7 @@ horizontally reduced and written to the output plane.
 
 ### Why not fused?
 
-The pow2 vertical group size is `2^depth` — for 16× it's 16 rows. Keeping
+The pow2 vertical group size is `2^depth` - for 16× it's 16 rows. Keeping
 16 rows × 3 registers = 48 registers live in a fused inner loop far
 exceeds the 16 YMM registers available on x86-64 (or 32 NEON registers on
 aarch64). The thirds family works because its vertical period is always 6,
@@ -513,10 +520,10 @@ Each vertically-reduced row is horizontally reduced through a cascade of
 halvings. The number of halvings equals the cascade level + 1:
 
 ```
-Level 0 (2×):  source width → halve once   → output width = src/2
-Level 1 (4×):  source width → halve twice  → output width = src/4
-Level 2 (8×):  source width → halve 3×     → output width = src/8
-Level 3 (16×): source width → halve 4×     → output width = src/16
+Level 0 (2×):  source width -> halve once   -> output width = src/2
+Level 1 (4×):  source width -> halve twice  -> output width = src/4
+Level 2 (8×):  source width -> halve 3×     -> output width = src/8
+Level 3 (16×): source width -> halve 4×     -> output width = src/16
 ```
 
 Each halving pass reads from the current source (or previous halving
@@ -528,13 +535,13 @@ For 8× horizontal (3 halvings):
   vert_row (src_w bytes)
        │
        ▼
-  halve: out[i] = avg(in[2i], in[2i+1])    → h_buf (src_w/2 bytes)
+  halve: out[i] = avg(in[2i], in[2i+1])    -> h_buf (src_w/2 bytes)
        │
        ▼
-  halve: out[i] = avg(in[2i], in[2i+1])    → h_buf (src_w/4 bytes)
+  halve: out[i] = avg(in[2i], in[2i+1])    -> h_buf (src_w/4 bytes)
        │
        ▼
-  halve: out[i] = avg(in[2i], in[2i+1])    → h_buf (src_w/8 bytes)
+  halve: out[i] = avg(in[2i], in[2i+1])    -> h_buf (src_w/8 bytes)
        │
        ▼
   memcpy to output plane (dst_width bytes)
@@ -545,7 +552,183 @@ shuffle approach described [above](#avx2-horizontal-halving-avx2_halve_32_to_16)
 
 On NEON, `vpaddlq_u8` sums adjacent byte pairs into 16-bit values in a
 single instruction, then `vrshrn_n_u16` narrows back to 8-bit with
-rounding — equivalent to `avg(in[2i], in[2i+1])`.
+rounding - equivalent to `avg(in[2i], in[2i+1])`.
+
+---
+
+## Upscale kernel architecture
+
+The upscale direction uses a **cascade** structure: level 0 (2×) reads
+from the source, and each subsequent level reads from the previous
+level's output buffer rather than re-reading the source. The optional
+1.5× tail reads either the source directly (if no pow2 levels were
+requested) or the deepest pow2 output buffer.
+
+```mermaid
+graph LR
+    src[source plane]
+    l0[up_out 0 - 2x]
+    l1[up_out 1 - 4x]
+    l2[up_out 2 - 8x]
+    l3[up_out 3 - 16x]
+    l4[up_out 4 - 32x]
+    tail[up_out 5 - tail x1.5]
+
+    src --> l0 --> l1 --> l2 --> l3 --> l4
+    l4 --> tail
+```
+
+Source memory is read exactly once (at level 0) regardless of cascade
+depth. Levels 1..N-1 read from L1/L2-hot buffers that the previous level
+just wrote. This is the key throughput property of the upscale cascade:
+total memory traffic on the source plane is independent of the number
+of upscale outputs requested.
+
+### Pow2 2× primitive
+
+Each 2× level produces two output pixels for every source pixel using
+pair-average bilinear interpolation:
+
+```
+src:     p0    p1    p2    p3    p4    p5    ...
+         |     |     |     |     |     |
+out 2x:  p0 (p0+p1)/2 p1 (p1+p2)/2 p2 (p2+p3)/2 ...
+```
+
+Vertical doubling produces two output rows per source row: row 2r is a
+direct horizontal-doubled copy of src[r], and row 2r+1 is a
+horizontal-doubled copy of the midpoint row `avg(src[r], src[r+1])`.
+
+The 2× kernel is **very cheap** because it reduces to a single
+pair-average per output byte:
+
+| Platform | Instruction | Details |
+|----------|-------------|---------|
+| NEON | `vrhaddq_u8` | 16 bytes/cycle. `vzip1q_u8`/`vzip2q_u8` interleave original + midpoint for horizontal doubling. |
+| AVX2 | `_mm256_avg_epu8` | 32 bytes/cycle. Same pattern with `vpunpcklbw`/`vpunpckhbw` for interleave. |
+| Scalar | `(a + b + 1) >> 1` | Reference implementation. |
+
+### 1.5× (2→3) tail
+
+The 1.5× bilinear operation expands 2 source samples to 3 output
+samples using the same 171/85 weighted blend as the thirds-family
+downscale, traversed in the reverse direction. For source samples
+`A = src[2i]`, `B = src[2i+1]`, `C = src[2i+2]`:
+
+```
+dst[3i  ] = A                                 (exact copy)
+dst[3i+1] = (A * 85 + B * 171 + 128) >> 8      (1/3 A, 2/3 B)
+dst[3i+2] = (B * 171 + C * 85 + 128) >> 8      (2/3 B, 1/3 C)
+```
+
+Vertical 1.5× uses the same weighted blend between pairs of source
+rows. Each source-row pair (r2j, r2j+1) and the next-row anchor r2j+2
+produce three output rows:
+
+```
+out 3j+0 = horizontally-1.5x of r2j                     (exact copy)
+out 3j+1 = horizontally-1.5x of v_blend(r2j,  r2j+1)    (1/3 + 2/3 blend)
+out 3j+2 = horizontally-1.5x of v_blend(r2j+2, r2j+1)   (2/3 + 1/3 blend)
+```
+
+The vertical blend runs first into a scratch row, then the horizontal
+1.5× kernel consumes the scratch row. The scratch buffer is a single
+row wide, allocated once at init (not per-frame).
+
+### NEON 1.5× implementation
+
+NEON maps the 2→3 bilinear pattern directly onto hardware
+load/store-permute instructions. For each 16-pair chunk:
+
+```
+vld2q_u8(src + 2*p)          -> {a[16], b[16]}    (even/odd deinterleave)
+compute m1 = weighted(a, b)
+compute m2 = weighted(c, b)   where c = a shifted by one lane
+vst3q_u8(dst + 3*p, {a, m1, m2})                  (3-way interleaved store)
+```
+
+`vld2q_u8` does the even/odd deinterleave as a hardware operation.
+`vst3q_u8` does the three-way interleave (a, m1, m2, a, m1, m2, ...)
+at the store. Both are single-cycle throughput on Apple Silicon and
+Cortex-A7x cores. The weighted blend uses `vmull_u8` + `vmlal_u8` with
+byte-wide 85 and 171 coefficients.
+
+32 source bytes → 48 destination bytes per chunk with minimal shuffle
+pressure.
+
+### AVX2 1.5× implementation
+
+AVX2 has no direct equivalent to `vld2q_u8` or `vst3q_u8`, so the
+deinterleave and output interleave are built from `vpshufb` masks. Per
+16-pair chunk the kernel:
+
+1. Loads 32 source bytes into a 256-bit register, plus an overlapping
+   32-byte "next" load to source the C values without a per-chunk
+   srli+insert.
+2. Extracts `a`, `b`, and `c` vectors via `vpshufb` with even/odd
+   masks broadcast to both 128-bit lanes. Each lane independently
+   handles 8 pairs.
+3. Widens to u16, computes `a*85 + b*171 + 128` and `c*85 + b*171 + 128`
+   with `vpmullw` + `vpaddw` + `vpsrli_w` by 8, then packs back to u8.
+4. Interleaves m1 and m2 via `vpunpcklbw`, then assembles the output
+   via four `vpshufb` + OR operations using hand-crafted mix masks.
+5. Stores 48 bytes as two 16-byte + two 8-byte writes per lane.
+
+The AVX2 1.5× kernel is **shuffle-port throughput limited**. The inner
+loop issues roughly 13 shuffle-port micro-ops per chunk
+(`vpshufb` extracts, `vpunpcklbw` widens, `vpackuswb` packs,
+`vpshufb` interleaves). On Zen 2 and later, which have two shuffle
+ports and a native 256-bit datapath, this bounds throughput at
+~6-7 cycles per chunk. On **Zen 1** every 256-bit AVX2 instruction is
+double-pumped through its 128-bit datapath, so the 256-bit kernel
+delivers no benefit over 128-bit and runs at roughly half of Zen 2's
+per-cycle throughput.
+
+For reference, on 1920×1080 upscaled to 1.5× (= 2880×1620):
+
+| CPU | 1.5× tail time | vs libswscale |
+|-----|---------------|---------------|
+| Apple M1 (NEON) | ~150 µs | 8× faster |
+| Zen 5 (AVX2) | 382 µs | 3.5× faster |
+| Zen 2 (AVX2) | 845 µs | 3.3× faster |
+| Zen 1 (AVX2) | 1956 µs | 2× faster |
+
+The per-byte cost of the 1.5× kernel is roughly **5-8× that of a
+straight 2× step on AVX2** and 2-3× on NEON. See the API reference
+[Performance notes](API.md#performance-notes) section for guidance on
+when the tail is worth requesting.
+
+### HDR 10-bit upscale
+
+The HDR upscale path mirrors the 8-bit path with `uint16_t` planes and
+10-bit-aware arithmetic. Key differences:
+
+- **u16 pair-average**: AVX2 has no `vpavgw` for 16-bit lanes, so the
+  2× kernel uses explicit `vpaddw` + `vpsrli_w` by 1 (with round-bias).
+  NEON uses `vrhaddq_u16`.
+- **u16 1.5× blend**: the HDR 1.5× kernel uses `vpmaddwd` (packed
+  multiply-add) on unpacked u16 pairs to fuse `85*a + 171*b` into a
+  single instruction. The 32-bit intermediate is then shifted and
+  narrowed back to u16 via `vpackusdw`.
+- **Chunk width**: half the pair count per 256-bit chunk (8 pairs per
+  lane instead of 16) because u16 elements are twice as wide.
+- **No tone mapping on upscale**: HDR upscale outputs are 10-bit only.
+  The tone-mapping LUT pipeline runs only on downscale outputs.
+
+### Combined downscale + upscale
+
+When both directions are requested in the same init call, the
+upscale phase runs after the downscale phase completes. The downscale
+kernels read the source and write downscale outputs; the upscale
+kernels then read the source a second time for level 0 and cascade
+from there. On Apple Silicon and Zen 2+ the source is typically still
+L2-resident at that point, so the second read is cheap.
+
+Strict single-pass source reads (loading each source row once and
+emitting both downscale and upscale outputs from the same register set
+before advancing) is left as a future optimization. The current
+structure trades a single extra L2-hot pass over the source for
+substantially simpler kernel code and lower register pressure.
 
 ---
 
@@ -570,13 +753,22 @@ rounding — equivalent to `avg(in[2i], in[2i+1])`.
 | Heap buffer | h_buf horizontal scratch | src_width bytes | Reused across all halvings |
 | SIMD registers | Vertical averages (per row pair) | 1 reg per chunk | Written to vert_buf immediately |
 
+### Upscale kernel
+
+| Resource | What | Size | Notes |
+|----------|------|------|-------|
+| Heap buffer | up_out[k] per achieved level | `eff_w * 2^(k+1) * eff_h * 2^(k+1)` bytes (Y) + half chroma | Allocated at init for every level in `achieved_upscale_flags`; written by level k, read by level k+1 |
+| Heap buffer | up_out[TAIL] if tail requested | tail dimensions (deepest * 1.5) | Allocated only if `achieved_upscale_tail` |
+| Heap buffer | upscale_scratch row buffer | max(row width across all upscale levels) bytes | Single persistent row buffer shared by the 1.5× vertical blend and the 2× vertical midpoint row. Allocated once at init. |
+| SIMD registers | Per-chunk deinterleave + weighted-blend state | Up to 13 regs in the 1.5× AVX2 inner loop | Live only during one chunk |
+
 ### Chunk sizes
 
-| Platform | Thirds chunk | Pow2 vertical chunk | Pow2 horizontal chunk |
-|----------|-------------|--------------------|-----------------------|
-| AVX2 | 96 bytes (3 × YMM) | 32 bytes (1 × YMM) | 32 bytes (1 × YMM) → 16 bytes |
-| NEON | 48 bytes (3 × Q) | 16 bytes (1 × Q) | 16 bytes (1 × Q) → 8 bytes |
-| Scalar | 1 byte | 1 byte | 1 byte |
+| Platform | Thirds chunk | Pow2 vertical chunk | Pow2 horizontal chunk | Upscale 2× chunk | Upscale 1.5× chunk |
+|----------|-------------|--------------------|-----------------------|------------------|--------------------|
+| AVX2 | 96 bytes (3 × YMM) | 32 bytes (1 × YMM) | 32 bytes (1 × YMM) -> 16 bytes | 32 src bytes -> 64 dst bytes | 32 src bytes -> 48 dst bytes (256-bit) |
+| NEON | 48 bytes (3 × Q) | 16 bytes (1 × Q) | 16 bytes (1 × Q) -> 8 bytes | 16 src bytes -> 32 dst bytes | 32 src bytes -> 48 dst bytes (vld2/vst3) |
+| Scalar | 1 byte | 1 byte | 1 byte | 1 byte | 1 pair -> 3 bytes |
 
 ### Source functions
 
@@ -590,7 +782,7 @@ rounding — equivalent to `avg(in[2i], in[2i+1])`.
 | `deinterleave_3x16` | kernels_avx2.c | SSE 48-byte deinterleave (also used by AVX2 h_filter tail) |
 | `deinterleave_chunk` | kernels_neon.c | NEON store+vld3q_u8 deinterleave |
 | `avx2_blend_2_1` | kernels_avx2.c | AVX2 bilinear blend (32 bytes) |
-| `avx2_halve_32_to_16` | kernels_avx2.c | AVX2 pairwise halving (32→16 bytes) |
+| `avx2_halve_32_to_16` | kernels_avx2.c | AVX2 pairwise halving (32->16 bytes) |
 | `h_chunk_1_5x_avx2` | kernels_avx2.c | AVX2 horizontal 1.5× on deinterleaved chunk |
 | `h_chunk_3x_avx2` | kernels_avx2.c | AVX2 horizontal 3× on deinterleaved chunk |
 | `h_chunk_6x_avx2` | kernels_avx2.c | AVX2 horizontal 6× (cascade from 3×) |
@@ -598,6 +790,14 @@ rounding — equivalent to `avg(in[2i], in[2i+1])`.
 | `h_chunk_3x` | kernels_neon.c | NEON horizontal 3× on deinterleaved chunk |
 | `h_chunk_6x` | kernels_neon.c | NEON horizontal 6× (cascade from 3×) |
 | `neon_blend_reg` | kernels_neon.c | NEON bilinear blend (16 bytes) |
+| `fused_kernel_upscale_avx2` | kernels_upscale_avx2.c | AVX2 upscale (pow2 cascade + 1.5× tail), SDR |
+| `fused_kernel_upscale_neon` | kernels_upscale_neon.c | NEON upscale, SDR |
+| `fused_kernel_upscale_scalar` | kernels_upscale_scalar.c | Scalar upscale reference + misaligned-source fallback |
+| `fused_kernel_thirds_up_*` | kernels_upscale_*.c | Combined thirds downscale + upscale |
+| `fused_kernel_pow2_up_*` | kernels_upscale_*.c | Combined pow2 downscale + upscale |
+| `up_h_2x_row_avx2` / `_neon` | kernels_upscale_*.c | Horizontal 2× doubling of one row |
+| `up_h_1_5x_row_avx2` / `_neon` | kernels_upscale_*.c | Horizontal 1.5× (2→3) of one row |
+| `up_vblend_21_row_avx2` / `_neon` | kernels_upscale_*.c | Vertical 85/171 weighted blend of two rows |
 
 ---
 
@@ -654,7 +854,7 @@ processing half as many elements per instruction.
 The triplet deinterleave (ABC pattern) uses the same structural approach
 as the 8-bit version but with 16-bit element granularity.
 
-**NEON:** uses `vld3q_u16` — the 16-bit variant of the hardware
+**NEON:** uses `vld3q_u16` - the 16-bit variant of the hardware
 deinterleave instruction. Loads 24 elements (48 bytes) and separates
 them into three 8-element vectors. The store-reload technique is
 identical to the 8-bit path:
@@ -724,7 +924,7 @@ surrounding luma pixels.
 
 **P010 deinterleave at load time.** P010 stores chroma as interleaved
 UV pairs in a single plane. The kernel deinterleaves U and V during the
-SIMD load phase — no intermediate buffer is allocated. Even elements
+SIMD load phase - no intermediate buffer is allocated. Even elements
 become U, odd elements become V. On AVX2 this uses a `vpshufb` mask
 that separates even/odd 16-bit elements within each lane.
 

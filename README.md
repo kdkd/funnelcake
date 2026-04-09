@@ -1,19 +1,23 @@
 # Funnelcake
 
-Funnelcake is a fused multi-resolution YUV420 downscaler. A single call
-produces up to four downscaled outputs simultaneously in one pass over the
-source data, using AVX2 (x86-64) or NEON (aarch64) SIMD kernels, with a
-portable scalar fallback. An HDR10 path handles 10-bit PQ and HLG input
-with optional built-in tone mapping to SDR.
+Funnelcake is a fused multi-resolution YUV420 scaler. A single call
+produces up to four downscaled outputs and up to six upscaled outputs
+simultaneously in one pass over the source data, using AVX2 (x86-64) or
+NEON (aarch64) SIMD kernels with a portable scalar fallback. An HDR10
+path handles 10-bit PQ and HLG input with optional built-in tone mapping
+to SDR.
 
-It is designed for video pipelines that need to derive multiple lower-resolution
-copies of each frame - thumbnail generation, adaptive bitrate encoding ladders,
-preview streams - where calling a general-purpose scaler once per output is
+It is designed for video pipelines that need to derive multiple
+alternate-resolution copies of each frame - thumbnail generation,
+adaptive bitrate encoding ladders, preview streams, super-resolution
+ladders - where calling a general-purpose scaler once per output is
 prohibitively slow.
 
 The 8-bit SDR path accepts I420 planar (separate Y, U, V planes), 8-bit
 unsigned. The 10-bit HDR path accepts I010, P010, I210, and P210 formats
-and can produce both HDR and tone-mapped SDR outputs at each scale step.
+and can produce both HDR and tone-mapped SDR outputs at each downscale
+step. Upscaling is available in both paths; upscale outputs on the HDR
+path are 10-bit only (no tone-mapping stage).
 
 
 ## How it works
@@ -25,7 +29,7 @@ source data once, computes the horizontal reduction, and writes every output
 simultaneously. Each source row is read exactly once regardless of how many
 outputs are requested.
 
-Two scale families are supported:
+Two downscale families are supported:
 
 | Family | Steps available |
 |--------|----------------|
@@ -37,6 +41,19 @@ Each family is a natural cascade: a 12× thirds output passes through 1.5×,
 library produces intermediate outputs only where explicitly requested. A single
 init call may request any combination of steps within one family; the two
 families may not be mixed in a single context.
+
+**Upscaling** is a cascading 2× chain of up to five levels (2×, 4×, 8×,
+16×, 32×) with an optional 1.5× tail. The tail reads either the source
+(when no 2× levels are requested) or the deepest 2× output, producing a
+single additional step at 1.5× of that width. A 1080p source can be
+upscaled all the way to 8× (15360×8640) in one call; deeper levels are
+soft-rejected if they exceed the 16384×16384 size cap.
+
+Upscale and downscale may be requested in the same `fused_scaler_init`
+call. Both directions' outputs are produced from a single vertical walk
+over the source. See the [Upscale Step Flags](docs/API.md#upscale-step-flags)
+section of the API reference for the full permutation table and size
+constraints.
 
 
 ## Benchmarks
@@ -100,7 +117,7 @@ These constraints apply to the source data passed to `fused_scaler_init` and
 - **YUV420 I420 planar only.** The three planes (Y, U, V) must be passed
   separately. Packed formats (NV12, UYVY, etc.) are not supported.
 - **8-bit unsigned** samples only.
-- **Downscaling only.** The library does not upscale.
+- **Downscaling, upscaling, or both** in a single pass over the source.
 
 ### Dimensions
 - `src_width` and `src_height` must be **positive** and **even**.
@@ -173,9 +190,46 @@ Set `FUSED_OPT_NO_CROP` to reject steps that require cropping rather than
 silently trimming.
 
 ### Mixing families
-A single `fused_scaler_ctx_t` may only use steps from **one family** per init.
-Requesting `FUSED_SCALE_3X | FUSED_SCALE_4X` (thirds + pow2) returns
-`FUSED_ERR_INVALID_FLAGS`. Use two separate contexts if you need both families.
+A single `fused_scaler_ctx_t` may only use downscale steps from **one
+family** per init. Requesting `FUSED_SCALE_3X | FUSED_SCALE_4X` (thirds
++ pow2) returns `FUSED_ERR_INVALID_FLAGS`. Use two separate contexts if
+you need both downscale families.
+
+Upscaling is independent of the downscale family selection and may be
+combined with either thirds or pow2 downscale flags in the same init
+call.
+
+### Upscale constraints
+
+Upscale flags (`FUSED_UPSCALE_2X`, `FUSED_UPSCALE_4X`, `FUSED_UPSCALE_8X`,
+`FUSED_UPSCALE_16X`, `FUSED_UPSCALE_32X`) form a cascading 2× chain.
+The mask set in `ctx->upscale_flags` must be a **contiguous prefix** of
+the cascade - valid values are `0`, `{2x}`, `{2x,4x}`, `{2x,4x,8x}`,
+`{2x,4x,8x,16x}`, or `{2x,4x,8x,16x,32x}`. Setting a non-contiguous
+mask (e.g. `{4x}` alone or `{2x,8x}`) returns `FUSED_ERR_INVALID_FLAGS`.
+
+Setting `ctx->upscale_tail_1_5x = 1` appends a single 1.5x bilinear step
+on top of the deepest pow2 level, or on the source directly if
+`upscale_flags == 0`. See the
+[Upscale Step Flags](docs/API.md#upscale-step-flags) section of the API
+reference for the full table of valid combinations.
+
+**Size cap**: individual upscale levels are soft-rejected when their luma
+output exceeds 16384×16384. For example, a 1920×1080 source with
+`FUSED_UPSCALE_POW2_MASK` produces 2×, 4×, and 8× successfully; 16×
+(30720×17280) and 32× (61440×34560) are rejected and `FUSED_WARN_BIT_PARTIAL`
+is set in the return code.
+
+**1.5x upscale performance**: the 1.5x tail is materially slower per
+output byte than any of the 2× steps on AVX2 because it uses a weighted
+85/171 bilinear blend whose inner loop is dominated by shuffle-port
+throughput. On Zen 2 / Haswell and later, the 256-bit kernel is roughly
+5-8× slower per byte than a straight 2× step but still substantially
+faster than libswscale's bilinear upscale. On Zen 1 the gap is wider
+because Zen 1 double-pumps 256-bit AVX2 instructions through its 128-bit
+datapath. NEON does not have this bottleneck - the 2→3 pattern maps
+cleanly onto `vld2q_u8` / `vst3q_u8`. Choose the 1.5x tail with this in
+mind on compute-limited x86 targets.
 
 ### Thread safety
 Each context is independent and not thread-safe. Use one context per thread.
@@ -214,6 +268,33 @@ fused_scaler_run(&scaler, frame_y, frame_u, frame_v);
 fused_scale_output_t *out_1280x720 = &scaler.outputs[FUSED_IDX_1_5X];
 fused_scale_output_t *out_640x360  = &scaler.outputs[FUSED_IDX_3X];
 fused_scale_output_t *out_320x180  = &scaler.outputs[FUSED_IDX_6X];
+
+fused_scaler_free(&scaler);
+```
+
+A combined downscale + upscale example:
+
+```c
+#include "funnelcake.h"
+
+/* 1920×1080 source: downscale to 960×540 + upscale to 3840×2160 in one pass */
+fused_scaler_ctx_t scaler = {0};
+scaler.src_width     = 1920;
+scaler.src_height    = 1080;
+scaler.src_y_stride  = (1920 + 31) & ~31;
+scaler.src_uv_stride = (960  + 31) & ~31;
+
+scaler.requested_flags    = FUSED_SCALE_2X;                             /*  960×540  */
+scaler.upscale_flags      = FUSED_UPSCALE_2X;                           /* 3840×2160 */
+scaler.upscale_tail_1_5x  = 0;
+
+int rc = fused_scaler_init(&scaler);
+if (rc < 0) { /* hard error */ }
+
+fused_scaler_run(&scaler, frame_y, frame_u, frame_v);
+
+fused_scale_output_t *out_half = &scaler.outputs[FUSED_IDX_2X];            /*  960×540  */
+fused_scale_output_t *out_4k   = &scaler.upscale_outputs[FUSED_UP_IDX_2X]; /* 3840×2160 */
 
 fused_scaler_free(&scaler);
 ```

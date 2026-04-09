@@ -811,7 +811,7 @@ static void test_hdr_double_free_safety(void)
     TEST_ASSERT(rc >= 0, "init should succeed");
 
     fused_hdr_free(&ctx);
-    fused_hdr_free(&ctx);  /* second free — should be a no-op */
+    fused_hdr_free(&ctx);  /* second free - should be a no-op */
 
     /* Part 2: free on zero-initialized context */
     fused_hdr_ctx_t zero_ctx;
@@ -939,6 +939,186 @@ static void test_hdr_p010_tonemap_1x(void)
     TEST_PASS();
 }
 
+/* ==========================================================================
+ * HDR upscale tests
+ * ========================================================================== */
+
+/* test_hdr_upscale_dimensions
+ *   Verify upscale_hdr_outputs[].width/.height match expected for several
+ *   cascade depths and the tail. */
+static void test_hdr_upscale_dimensions(void)
+{
+    test_hdr_frame_t frame;
+    int r = test_hdr_frame_create(&frame, 192, 108, PATTERN_PQ_RAMP, 0);
+    TEST_ASSERT(r == 0, "frame create");
+
+    fused_hdr_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.src_width         = frame.width;
+    ctx.src_height        = frame.height;
+    ctx.src_y_stride      = frame.y_stride;
+    ctx.src_uv_stride     = frame.uv_stride;
+    ctx.src_format        = FUSED_PIX_I010;
+    ctx.src_transfer      = FUSED_TRC_PQ;
+    ctx.requested_flags   = 0;          /* upscale-only */
+    ctx.upscale_flags     = FUSED_UPSCALE_2X | FUSED_UPSCALE_4X;
+    ctx.upscale_tail_1_5x = 1;
+    suppress_log(&ctx);
+
+    int rc = fused_hdr_init(&ctx);
+    TEST_ASSERT(rc >= 0, "hdr init");
+
+    TEST_ASSERT(ctx.upscale_hdr_outputs[FUSED_UP_IDX_2X].plane_y != NULL, "2x");
+    TEST_ASSERT(ctx.upscale_hdr_outputs[FUSED_UP_IDX_2X].width  == 384, "2x w");
+    TEST_ASSERT(ctx.upscale_hdr_outputs[FUSED_UP_IDX_2X].height == 216, "2x h");
+
+    TEST_ASSERT(ctx.upscale_hdr_outputs[FUSED_UP_IDX_4X].plane_y != NULL, "4x");
+    TEST_ASSERT(ctx.upscale_hdr_outputs[FUSED_UP_IDX_4X].width  == 768, "4x w");
+    TEST_ASSERT(ctx.upscale_hdr_outputs[FUSED_UP_IDX_4X].height == 432, "4x h");
+
+    /* Tail = 4x * 1.5 = 6x */
+    TEST_ASSERT(ctx.upscale_hdr_outputs[FUSED_UP_IDX_TAIL].plane_y != NULL, "tail");
+    TEST_ASSERT(ctx.upscale_hdr_outputs[FUSED_UP_IDX_TAIL].width  == 1152, "tail w");
+    TEST_ASSERT(ctx.upscale_hdr_outputs[FUSED_UP_IDX_TAIL].height == 648, "tail h");
+
+    fused_hdr_free(&ctx);
+    test_hdr_frame_free(&frame);
+    TEST_PASS();
+}
+
+/* test_hdr_upscale_solid_preservation
+ *   Solid 10-bit value source must be preserved (within ±1) by upscale. */
+static void test_hdr_upscale_solid_preservation(void)
+{
+    test_hdr_frame_t frame;
+    int r = test_hdr_frame_create(&frame, 192, 108, PATTERN_SOLID, 0);
+    TEST_ASSERT(r == 0, "frame create");
+
+    /* Set source to a fixed 10-bit value (mid-gray) */
+    const uint16_t mid = 512;
+    int y_el = frame.y_stride / (int)sizeof(uint16_t);
+    int uv_el = frame.uv_stride / (int)sizeof(uint16_t);
+    for (int y = 0; y < frame.height; y++)
+        for (int x = 0; x < frame.width; x++)
+            frame.plane_y[y * y_el + x] = mid;
+    for (int y = 0; y < frame.height / 2; y++)
+        for (int x = 0; x < frame.width / 2; x++) {
+            frame.plane_u[y * uv_el + x] = mid;
+            frame.plane_v[y * uv_el + x] = mid;
+        }
+
+    fused_hdr_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.src_width         = frame.width;
+    ctx.src_height        = frame.height;
+    ctx.src_y_stride      = frame.y_stride;
+    ctx.src_uv_stride     = frame.uv_stride;
+    ctx.src_format        = FUSED_PIX_I010;
+    ctx.src_transfer      = FUSED_TRC_PQ;
+    ctx.requested_flags   = 0;
+    ctx.upscale_flags     = FUSED_UPSCALE_2X | FUSED_UPSCALE_4X;
+    ctx.upscale_tail_1_5x = 0;
+    suppress_log(&ctx);
+
+    int rc = fused_hdr_init(&ctx);
+    TEST_ASSERT(rc >= 0, "init");
+    fused_hdr_run(&ctx, frame.plane_y, frame.plane_u, frame.plane_v);
+
+    for (int k = 0; k < FUSED_MAX_UPSCALE_STEPS; k++) {
+        const fused_hdr_output_t *o = &ctx.upscale_hdr_outputs[k];
+        if (!o->plane_y) continue;
+        int el_stride = o->y_stride / (int)sizeof(uint16_t);
+        for (int y = 0; y < o->height; y++) {
+            for (int x = 0; x < o->width; x++) {
+                int v = o->plane_y[y * el_stride + x];
+                int diff = v - mid;
+                if (diff < -1 || diff > 1) {
+                    TEST_ASSERT(0, "HDR upscale Y not preserved");
+                }
+            }
+        }
+    }
+
+    fused_hdr_free(&ctx);
+    test_hdr_frame_free(&frame);
+    TEST_PASS();
+}
+
+/* test_hdr_upscale_combined_with_downscale
+ *   HDR downscale and upscale in one init call must both produce correct
+ *   outputs. */
+static void test_hdr_upscale_combined_with_downscale(void)
+{
+    test_hdr_frame_t frame;
+    int r = test_hdr_frame_create(&frame, 1920, 1080, PATTERN_SOLID, 0);
+    TEST_ASSERT(r == 0, "frame create");
+
+    /* Solid mid-value */
+    const uint16_t mid = 512;
+    int y_el = frame.y_stride / (int)sizeof(uint16_t);
+    int uv_el = frame.uv_stride / (int)sizeof(uint16_t);
+    for (int y = 0; y < frame.height; y++)
+        for (int x = 0; x < frame.width; x++)
+            frame.plane_y[y * y_el + x] = mid;
+    for (int y = 0; y < frame.height / 2; y++)
+        for (int x = 0; x < frame.width / 2; x++) {
+            frame.plane_u[y * uv_el + x] = mid;
+            frame.plane_v[y * uv_el + x] = mid;
+        }
+
+    fused_hdr_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.src_width       = frame.width;
+    ctx.src_height      = frame.height;
+    ctx.src_y_stride    = frame.y_stride;
+    ctx.src_uv_stride   = frame.uv_stride;
+    ctx.src_format      = FUSED_PIX_I010;
+    ctx.src_transfer    = FUSED_TRC_PQ;
+    ctx.requested_flags = FUSED_SCALE_2X;
+    ctx.hdr_flags       = FUSED_SCALE_2X;
+    ctx.upscale_flags   = FUSED_UPSCALE_2X;
+    suppress_log(&ctx);
+
+    int rc = fused_hdr_init(&ctx);
+    TEST_ASSERT(rc >= 0, "init");
+    TEST_ASSERT(ctx.hdr_outputs[FUSED_IDX_2X].plane_y != NULL, "down 2x");
+    TEST_ASSERT(ctx.upscale_hdr_outputs[FUSED_UP_IDX_2X].plane_y != NULL, "up 2x");
+
+    fused_hdr_run(&ctx, frame.plane_y, frame.plane_u, frame.plane_v);
+
+    /* Verify downscale 2x output is mid */
+    {
+        const fused_hdr_output_t *o = &ctx.hdr_outputs[FUSED_IDX_2X];
+        int el_stride = o->y_stride / (int)sizeof(uint16_t);
+        for (int y = 0; y < o->height; y++) {
+            for (int x = 0; x < o->width; x++) {
+                int v = o->plane_y[y * el_stride + x];
+                if (v < mid - 1 || v > mid + 1) {
+                    TEST_ASSERT(0, "HDR down 2x not mid");
+                }
+            }
+        }
+    }
+    /* Verify upscale 2x output is mid */
+    {
+        const fused_hdr_output_t *o = &ctx.upscale_hdr_outputs[FUSED_UP_IDX_2X];
+        int el_stride = o->y_stride / (int)sizeof(uint16_t);
+        for (int y = 0; y < o->height; y++) {
+            for (int x = 0; x < o->width; x++) {
+                int v = o->plane_y[y * el_stride + x];
+                if (v < mid - 1 || v > mid + 1) {
+                    TEST_ASSERT(0, "HDR up 2x not mid");
+                }
+            }
+        }
+    }
+
+    fused_hdr_free(&ctx);
+    test_hdr_frame_free(&frame);
+    TEST_PASS();
+}
+
+
 /* --------------------------------------------------------------------------
  * run_hdr_correctness_tests
  * -------------------------------------------------------------------------- */
@@ -958,4 +1138,9 @@ void run_hdr_correctness_tests(void)
     RUN_TEST(test_hdr_double_free_safety);
     RUN_TEST(test_hdr_non_standard_correctness);
     RUN_TEST(test_hdr_p010_tonemap_1x);
+
+    /* HDR upscale tests */
+    RUN_TEST(test_hdr_upscale_dimensions);
+    RUN_TEST(test_hdr_upscale_solid_preservation);
+    RUN_TEST(test_hdr_upscale_combined_with_downscale);
 }

@@ -1,10 +1,22 @@
 # Funnelcake API Reference
 
-Funnelcake is a fused multi-resolution YUV420 downscaler. A single call
-to `fused_scaler_run` produces up to four downscaled outputs in one pass,
-using AVX2 or NEON SIMD kernels with a portable scalar fallback.
+Funnelcake is a fused multi-resolution YUV420 scaler. A single call to
+`fused_scaler_run` produces multiple downscaled and/or upscaled outputs in
+one pass over the source, using AVX2 or NEON SIMD kernels with a portable
+scalar fallback.
 
-Input and output are I420 planar (Y, U, V separate planes), 8-bit.
+Input and output are I420 planar (Y, U, V separate planes), 8-bit. An
+HDR10 API handles 10-bit PQ/HLG input with optional tone mapping and
+shares the same scale flags and cascade semantics.
+
+**Downscale** produces up to four outputs from one of two families:
+thirds (1.5x, 3x, 6x, 12x) or pow2 (2x, 4x, 8x, 16x). See
+[Scale Step Flags](#scale-step-flags).
+
+**Upscale** produces up to five progressively-larger pow2 outputs (2x,
+4x, 8x, 16x, 32x) plus an optional 1.5x tail. Upscale may be combined
+with downscale in the same init call; both directions are produced in a
+single pass. See [Upscale Step Flags](#upscale-step-flags).
 
 
 ## Quick Start
@@ -43,7 +55,7 @@ if (rc < 0) {
 /* Process a frame */
 fused_scaler_run(&scaler, src_y, src_u, src_v);
 
-/* Access outputs — indexed by FUSED_IDX_* constants */
+/* Access outputs - indexed by FUSED_IDX_* constants */
 fused_scale_output_t *out_1_5x = &scaler.outputs[FUSED_IDX_1_5X];
 fused_scale_output_t *out_3x   = &scaler.outputs[FUSED_IDX_3X];
 fused_scale_output_t *out_6x   = &scaler.outputs[FUSED_IDX_6X];
@@ -145,20 +157,29 @@ a struct member. Zero-initialise before use.
 | `src_height` | `int` | Source luma height in pixels. Must be > 0 and large enough for all requested steps. |
 | `src_y_stride` | `int` | Bytes per row of the luma plane. Must be >= `src_width` and 32-byte aligned. |
 | `src_uv_stride` | `int` | Bytes per row of each chroma plane. Must be >= `src_width/2` and 32-byte aligned. |
-| `requested_flags` | `uint32_t` | Bitmask of `FUSED_SCALE_*` flags. All set bits must belong to the same family (thirds or pow2). |
+| `requested_flags` | `uint32_t` | Bitmask of `FUSED_SCALE_*` downscale flags. All set bits must belong to the same family (thirds or pow2). May be 0 if only upscaling is requested. |
+| `upscale_flags` | `uint32_t` | Bitmask of `FUSED_UPSCALE_*` flags. Must be a contiguous prefix of the cascade (`{}`, `{2x}`, `{2x,4x}`, ...). See [Upscale Step Flags](#upscale-step-flags). |
+| `upscale_tail_1_5x` | `int` | Set to 1 to append a 1.5x output on top of the deepest pow2 upscale level (or on the source directly if `upscale_flags == 0`). |
 | `options` | `uint32_t` | Bitmask of `FUSED_OPT_*` flags. Zero means default (lenient) behavior. |
 | `log_errors` | `fused_log_config_t` | Logging target for hard errors. Zero-value = stderr. |
 | `log_warnings` | `fused_log_config_t` | Logging target for warnings. Zero-value = stderr. |
+
+At least one of `requested_flags`, `upscale_flags`, or `upscale_tail_1_5x`
+must be non-zero. An init call that requests neither direction returns
+`FUSED_ERR_NO_STEPS`.
 
 **Fields written by `fused_scaler_init`**
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `achieved_flags` | `uint32_t` | Steps that will be produced on each `fused_scaler_run` call. |
-| `rejected_flags` | `uint32_t` | Steps from `requested_flags` that were rejected. |
+| `achieved_flags` | `uint32_t` | Downscale steps that will be produced on each `fused_scaler_run` call. |
+| `rejected_flags` | `uint32_t` | Downscale steps from `requested_flags` that were rejected. |
+| `achieved_upscale_flags` | `uint32_t` | Upscale pow2 levels that will be produced (subset of `upscale_flags`). Levels exceeding the 16384x16384 size cap are cleared here with `FUSED_WARN_BIT_PARTIAL` set in the return code. |
+| `achieved_upscale_tail` | `int` | 1 if the 1.5x tail will be produced, 0 if rejected. |
 | `effective_width` | `int` | Actual luma width read from the source (may be <= `src_width` if cropped). |
 | `effective_height` | `int` | Actual luma height read from the source (may be <= `src_height` if cropped). |
-| `outputs[8]` | `fused_scale_output_t` | Indexed by `FUSED_IDX_*` constants. Slots for steps not in `achieved_flags` have NULL plane pointers. |
+| `outputs[8]` | `fused_scale_output_t` | Downscale outputs, indexed by `FUSED_IDX_*` constants. Slots for steps not in `achieved_flags` have NULL plane pointers. |
+| `upscale_outputs[6]` | `fused_scale_output_t` | Upscale outputs, indexed by `FUSED_UP_IDX_*` constants. Slots 0-4 hold 2x-32x; slot 5 holds the 1.5x tail. Slots not achieved have NULL plane pointers. |
 
 The `_internal` field is opaque; do not read or write it.
 
@@ -245,6 +266,179 @@ intermediate passes internally without allocating output buffers for
 them.
 
 
+## Upscale Step Flags
+
+Upscale flags are ORed into `upscale_flags` (separate from
+`requested_flags`, which controls downscaling). Upscaling produces up to
+five pow2 outputs (2x, 4x, 8x, 16x, 32x) plus an optional 1.5x tail, all
+in a single pass over the source alongside any downscale outputs.
+
+| Flag | Bit | Output ratio |
+|------|-----|--------------|
+| `FUSED_UPSCALE_2X` | 0 | 2x source dimensions |
+| `FUSED_UPSCALE_4X` | 1 | 4x source dimensions |
+| `FUSED_UPSCALE_8X` | 2 | 8x source dimensions |
+| `FUSED_UPSCALE_16X` | 3 | 16x source dimensions |
+| `FUSED_UPSCALE_32X` | 4 | 32x source dimensions |
+
+Convenience mask:
+
+```c
+FUSED_UPSCALE_POW2_MASK  /* 2x | 4x | 8x | 16x | 32x */
+```
+
+### Cascade contiguity requirement
+
+Unlike the downscale flags, `upscale_flags` MUST be a **contiguous prefix**
+of the cascade. Each level reads from the previous level's output buffer
+(level 4x reads from the 2x buffer, 8x reads from 4x, etc.), so the
+intermediate levels must be present to produce deeper ones.
+
+Valid masks:
+
+- `0` (no pow2 upscaling)
+- `FUSED_UPSCALE_2X`
+- `FUSED_UPSCALE_2X | FUSED_UPSCALE_4X`
+- `FUSED_UPSCALE_2X | FUSED_UPSCALE_4X | FUSED_UPSCALE_8X`
+- `FUSED_UPSCALE_2X | FUSED_UPSCALE_4X | FUSED_UPSCALE_8X | FUSED_UPSCALE_16X`
+- `FUSED_UPSCALE_POW2_MASK` (all five)
+
+Non-contiguous masks such as `FUSED_UPSCALE_4X` alone or
+`FUSED_UPSCALE_2X | FUSED_UPSCALE_8X` cause `fused_scaler_init` to
+return `FUSED_ERR_INVALID_FLAGS`.
+
+### The 1.5x tail
+
+Set `ctx->upscale_tail_1_5x = 1` to append a single 1.5x bilinear step
+on top of the deepest pow2 output. The tail reads from:
+
+- the **source directly** when `upscale_flags == 0` (producing a 1.5x
+  output), or
+- the **deepest pow2 output** (level N-1) when pow2 levels are also
+  requested (producing a (1.5 * 2^N)x output).
+
+The tail output is stored in `upscale_outputs[FUSED_UP_IDX_TAIL]`.
+
+### Allowed combinations
+
+Every valid combination of `upscale_flags` and `upscale_tail_1_5x` and
+the resulting output set. `2X-4X` in the flag column means
+`FUSED_UPSCALE_2X | FUSED_UPSCALE_4X`, etc.
+
+| `upscale_flags` | `upscale_tail_1_5x` | Outputs produced | Tail ratio |
+|-----------------|---------------------|------------------|------------|
+| `0` | `0` | (no upscaling) | - |
+| `0` | `1` | 1.5x | 1.5x of source |
+| `2X` | `0` | 2x | - |
+| `2X` | `1` | 2x, 3x | 3x (= 2x * 1.5) |
+| `2X-4X` | `0` | 2x, 4x | - |
+| `2X-4X` | `1` | 2x, 4x, 6x | 6x (= 4x * 1.5) |
+| `2X-8X` | `0` | 2x, 4x, 8x | - |
+| `2X-8X` | `1` | 2x, 4x, 8x, 12x | 12x (= 8x * 1.5) |
+| `2X-16X` | `0` | 2x, 4x, 8x, 16x | - |
+| `2X-16X` | `1` | 2x, 4x, 8x, 16x, 24x | 24x (= 16x * 1.5) |
+| `POW2_MASK` | `0` | 2x, 4x, 8x, 16x, 32x | - |
+| `POW2_MASK` | `1` | 2x, 4x, 8x, 16x, 32x, 48x | 48x (= 32x * 1.5) |
+
+### Accessing upscale outputs
+
+Upscale output slots are indexed by `FUSED_UP_IDX_*` constants. Slots
+0-4 correspond to 2x-32x; slot 5 holds the 1.5x tail:
+
+```c
+#define FUSED_UP_IDX_2X     0
+#define FUSED_UP_IDX_4X     1
+#define FUSED_UP_IDX_8X     2
+#define FUSED_UP_IDX_16X    3
+#define FUSED_UP_IDX_32X    4
+#define FUSED_UP_IDX_TAIL   5
+```
+
+Example: 480x270 source, 2x + 4x cascade with 1.5x tail:
+
+```c
+fused_scaler_ctx_t ctx = {0};
+ctx.src_width     = 480;
+ctx.src_height    = 270;
+ctx.src_y_stride  = (480 + 31) & ~31;
+ctx.src_uv_stride = (240 + 31) & ~31;
+ctx.upscale_flags     = FUSED_UPSCALE_2X | FUSED_UPSCALE_4X;
+ctx.upscale_tail_1_5x = 1;
+
+int rc = fused_scaler_init(&ctx);
+if (rc < 0) { /* handle error */ }
+
+fused_scaler_run(&ctx, src_y, src_u, src_v);
+
+fused_scale_output_t *out_2x   = &ctx.upscale_outputs[FUSED_UP_IDX_2X];
+fused_scale_output_t *out_4x   = &ctx.upscale_outputs[FUSED_UP_IDX_4X];
+fused_scale_output_t *out_tail = &ctx.upscale_outputs[FUSED_UP_IDX_TAIL];
+/* out_2x   is  960 x  540
+ * out_4x   is 1920 x 1080
+ * out_tail is 2880 x 1620  (1.5x of the 4x level)
+ */
+
+fused_scaler_free(&ctx);
+```
+
+### Combining with downscale
+
+`upscale_flags` can be set in the same init call as `requested_flags`.
+Both directions are produced in one pass over the source:
+
+```c
+ctx.requested_flags   = FUSED_SCALE_1_5X | FUSED_SCALE_3X;  /* 2/3 and 1/3 */
+ctx.upscale_flags     = FUSED_UPSCALE_2X;                    /* 2x upscale  */
+ctx.upscale_tail_1_5x = 0;
+```
+
+The downscale outputs land in `ctx.outputs[]` and the upscale outputs
+land in `ctx.upscale_outputs[]`; the two arrays are independent.
+
+### Dimension and size requirements
+
+- Source dimensions must be **even** (already required by the downscale
+  path for YUV420 chroma subsampling).
+- No minimum-size constraint specific to upscaling beyond the downscale
+  minimum.
+- **Size cap**: any individual upscale level whose luma output exceeds
+  **16384 x 16384** is soft-rejected. The corresponding bit is cleared
+  from `ctx.achieved_upscale_flags` (or `achieved_upscale_tail`) and
+  `fused_scaler_init` returns with `FUSED_WARN_BIT_PARTIAL` set. Example:
+  a 1920x1080 source with `FUSED_UPSCALE_POW2_MASK` successfully produces
+  2x (3840x2160), 4x (7680x4320), and 8x (15360x8640); 16x (30720x17280)
+  and 32x (61440x34560) are rejected as they exceed the cap.
+
+### Performance notes
+
+Pow2 upscales are **very cheap**. Each 2x level is a single
+pair-average (`vrhaddq_u8` on NEON, `vpavgb` on AVX2) per output byte,
+typically running near memory bandwidth limits. The cascade amortizes
+source reads: level 0 (2x) reads the source once, and each subsequent
+level reads from the previous level's L1/L2-hot output buffer.
+
+The **1.5x tail is significantly more expensive than any 2x step**. It
+uses a weighted 85/171 bilinear blend rather than a pair-average, and
+the AVX2 implementation is shuffle-port throughput limited - the
+deinterleave, weighted-sum, pack, and interleave-store sequence costs
+roughly 13 shuffle-port micro-ops per chunk. On Zen 2 and later and on
+Intel Haswell-and-later, the 256-bit implementation is roughly 5-8x
+slower per byte than a straight 2x step, which is still faster than
+libswscale's bilinear upscale. On Zen 1 the 2x step wins by a larger
+margin because Zen 1 double-pumps every 256-bit AVX2 instruction through
+its 128-bit datapath, so the wider kernel provides no benefit there.
+
+The NEON path does not have this bottleneck - the 2->3 bilinear maps
+cleanly onto `vld2q_u8` / `vst3q_u8` load/store permute instructions
+which share ports with other vector ops and achieve near-optimal
+throughput.
+
+If you need a 1.5x ratio and are compute-limited on older x86 hardware,
+consider whether the tail can be applied at a shallower cascade level
+(where it operates on less data) or whether the downstream consumer can
+accept a slightly different ratio from a pow2 step.
+
+
 ## Option Flags
 
 Set in `ctx->options` before calling `fused_scaler_init`. Default
@@ -260,7 +454,7 @@ behavior (options = 0) is to produce every output possible.
   or odd output dimensions are rescued by silently cropping up to
   `ratio - 1` rows/columns from the bottom/right edge of the source.
   The crop is computed once at init time and applies only to the
-  kernel's loop bounds — no data is copied. The return code includes
+  kernel's loop bounds - no data is copied. The return code includes
   `FUSED_WARN_BIT_CROPPED`, and the effective source region is reported
   in `ctx->effective_width` / `ctx->effective_height`.
 
@@ -373,7 +567,7 @@ scaler.requested_flags = FUSED_SCALE_1_5X | FUSED_SCALE_3X | FUSED_SCALE_6X;
 
 int rc = fused_scaler_init(&scaler);
 if (rc < 0) {
-    /* Hard error — log and abort */
+    /* Hard error - log and abort */
     fprintf(stderr, "fused_scaler_init: error %d\n", rc);
     return rc;
 }
@@ -707,11 +901,13 @@ struct member. Zero-initialise before use.
 | `src_height` | `int` | Source luma height in pixels. |
 | `src_y_stride` | `int` | Bytes per row of the luma plane. Must be 32-byte aligned. |
 | `src_uv_stride` | `int` | Bytes per row of the U/V or interleaved UV plane. Must be 32-byte aligned. |
-| `src_format` | `int` | `FUSED_PIX_*` constant — input pixel layout. |
-| `src_transfer` | `int` | `FUSED_TRC_*` constant — transfer function (PQ or HLG). |
-| `requested_flags` | `uint32_t` | Bitmask of `FUSED_SCALE_*` flags. One family only. |
-| `hdr_flags` | `uint32_t` | Subset of `requested_flags` — produce 10-bit HDR outputs for these steps. |
-| `sdr_flags` | `uint32_t` | Subset of `requested_flags` — produce 8-bit tone-mapped SDR outputs for these steps. |
+| `src_format` | `int` | `FUSED_PIX_*` constant - input pixel layout. |
+| `src_transfer` | `int` | `FUSED_TRC_*` constant - transfer function (PQ or HLG). |
+| `requested_flags` | `uint32_t` | Bitmask of `FUSED_SCALE_*` downscale flags. One family only. May be 0 if only upscaling is requested. |
+| `hdr_flags` | `uint32_t` | Subset of `requested_flags` - produce 10-bit HDR outputs for these downscale steps. |
+| `sdr_flags` | `uint32_t` | Subset of `requested_flags` - produce 8-bit tone-mapped SDR outputs for these downscale steps. |
+| `upscale_flags` | `uint32_t` | Bitmask of `FUSED_UPSCALE_*` flags. Must be a contiguous prefix of the cascade. Same semantics as the 8-bit API. |
+| `upscale_tail_1_5x` | `int` | Set to 1 to append a 1.5x output to the deepest pow2 upscale level. |
 | `options` | `uint32_t` | `FUSED_OPT_*` bitmask (same as 8-bit API). |
 | `tonemap_1x` | `int` | If non-zero, produce an 8-bit tone-mapped copy at source resolution. |
 | `tonemap` | `fused_tonemap_config_t` | Tone mapping curve and parameters. |
@@ -722,16 +918,25 @@ struct member. Zero-initialise before use.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `achieved_hdr_flags` | `uint32_t` | HDR steps that will be produced. |
-| `achieved_sdr_flags` | `uint32_t` | SDR steps that will be produced. |
-| `rejected_flags` | `uint32_t` | Steps from `requested_flags` that were rejected. |
+| `achieved_hdr_flags` | `uint32_t` | HDR downscale steps that will be produced. |
+| `achieved_sdr_flags` | `uint32_t` | SDR downscale steps that will be produced. |
+| `rejected_flags` | `uint32_t` | Downscale steps from `requested_flags` that were rejected. |
+| `achieved_upscale_flags` | `uint32_t` | Upscale pow2 levels that will be produced. |
+| `achieved_upscale_tail` | `int` | 1 if the 1.5x tail will be produced, 0 if rejected. |
 | `effective_width` | `int` | Actual luma width read (may be <= `src_width` if cropped). |
 | `effective_height` | `int` | Actual luma height read (may be <= `src_height` if cropped). |
-| `hdr_outputs[8]` | `fused_hdr_output_t` | 10-bit outputs. Slots not in `achieved_hdr_flags` have NULL planes. |
-| `sdr_outputs[8]` | `fused_scale_output_t` | 8-bit tone-mapped outputs. Slots not in `achieved_sdr_flags` have NULL planes. |
+| `hdr_outputs[8]` | `fused_hdr_output_t` | 10-bit downscale outputs. Slots not in `achieved_hdr_flags` have NULL planes. |
+| `sdr_outputs[8]` | `fused_scale_output_t` | 8-bit tone-mapped downscale outputs. Slots not in `achieved_sdr_flags` have NULL planes. |
 | `output_1x` | `fused_scale_output_t` | 8-bit tone-mapped output at source resolution. Only valid if `tonemap_1x` was set. |
+| `upscale_hdr_outputs[6]` | `fused_hdr_output_t` | 10-bit upscale outputs, indexed by `FUSED_UP_IDX_*`. HDR only - no SDR or tone-mapping path is applied to upscale outputs. |
 
 The `_internal` field is opaque; do not read or write it.
+
+**HDR upscale** produces 10-bit outputs only. Unlike the downscale path,
+there is no parallel SDR or tone-mapping stage on upscale: `hdr_flags`
+and `sdr_flags` do not affect upscale outputs. If you need an SDR
+tone-mapped upscale copy, apply it in a separate pass on the resulting
+`upscale_hdr_outputs` plane.
 
 
 ## Input Pixel Formats
@@ -764,7 +969,7 @@ Set `ctx->tonemap.curve` before calling `fused_hdr_init`. The LUT is
 precomputed at init time from the selected curve, `peak_nits`, and
 `target_nits`.
 
-### `FUSED_TONEMAP_HABLE` (0) — default
+### `FUSED_TONEMAP_HABLE` (0) - default
 
 Hable/Uncharted 2 filmic curve. Provides natural highlight rolloff with
 good shadow detail. A solid general-purpose default for most content.

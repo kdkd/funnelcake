@@ -9,7 +9,7 @@
 
 /* --------------------------------------------------------------------------
  * All PNG generation uses ffmpeg for correct color space handling.
- * This avoids manual YUV→RGB matrix conversion and ensures the display
+ * This avoids manual YUV->RGB matrix conversion and ensures the display
  * colorimetry matches the actual data:
  *   SDR 8-bit:  yuv420p, BT.709 primaries/transfer/matrix, full range
  *   SDR (tone-mapped): yuv420p, BT.709, full range
@@ -183,7 +183,7 @@ static int run_hdr_visual_config(const char *label,
         const char *ratio = ratio_name(i);
 
         /* SDR (tone-mapped) output only.  HDR output is skipped because
-         * PNG is an SDR format — any conversion from PQ to displayable
+         * PNG is an SDR format - any conversion from PQ to displayable
          * RGB is itself a tone mapping, making the "HDR" PNG misleading.
          * The SDR output demonstrates the actual tone mapping result. */
         if (ctx.sdr_outputs[i].plane_y) {
@@ -210,13 +210,13 @@ static int run_hdr_visual_config(const char *label,
  *
  * Generate PNGs in output/ for representative configs × patterns.
  * All output uses ffmpeg for correct colorimetry.
- * HDR tests require ffmpeg — skipped entirely if ffmpeg is not found.
+ * HDR tests require ffmpeg - skipped entirely if ffmpeg is not found.
  * -------------------------------------------------------------------------- */
 
 void run_visual_tests(void)
 {
     if (!have_ffmpeg()) {
-        printf("\n  ffmpeg not found — skipping all visual output.\n");
+        printf("\n  ffmpeg not found - skipping all visual output.\n");
         printf("  Install ffmpeg and re-run 'make visual' for PNG output.\n");
         return;
     }
@@ -337,7 +337,7 @@ void run_visual_tests(void)
         /* Sample files from test/samples/ (if present from 'make fetch-samples').
          *
          * The synthetic ffmpeg samples (bars, gradients, mandelbrot) are
-         * gamma-space 10-bit — NOT actually PQ/HLG encoded.  They're useful
+         * gamma-space 10-bit - NOT actually PQ/HLG encoded.  They're useful
          * for verifying the 10-bit scaling pipeline (HDR-only output) but
          * tone mapping them produces wrong colors because the PQ EOTF
          * misinterprets gamma values.
@@ -361,9 +361,9 @@ void run_visual_tests(void)
             /* Real HDR content (haasn/hdr-tests) */
             { "test/samples/hdr_colorbars_1080p_i010_pq.yuv", 1920, 1080, FUSED_TRC_PQ,  "sample_hdr_colorbars" },
             { "test/samples/hdr_snow_i010_pq.yuv",            3840, 2160, FUSED_TRC_HLG, "sample_hdr_snow_hlg" },
-            /* OpenEXR StillLife (EXR linear → PQ via zscale) */
+            /* OpenEXR StillLife (EXR linear -> PQ via zscale) */
             { "test/samples/stilllife_i010_pq.yuv",            1240,  846, FUSED_TRC_PQ,  "sample_stilllife" },
-            /* Real-world photographs (JPEG → PQ via zscale) */
+            /* Real-world photographs (JPEG -> PQ via zscale) */
             { "test/samples/photo_panorama_i010_pq.yuv",      1000,  666, FUSED_TRC_PQ,  "photo_panorama" },
             { "test/samples/photo_landscape_i010_pq.yuv",     1000,  666, FUSED_TRC_PQ,  "photo_landscape" },
             { "test/samples/photo_nature_i010_pq.yuv",        1000,  666, FUSED_TRC_PQ,  "photo_nature" },
@@ -400,7 +400,7 @@ void run_visual_tests(void)
     }
 
     /* ======================================================================
-     * Video file demos — extract frame from .mov/.mp4/.MP4, scale and
+     * Video file demos - extract frame from .mov/.mp4/.MP4, scale and
      * tone-map through funnelcake, write output as .mov files:
      *   HDR: HEVC Main10 with HLG/PQ metadata (displays in HDR on macOS)
      *   SDR: H.264 BT.709 (standard SDR display)
@@ -504,7 +504,7 @@ void run_visual_tests(void)
             for (int i = 0; i < 8; i++) {
                 const char *ratio = (i < 8) ? ratio_names[i] : "?x";
 
-                /* HDR output → HEVC Main10 .mov with HLG metadata */
+                /* HDR output -> HEVC Main10 .mov with HLG metadata */
                 if (ctx.hdr_outputs[i].plane_y) {
                     int ow = ctx.hdr_outputs[i].width;
                     int oh = ctx.hdr_outputs[i].height;
@@ -547,7 +547,7 @@ void run_visual_tests(void)
                     }
                 }
 
-                /* SDR output → H.264 .mov with BT.709 metadata */
+                /* SDR output -> H.264 .mov with BT.709 metadata */
                 if (ctx.sdr_outputs[i].plane_y) {
                     int ow = ctx.sdr_outputs[i].width;
                     int oh = ctx.sdr_outputs[i].height;

@@ -21,11 +21,11 @@ void print_bench_comparison_table(void)
         if (g_bench_comparison[i].swscale_indep_med > 0) { has_swscale = 1; break; }
     if (!has_swscale) return;
 
-    printf("\n  %-28s %12s %12s %12s %10s %10s\n",
+    printf("\n  %-44s %12s %12s %12s %10s %10s\n",
            "Workload", "funnelcake", "sws indep", "sws cascade",
            "vs indep", "vs cascade");
-    printf("  %-28s %12s %12s %12s %10s %10s\n",
-           "----------------------------",
+    printf("  %-44s %12s %12s %12s %10s %10s\n",
+           "--------------------------------------------",
            "------------", "------------", "------------",
            "----------", "----------");
 
@@ -51,7 +51,7 @@ void print_bench_comparison_table(void)
         snprintf(speedup_indep, sizeof(speedup_indep), "%.1fx",
                  c->swscale_indep_med / c->funnelcake_med);
 
-        printf("  %-28s %12s %12s %12s %10s %10s\n",
+        printf("  %-44s %12s %12s %12s %10s %10s\n",
                c->label, fc_str, si_str, sc_str,
                speedup_indep, speedup_cascade);
     }

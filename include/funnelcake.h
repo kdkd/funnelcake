@@ -32,7 +32,7 @@ extern "C" {
 #define FUSED_SCALE_POW2_MASK \
     (FUSED_SCALE_2X | FUSED_SCALE_4X | FUSED_SCALE_8X | FUSED_SCALE_16X)
 
-/* Output array indices — use these to index into outputs[], hdr_outputs[],
+/* Output array indices - use these to index into outputs[], hdr_outputs[],
  * and sdr_outputs[] instead of hard-coding bit positions.
  *
  *   fused_scale_output_t *out = &scaler.outputs[FUSED_IDX_3X];
@@ -45,6 +45,57 @@ extern "C" {
 #define FUSED_IDX_8X     5
 #define FUSED_IDX_12X    6
 #define FUSED_IDX_16X    7
+
+
+/* --------------------------------------------------------------------------
+ * Upscale flags (upscale_flags)
+ *
+ * Upscaling is a cascading 2x chain (0..5 levels) optionally followed by a
+ * single 1.5x tail that reads the deepest 2x output. Unlike the downscale
+ * flags, the upscale flag mask MUST be a contiguous prefix of the pow2
+ * cascade - you can request {2x}, {2x,4x}, {2x,4x,8x}, etc. but not {4x}
+ * alone or {2x,8x}. This mirrors the cascade dependency: 8x reads from 4x's
+ * output buffer.
+ *
+ * The upscale chain is independent of the downscale family (thirds/pow2):
+ * both may be requested in the same init call and are produced in a single
+ * pass over the source.
+ *
+ * Combinations (cascade depth N, tail on/off) produce these outputs:
+ *   N=0, tail=1 -> [1.5x]                           (reads source directly)
+ *   N=1, tail=0 -> [2x]
+ *   N=1, tail=1 -> [2x, 3x]                         (3x = 2x * 1.5)
+ *   N=2, tail=0 -> [2x, 4x]
+ *   N=2, tail=1 -> [2x, 4x, 6x]
+ *   ...
+ *   N=5, tail=0 -> [2x, 4x, 8x, 16x, 32x]
+ *   N=5, tail=1 -> [2x, 4x, 8x, 16x, 32x, 48x]
+ * -------------------------------------------------------------------------- */
+
+#define FUSED_UPSCALE_2X        (1u << 0)
+#define FUSED_UPSCALE_4X        (1u << 1)
+#define FUSED_UPSCALE_8X        (1u << 2)
+#define FUSED_UPSCALE_16X       (1u << 3)
+#define FUSED_UPSCALE_32X       (1u << 4)
+
+#define FUSED_UPSCALE_POW2_MASK 0x1Fu
+
+/* Maximum number of upscale output slots (5 pow2 levels + 1.5x tail). */
+#define FUSED_MAX_UPSCALE_STEPS 6
+
+/* Upscale output array indices.
+ *
+ *   fused_scale_output_t *out = &scaler.upscale_outputs[FUSED_UP_IDX_4X];
+ *
+ * Slots 0..4 hold the 2x..32x outputs, slot 5 holds the 1.5x tail (if
+ * upscale_tail_1_5x was set).
+ */
+#define FUSED_UP_IDX_2X     0
+#define FUSED_UP_IDX_4X     1
+#define FUSED_UP_IDX_8X     2
+#define FUSED_UP_IDX_16X    3
+#define FUSED_UP_IDX_32X    4
+#define FUSED_UP_IDX_TAIL   5
 
 
 /* --------------------------------------------------------------------------
@@ -66,8 +117,8 @@ extern "C" {
  * Return codes
  *
  * Zero (FUSED_OK): all requested outputs produced with SIMD, no crop.
- * Positive: warning bits — composable, test with &.
- * Negative: hard errors — not composable, nothing was produced.
+ * Positive: warning bits - composable, test with &.
+ * Negative: hard errors - not composable, nothing was produced.
  * -------------------------------------------------------------------------- */
 
 #define FUSED_OK                 0
@@ -149,28 +200,40 @@ typedef struct {
  * The _internal pointer is managed by init/free and must not be touched.
  */
 typedef struct {
-    /* Source description — set by caller before init */
+    /* Source description - set by caller before init */
     int      src_width;
     int      src_height;
     int      src_y_stride;
     int      src_uv_stride;
 
-    /* Configuration — set by caller before init */
+    /* Configuration - set by caller before init */
     uint32_t requested_flags;   /* FUSED_SCALE_* bitmask (one family only) */
     uint32_t options;           /* FUSED_OPT_* bitmask                     */
 
-    /* Logging — set by caller before init; zero struct = stderr defaults */
+    /* Logging - set by caller before init; zero struct = stderr defaults */
     fused_log_config_t log_errors;
     fused_log_config_t log_warnings;
 
-    /* Results — written by fused_scaler_init */
-    uint32_t achieved_flags;    /* steps that will be produced              */
-    uint32_t rejected_flags;    /* steps that were rejected                 */
+    /* Upscale configuration - set by caller before init (all optional; zero
+     * values mean "no upscaling").  May be used alone or together with the
+     * downscale requested_flags above; in the combined case both direction's
+     * outputs are produced in a single pass over the source. */
+    uint32_t upscale_flags;     /* FUSED_UPSCALE_* contiguous prefix mask   */
+    int      upscale_tail_1_5x; /* 0 or 1: append a 1.5x tail output        */
+
+    /* Results - written by fused_scaler_init */
+    uint32_t achieved_flags;    /* downscale steps that will be produced    */
+    uint32_t rejected_flags;    /* downscale steps that were rejected       */
     int      effective_width;   /* actual source luma width used            */
     int      effective_height;  /* actual source luma height used           */
     fused_scale_output_t outputs[8];
 
-    /* Internal — opaque, managed by init/free; do not read or write */
+    /* Upscale results - written by fused_scaler_init */
+    uint32_t achieved_upscale_flags;   /* upscale levels that will be produced */
+    int      achieved_upscale_tail;    /* 1 if the 1.5x tail will be produced  */
+    fused_scale_output_t upscale_outputs[FUSED_MAX_UPSCALE_STEPS];
+
+    /* Internal - opaque, managed by init/free; do not read or write */
     void *_internal;
 } fused_scaler_ctx_t;
 
@@ -180,7 +243,7 @@ typedef struct {
  * -------------------------------------------------------------------------- */
 
 /*
- * fused_scaler_init — validate configuration and allocate output buffers.
+ * fused_scaler_init - validate configuration and allocate output buffers.
  *
  * Returns FUSED_OK (0) on perfect success, a positive bitmask of
  * FUSED_WARN_BIT_* on partial success, or a negative FUSED_ERR_* on hard
@@ -194,7 +257,7 @@ typedef struct {
 int fused_scaler_init(fused_scaler_ctx_t *ctx);
 
 /*
- * fused_scaler_run — process one input frame and fill all achieved outputs.
+ * fused_scaler_run - process one input frame and fill all achieved outputs.
  *
  * src_y, src_u, src_v must point to the start of the YUV420 I420 planes
  * for the current frame. Strides come from ctx->src_y_stride and
@@ -210,7 +273,7 @@ void fused_scaler_run(fused_scaler_ctx_t *ctx,
                       const uint8_t *src_v);
 
 /*
- * fused_scaler_free — release all resources allocated by fused_scaler_init.
+ * fused_scaler_free - release all resources allocated by fused_scaler_init.
  *
  * Safe to call on a zero-initialised context or after a hard-error init
  * (no-op in those cases). After this call, the context may be re-initialised
@@ -220,7 +283,7 @@ void fused_scaler_free(fused_scaler_ctx_t *ctx);
 
 
 /* ==========================================================================
- * HDR10 API — 10-bit scaling with optional tone mapping to SDR
+ * HDR10 API - 10-bit scaling with optional tone mapping to SDR
  *
  * Completely separate from the 8-bit API above. The existing SDR types,
  * functions, and behavior are unchanged.
@@ -250,7 +313,7 @@ void fused_scaler_free(fused_scaler_ctx_t *ctx);
  * function differs.
  * -------------------------------------------------------------------------- */
 
-#define FUSED_TRC_PQ       0   /* SMPTE ST 2084 — Perceptual Quantizer (HDR10)  */
+#define FUSED_TRC_PQ       0   /* SMPTE ST 2084 - Perceptual Quantizer (HDR10)  */
 #define FUSED_TRC_HLG      1   /* Hybrid Log-Gamma (BBC/NHK, backward-compat)   */
 
 
@@ -262,9 +325,9 @@ void fused_scaler_free(fused_scaler_ctx_t *ctx);
  * target_nits.
  * -------------------------------------------------------------------------- */
 
-#define FUSED_TONEMAP_HABLE    0   /* Hable/Uncharted 2 filmic — good default    */
-#define FUSED_TONEMAP_REINHARD 1   /* Reinhard global — simple, lower contrast    */
-#define FUSED_TONEMAP_BT2390   2   /* ITU-R BT.2390 EETF — broadcast reference   */
+#define FUSED_TONEMAP_HABLE    0   /* Hable/Uncharted 2 filmic - good default    */
+#define FUSED_TONEMAP_REINHARD 1   /* Reinhard global - simple, lower contrast    */
+#define FUSED_TONEMAP_BT2390   2   /* ITU-R BT.2390 EETF - broadcast reference   */
 #define FUSED_TONEMAP_CUSTOM   3   /* Caller-supplied 1024-entry Y LUT            */
 
 
@@ -310,43 +373,52 @@ typedef struct {
  * and/or sdr_flags. Both must be subsets of requested_flags.
  */
 typedef struct {
-    /* Source description — set by caller before init */
+    /* Source description - set by caller before init */
     int      src_width;
     int      src_height;
     int      src_y_stride;       /* bytes per row of Y plane                   */
     int      src_uv_stride;      /* bytes per row of U/V (or UV interleaved)   */
-    int      src_format;         /* FUSED_PIX_* — pixel layout                 */
-    int      src_transfer;       /* FUSED_TRC_* — transfer function            */
+    int      src_format;         /* FUSED_PIX_* - pixel layout                 */
+    int      src_transfer;       /* FUSED_TRC_* - transfer function            */
 
-    /* Configuration — set by caller before init */
+    /* Configuration - set by caller before init */
     uint32_t requested_flags;    /* FUSED_SCALE_* bitmask (one family only)    */
     uint32_t hdr_flags;          /* subset: produce 10-bit HDR outputs         */
     uint32_t sdr_flags;          /* subset: produce 8-bit tone-mapped outputs  */
     uint32_t options;            /* FUSED_OPT_* bitmask (NO_CROP, NO_FALLBACK) */
 
-    /* 1:1 tone map — if set, produce an SDR copy at source resolution */
+    /* 1:1 tone map - if set, produce an SDR copy at source resolution */
     int      tonemap_1x;
 
     /* Tone mapping configuration (applied to all SDR outputs + tonemap_1x) */
     fused_tonemap_config_t tonemap;
 
-    /* Logging — zero struct = stderr defaults */
+    /* Logging - zero struct = stderr defaults */
     fused_log_config_t log_errors;
     fused_log_config_t log_warnings;
 
-    /* Results — written by fused_hdr_init */
+    /* Results - written by fused_hdr_init */
     uint32_t achieved_hdr_flags;     /* HDR steps that will be produced          */
     uint32_t achieved_sdr_flags;     /* SDR steps that will be produced          */
     uint32_t rejected_flags;         /* steps that were rejected                 */
     int      effective_width;        /* actual source width used (after crop)    */
     int      effective_height;       /* actual source height used (after crop)   */
 
-    /* Outputs — indexed by bit position of FUSED_SCALE_* flag */
+    /* Outputs - indexed by bit position of FUSED_SCALE_* flag */
     fused_hdr_output_t   hdr_outputs[8];  /* 10-bit; NULL planes if not in hdr_flags */
     fused_scale_output_t sdr_outputs[8];  /* 8-bit;  NULL planes if not in sdr_flags */
     fused_scale_output_t output_1x;       /* 8-bit tone-mapped at source res         */
 
-    /* Internal — opaque, managed by init/free; do not read or write */
+    /* Upscale configuration and results - HDR-only for this iteration.
+     * No tone-mapping is applied to upscale outputs; they are 10-bit HDR
+     * copies scaled from the 10-bit HDR source. */
+    uint32_t upscale_flags;             /* FUSED_UPSCALE_* contiguous prefix mask  */
+    int      upscale_tail_1_5x;         /* 0 or 1: append 1.5x tail output         */
+    uint32_t achieved_upscale_flags;    /* written by init                         */
+    int      achieved_upscale_tail;     /* written by init                         */
+    fused_hdr_output_t upscale_hdr_outputs[FUSED_MAX_UPSCALE_STEPS];
+
+    /* Internal - opaque, managed by init/free; do not read or write */
     void *_internal;
 } fused_hdr_ctx_t;
 
@@ -356,7 +428,7 @@ typedef struct {
  * -------------------------------------------------------------------------- */
 
 /*
- * fused_hdr_init — validate configuration, generate tone mapping LUTs,
+ * fused_hdr_init - validate configuration, generate tone mapping LUTs,
  * and allocate output buffers.
  *
  * Returns FUSED_OK (0) on perfect success, a positive bitmask of
@@ -370,7 +442,7 @@ typedef struct {
 int fused_hdr_init(fused_hdr_ctx_t *ctx);
 
 /*
- * fused_hdr_run — process one 10-bit input frame, produce all HDR and
+ * fused_hdr_run - process one 10-bit input frame, produce all HDR and
  * SDR outputs, and apply tone mapping to SDR outputs.
  *
  * src_y: pointer to luma plane (uint16_t, 10-bit values in low bits).
@@ -386,7 +458,7 @@ void fused_hdr_run(fused_hdr_ctx_t *ctx,
                    const uint16_t *src_v);
 
 /*
- * fused_hdr_free — release all resources allocated by fused_hdr_init.
+ * fused_hdr_free - release all resources allocated by fused_hdr_init.
  * Same safety semantics as fused_scaler_free.
  */
 void fused_hdr_free(fused_hdr_ctx_t *ctx);

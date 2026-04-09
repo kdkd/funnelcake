@@ -70,7 +70,7 @@ static int kernel_produces_output(int src_w, int src_h, uint32_t flags)
 
 /* --------------------------------------------------------------------------
  * 1. test_solid_color_preservation
- *    Solid-128 frame scaled — output Y pixels must be 128 ±1.
+ *    Solid-128 frame scaled - output Y pixels must be 128 ±1.
  * -------------------------------------------------------------------------- */
 
 static void test_solid_color_preservation(void)
@@ -82,7 +82,7 @@ static void test_solid_color_preservation(void)
 
     for (int ci = 0; ci < (int)(sizeof(cases)/sizeof(cases[0])); ci++) {
         if (!kernel_produces_output(cases[ci].w, cases[ci].h, cases[ci].flags)) {
-            TEST_SKIP("SIMD kernel active but not yet implemented — skipping pixel checks");
+            TEST_SKIP("SIMD kernel active but not yet implemented - skipping pixel checks");
         }
 
         test_frame_t frame;
@@ -134,7 +134,7 @@ static void test_solid_color_preservation(void)
 
 /* --------------------------------------------------------------------------
  * 2. test_hgradient_monotonicity
- *    Horizontal gradient — output rows must be non-decreasing left-to-right
+ *    Horizontal gradient - output rows must be non-decreasing left-to-right
  *    (allow ±2 for rounding).
  * -------------------------------------------------------------------------- */
 
@@ -146,7 +146,7 @@ static void test_hgradient_monotonicity(void)
 
     for (int ci = 0; ci < (int)(sizeof(cases)/sizeof(cases[0])); ci++) {
         if (!kernel_produces_output(cases[ci].w, cases[ci].h, cases[ci].flags)) {
-            TEST_SKIP("SIMD kernel active but not yet implemented — skipping pixel checks");
+            TEST_SKIP("SIMD kernel active but not yet implemented - skipping pixel checks");
         }
 
         test_frame_t frame;
@@ -199,7 +199,7 @@ static void test_hgradient_monotonicity(void)
 
 /* --------------------------------------------------------------------------
  * 3. test_vgradient_monotonicity
- *    Vertical gradient — output columns must be non-decreasing top-to-bottom
+ *    Vertical gradient - output columns must be non-decreasing top-to-bottom
  *    (allow ±2 for rounding).
  * -------------------------------------------------------------------------- */
 
@@ -211,7 +211,7 @@ static void test_vgradient_monotonicity(void)
 
     for (int ci = 0; ci < (int)(sizeof(cases)/sizeof(cases[0])); ci++) {
         if (!kernel_produces_output(cases[ci].w, cases[ci].h, cases[ci].flags)) {
-            TEST_SKIP("SIMD kernel active but not yet implemented — skipping pixel checks");
+            TEST_SKIP("SIMD kernel active but not yet implemented - skipping pixel checks");
         }
 
         test_frame_t frame;
@@ -369,8 +369,8 @@ static void test_buffer_alignment(void)
 
 /* --------------------------------------------------------------------------
  * 6. test_random_pixel_range
- *    Random-seeded frame scaled — all output pixel values must be in [0,255].
- *    (Verifies no overflow/underflow in arithmetic — only meaningful when
+ *    Random-seeded frame scaled - all output pixel values must be in [0,255].
+ *    (Verifies no overflow/underflow in arithmetic - only meaningful when
  *    the scalar kernel is active.)
  * -------------------------------------------------------------------------- */
 
@@ -379,7 +379,7 @@ static void test_random_pixel_range(void)
     uint32_t flags = FUSED_SCALE_1_5X | FUSED_SCALE_3X | FUSED_SCALE_6X;
 
     if (!kernel_produces_output(1920, 1080, flags)) {
-        TEST_SKIP("SIMD kernel active but not yet implemented — skipping pixel checks");
+        TEST_SKIP("SIMD kernel active but not yet implemented - skipping pixel checks");
     }
 
     test_frame_t frame;
@@ -433,7 +433,7 @@ static void test_random_pixel_range(void)
 
 /* --------------------------------------------------------------------------
  * 7. test_checkerboard_scaling
- *    Checkerboard scaled — output must not be all-zeros or all-one-value
+ *    Checkerboard scaled - output must not be all-zeros or all-one-value
  *    (sanity check that kernels are actually processing data).
  *    Only checked when the scalar kernel is active.
  * -------------------------------------------------------------------------- */
@@ -447,7 +447,7 @@ static void test_checkerboard_scaling(void)
 
     for (int ci = 0; ci < (int)(sizeof(cases)/sizeof(cases[0])); ci++) {
         if (!kernel_produces_output(cases[ci].w, cases[ci].h, cases[ci].flags)) {
-            TEST_SKIP("SIMD kernel active but not yet implemented — skipping pixel checks");
+            TEST_SKIP("SIMD kernel active but not yet implemented - skipping pixel checks");
         }
 
         test_frame_t frame;
@@ -656,7 +656,7 @@ static void test_double_free_safety(void)
     TEST_ASSERT(rc >= 0, "init should succeed");
 
     fused_scaler_free(&ctx);
-    fused_scaler_free(&ctx);  /* second free — should be a no-op */
+    fused_scaler_free(&ctx);  /* second free - should be a no-op */
 
     /* Part 2: free on zero-initialized context */
     fused_scaler_ctx_t zero_ctx;
@@ -665,6 +665,476 @@ static void test_double_free_safety(void)
 
     TEST_PASS();
 }
+
+/* ==========================================================================
+ * Upscale tests
+ * ========================================================================== */
+
+/* Run a basic upscale config and return the populated ctx (caller must free).
+ * Returns 0 on success and a negative error code if init failed. */
+static int upscale_init_run(fused_scaler_ctx_t *ctx, test_frame_t *frame,
+                            int src_w, int src_h, int pattern,
+                            uint32_t up_flags, int up_tail)
+{
+    if (test_frame_create(frame, src_w, src_h, pattern, 0) != 0) return -1;
+
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->src_width         = frame->width;
+    ctx->src_height        = frame->height;
+    ctx->src_y_stride      = frame->y_stride;
+    ctx->src_uv_stride     = frame->uv_stride;
+    ctx->requested_flags   = 0;        /* upscale-only */
+    ctx->upscale_flags     = up_flags;
+    ctx->upscale_tail_1_5x = up_tail;
+    suppress_log(ctx);
+
+    int rc = fused_scaler_init(ctx);
+    if (rc < 0) {
+        test_frame_free(frame);
+        return rc;
+    }
+
+    fused_scaler_run(ctx, frame->plane_y, frame->plane_u, frame->plane_v);
+    return 0;
+}
+
+/* --------------------------------------------------------------------------
+ * test_upscale_output_dimensions
+ *   For each cascade depth 1..5 (and the tail with/without), verify
+ *   upscale_outputs[k].width / .height match expected.
+ * -------------------------------------------------------------------------- */
+
+static void test_upscale_output_dimensions(void)
+{
+    /* 192x108 source - small enough that 32x cascade is reasonable.
+     * For the N=0 tail-only case, source must be a multiple of 4 in both
+     * dimensions so that src*3/2 is even (YUV420 requirement). */
+    static const struct {
+        int      src_w, src_h;
+        uint32_t up;
+        int      tail;
+    } cases[] = {
+        { 192, 108, FUSED_UPSCALE_2X,                                      0 },
+        { 192, 108, FUSED_UPSCALE_2X|FUSED_UPSCALE_4X,                     0 },
+        { 192, 108, FUSED_UPSCALE_2X|FUSED_UPSCALE_4X|FUSED_UPSCALE_8X,    0 },
+        { 192, 108, FUSED_UPSCALE_2X,                                      1 },
+        { 192, 108, 0,                                                     1 },
+        { 192, 108, FUSED_UPSCALE_2X|FUSED_UPSCALE_4X|
+                    FUSED_UPSCALE_8X|FUSED_UPSCALE_16X,                    0 },
+    };
+
+    for (int ci = 0; ci < (int)(sizeof(cases)/sizeof(cases[0])); ci++) {
+        fused_scaler_ctx_t ctx;
+        test_frame_t frame;
+        int rc = upscale_init_run(&ctx, &frame, cases[ci].src_w, cases[ci].src_h,
+                                  PATTERN_SOLID, cases[ci].up, cases[ci].tail);
+        TEST_ASSERT(rc == 0, "upscale init failed");
+
+        /* Walk the pow2 cascade slots */
+        int up_n = 0;
+        for (int k = 0; k < 5; k++) if (cases[ci].up & (1u << k)) up_n++;
+
+        for (int k = 0; k < up_n; k++) {
+            int expected_w = cases[ci].src_w << (k + 1);
+            int expected_h = cases[ci].src_h << (k + 1);
+            TEST_ASSERT(ctx.upscale_outputs[k].plane_y != NULL,
+                        "expected upscale level allocated");
+            TEST_ASSERT(ctx.upscale_outputs[k].width == expected_w,
+                        "upscale level width mismatch");
+            TEST_ASSERT(ctx.upscale_outputs[k].height == expected_h,
+                        "upscale level height mismatch");
+        }
+
+        if (cases[ci].tail) {
+            int tail_in_w = (up_n == 0) ? cases[ci].src_w
+                                        : (cases[ci].src_w << up_n);
+            int tail_in_h = (up_n == 0) ? cases[ci].src_h
+                                        : (cases[ci].src_h << up_n);
+            int expected_w = tail_in_w * 3 / 2;
+            int expected_h = tail_in_h * 3 / 2;
+            TEST_ASSERT(ctx.upscale_outputs[FUSED_UP_IDX_TAIL].plane_y != NULL,
+                        "expected tail allocated");
+            TEST_ASSERT(ctx.upscale_outputs[FUSED_UP_IDX_TAIL].width == expected_w,
+                        "tail width mismatch");
+            TEST_ASSERT(ctx.upscale_outputs[FUSED_UP_IDX_TAIL].height == expected_h,
+                        "tail height mismatch");
+        }
+
+        fused_scaler_free(&ctx);
+        test_frame_free(&frame);
+    }
+
+    TEST_PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * test_upscale_solid_color_preservation
+ *   Solid 128 source. Every upscale output pixel must be 128 (±1 tolerance
+ *   for the 171/85 weight rounding).
+ * -------------------------------------------------------------------------- */
+
+static void test_upscale_solid_color_preservation(void)
+{
+    static const struct {
+        int      src_w, src_h;
+        uint32_t up;
+        int      tail;
+    } cases[] = {
+        { 192, 108, FUSED_UPSCALE_2X,                                      0 },
+        { 192, 108, FUSED_UPSCALE_2X|FUSED_UPSCALE_4X,                     0 },
+        { 192, 108, FUSED_UPSCALE_2X,                                      1 },
+        { 192, 108, 0,                                                     1 },
+        { 192, 108, FUSED_UPSCALE_2X|FUSED_UPSCALE_4X|FUSED_UPSCALE_8X,    1 },
+    };
+
+    for (int ci = 0; ci < (int)(sizeof(cases)/sizeof(cases[0])); ci++) {
+        fused_scaler_ctx_t ctx;
+        test_frame_t frame;
+        int rc = upscale_init_run(&ctx, &frame, cases[ci].src_w, cases[ci].src_h,
+                                  PATTERN_SOLID, cases[ci].up, cases[ci].tail);
+        TEST_ASSERT(rc == 0, "init failed");
+
+        /* Set source to solid 128 */
+        for (int y = 0; y < frame.height; y++)
+            memset(frame.plane_y + y * frame.y_stride, 128, frame.width);
+        for (int y = 0; y < frame.height / 2; y++) {
+            memset(frame.plane_u + y * frame.uv_stride, 128, frame.width / 2);
+            memset(frame.plane_v + y * frame.uv_stride, 128, frame.width / 2);
+        }
+        fused_scaler_run(&ctx, frame.plane_y, frame.plane_u, frame.plane_v);
+
+        for (int k = 0; k < FUSED_MAX_UPSCALE_STEPS; k++) {
+            const fused_scale_output_t *o = &ctx.upscale_outputs[k];
+            if (!o->plane_y) continue;
+            for (int y = 0; y < o->height; y++) {
+                const uint8_t *row = o->plane_y + y * o->y_stride;
+                for (int x = 0; x < o->width; x++) {
+                    int diff = (int)row[x] - 128;
+                    if (diff < -1 || diff > 1) {
+                        char msg[128];
+                        snprintf(msg, sizeof(msg),
+                                 "upscale slot %d Y[%d,%d]=%u expected 128",
+                                 k, x, y, row[x]);
+                        TEST_ASSERT(0, msg);
+                    }
+                }
+            }
+        }
+
+        fused_scaler_free(&ctx);
+        test_frame_free(&frame);
+    }
+
+    TEST_PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * test_upscale_hgradient_monotonicity
+ *   Horizontal gradient source. Each output row must be (weakly) monotonic
+ *   left-to-right within ±2 tolerance.
+ * -------------------------------------------------------------------------- */
+
+static void test_upscale_hgradient_monotonicity(void)
+{
+    fused_scaler_ctx_t ctx;
+    test_frame_t frame;
+    int rc = upscale_init_run(&ctx, &frame, 192, 108,
+                              PATTERN_HGRADIENT,
+                              FUSED_UPSCALE_2X | FUSED_UPSCALE_4X, 1);
+    TEST_ASSERT(rc == 0, "init failed");
+
+    for (int k = 0; k < FUSED_MAX_UPSCALE_STEPS; k++) {
+        const fused_scale_output_t *o = &ctx.upscale_outputs[k];
+        if (!o->plane_y) continue;
+        for (int y = 0; y < o->height; y++) {
+            const uint8_t *row = o->plane_y + y * o->y_stride;
+            for (int x = 1; x < o->width; x++) {
+                if ((int)row[x] < (int)row[x - 1] - 2) {
+                    char msg[128];
+                    snprintf(msg, sizeof(msg),
+                             "upscale slot %d row %d not monotonic at x=%d "
+                             "(%u < %u - 2)", k, y, x, row[x], row[x - 1]);
+                    TEST_ASSERT(0, msg);
+                }
+            }
+        }
+    }
+
+    fused_scaler_free(&ctx);
+    test_frame_free(&frame);
+    TEST_PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * test_upscale_vgradient_monotonicity
+ *   Vertical gradient source. Each output column must be (weakly) monotonic
+ *   top-to-bottom within ±2 tolerance.
+ * -------------------------------------------------------------------------- */
+
+static void test_upscale_vgradient_monotonicity(void)
+{
+    fused_scaler_ctx_t ctx;
+    test_frame_t frame;
+    int rc = upscale_init_run(&ctx, &frame, 192, 108,
+                              PATTERN_VGRADIENT,
+                              FUSED_UPSCALE_2X | FUSED_UPSCALE_4X, 1);
+    TEST_ASSERT(rc == 0, "init failed");
+
+    for (int k = 0; k < FUSED_MAX_UPSCALE_STEPS; k++) {
+        const fused_scale_output_t *o = &ctx.upscale_outputs[k];
+        if (!o->plane_y) continue;
+        for (int x = 0; x < o->width; x++) {
+            int prev = o->plane_y[x];
+            for (int y = 1; y < o->height; y++) {
+                int v = o->plane_y[y * o->y_stride + x];
+                if (v < prev - 2) {
+                    char msg[128];
+                    snprintf(msg, sizeof(msg),
+                             "upscale slot %d col %d not monotonic at y=%d "
+                             "(%d < %d - 2)", k, x, y, v, prev);
+                    TEST_ASSERT(0, msg);
+                }
+                prev = v;
+            }
+        }
+    }
+
+    fused_scaler_free(&ctx);
+    test_frame_free(&frame);
+    TEST_PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * test_upscale_combined_with_downscale
+ *   Request both downscale and upscale flags. Verify both sets of outputs
+ *   are populated and correct on a solid-128 source.
+ * -------------------------------------------------------------------------- */
+
+static void test_upscale_combined_with_downscale(void)
+{
+    test_frame_t frame;
+    int r = test_frame_create(&frame, 1920, 1080, PATTERN_SOLID, 0);
+    TEST_ASSERT(r == 0, "frame create");
+
+    /* Solid 128 source */
+    for (int y = 0; y < frame.height; y++)
+        memset(frame.plane_y + y * frame.y_stride, 128, frame.width);
+    for (int y = 0; y < frame.height / 2; y++) {
+        memset(frame.plane_u + y * frame.uv_stride, 128, frame.width / 2);
+        memset(frame.plane_v + y * frame.uv_stride, 128, frame.width / 2);
+    }
+
+    fused_scaler_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.src_width         = frame.width;
+    ctx.src_height        = frame.height;
+    ctx.src_y_stride      = frame.y_stride;
+    ctx.src_uv_stride     = frame.uv_stride;
+    ctx.requested_flags   = FUSED_SCALE_1_5X | FUSED_SCALE_3X;
+    ctx.upscale_flags     = FUSED_UPSCALE_2X;
+    ctx.upscale_tail_1_5x = 0;
+    suppress_log(&ctx);
+
+    int rc = fused_scaler_init(&ctx);
+    TEST_ASSERT(rc >= 0, "init succeeds");
+    TEST_ASSERT(ctx.outputs[FUSED_IDX_1_5X].plane_y != NULL, "1.5x down output");
+    TEST_ASSERT(ctx.outputs[FUSED_IDX_3X].plane_y   != NULL, "3x down output");
+    TEST_ASSERT(ctx.upscale_outputs[FUSED_UP_IDX_2X].plane_y != NULL,
+                "2x up output");
+
+    fused_scaler_run(&ctx, frame.plane_y, frame.plane_u, frame.plane_v);
+
+    /* Verify all outputs are 128 within tolerance */
+    int slots_to_check[] = { FUSED_IDX_1_5X, FUSED_IDX_3X };
+    for (int s = 0; s < 2; s++) {
+        const fused_scale_output_t *o = &ctx.outputs[slots_to_check[s]];
+        for (int y = 0; y < o->height; y++) {
+            const uint8_t *row = o->plane_y + y * o->y_stride;
+            for (int x = 0; x < o->width; x++) {
+                int diff = (int)row[x] - 128;
+                if (diff < -1 || diff > 1) {
+                    TEST_ASSERT(0, "down output not 128");
+                }
+            }
+        }
+    }
+    {
+        const fused_scale_output_t *o = &ctx.upscale_outputs[FUSED_UP_IDX_2X];
+        for (int y = 0; y < o->height; y++) {
+            const uint8_t *row = o->plane_y + y * o->y_stride;
+            for (int x = 0; x < o->width; x++) {
+                int diff = (int)row[x] - 128;
+                if (diff < -1 || diff > 1) {
+                    TEST_ASSERT(0, "up output not 128");
+                }
+            }
+        }
+    }
+
+    fused_scaler_free(&ctx);
+    test_frame_free(&frame);
+    TEST_PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * test_upscale_tail_only
+ *   upscale_flags=0, tail=1: 1.5x reads source directly. Verify dimensions
+ *   are eff_w*3/2 × eff_h*3/2 and gradient stays monotonic.
+ * -------------------------------------------------------------------------- */
+
+static void test_upscale_tail_only(void)
+{
+    fused_scaler_ctx_t ctx;
+    test_frame_t frame;
+    int rc = upscale_init_run(&ctx, &frame, 192, 108,
+                              PATTERN_HGRADIENT, 0, 1);
+    TEST_ASSERT(rc == 0, "init");
+
+    const fused_scale_output_t *t = &ctx.upscale_outputs[FUSED_UP_IDX_TAIL];
+    TEST_ASSERT(t->plane_y != NULL, "tail allocated");
+    TEST_ASSERT(t->width  == 192 * 3 / 2, "tail width");
+    TEST_ASSERT(t->height == 108 * 3 / 2, "tail height");
+
+    /* Monotonicity check on the tail rows */
+    for (int y = 0; y < t->height; y++) {
+        const uint8_t *row = t->plane_y + y * t->y_stride;
+        for (int x = 1; x < t->width; x++) {
+            if ((int)row[x] < (int)row[x - 1] - 2) {
+                TEST_ASSERT(0, "tail row not monotonic");
+            }
+        }
+    }
+
+    /* And no level-0..4 slots should be allocated */
+    for (int k = 0; k < 5; k++) {
+        TEST_ASSERT(ctx.upscale_outputs[k].plane_y == NULL,
+                    "no pow2 level should be allocated");
+    }
+
+    fused_scaler_free(&ctx);
+    test_frame_free(&frame);
+    TEST_PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * test_upscale_tail_with_cascade
+ *   upscale_flags=2X, tail=1: produces both a 2x and a 3x (=2x*1.5) tail.
+ * -------------------------------------------------------------------------- */
+
+static void test_upscale_tail_with_cascade(void)
+{
+    fused_scaler_ctx_t ctx;
+    test_frame_t frame;
+    int rc = upscale_init_run(&ctx, &frame, 192, 108,
+                              PATTERN_HGRADIENT, FUSED_UPSCALE_2X, 1);
+    TEST_ASSERT(rc == 0, "init");
+
+    TEST_ASSERT(ctx.upscale_outputs[FUSED_UP_IDX_2X].plane_y   != NULL, "2x");
+    TEST_ASSERT(ctx.upscale_outputs[FUSED_UP_IDX_TAIL].plane_y != NULL, "tail");
+
+    TEST_ASSERT(ctx.upscale_outputs[FUSED_UP_IDX_2X].width   == 384, "2x w");
+    TEST_ASSERT(ctx.upscale_outputs[FUSED_UP_IDX_2X].height  == 216, "2x h");
+    TEST_ASSERT(ctx.upscale_outputs[FUSED_UP_IDX_TAIL].width  == 576, "tail w");
+    TEST_ASSERT(ctx.upscale_outputs[FUSED_UP_IDX_TAIL].height == 324, "tail h");
+
+    fused_scaler_free(&ctx);
+    test_frame_free(&frame);
+    TEST_PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * test_upscale_deep_cascade
+ *   Tiny source, request all five pow2 levels, verify final dimensions.
+ * -------------------------------------------------------------------------- */
+
+static void test_upscale_deep_cascade(void)
+{
+    fused_scaler_ctx_t ctx;
+    test_frame_t frame;
+    int rc = upscale_init_run(&ctx, &frame, 64, 32, PATTERN_HGRADIENT,
+                              FUSED_UPSCALE_2X | FUSED_UPSCALE_4X |
+                              FUSED_UPSCALE_8X | FUSED_UPSCALE_16X |
+                              FUSED_UPSCALE_32X, 0);
+    TEST_ASSERT(rc == 0, "init");
+
+    for (int k = 0; k < 5; k++) {
+        TEST_ASSERT(ctx.upscale_outputs[k].plane_y != NULL, "level allocated");
+        TEST_ASSERT(ctx.upscale_outputs[k].width  == 64  << (k + 1), "level w");
+        TEST_ASSERT(ctx.upscale_outputs[k].height == 32 << (k + 1), "level h");
+    }
+
+    /* Sanity: 32x output should be 2048x1024 */
+    TEST_ASSERT(ctx.upscale_outputs[FUSED_UP_IDX_32X].width  == 2048, "32x w");
+    TEST_ASSERT(ctx.upscale_outputs[FUSED_UP_IDX_32X].height == 1024, "32x h");
+
+    fused_scaler_free(&ctx);
+    test_frame_free(&frame);
+    TEST_PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * test_upscale_edge_replication
+ *   Right edge column of every upscale level must equal the source's right
+ *   column (no garbage from out-of-bounds reads).
+ * -------------------------------------------------------------------------- */
+
+static void test_upscale_edge_replication(void)
+{
+    fused_scaler_ctx_t ctx;
+    test_frame_t frame;
+    int rc = upscale_init_run(&ctx, &frame, 192, 108, PATTERN_HGRADIENT,
+                              FUSED_UPSCALE_2X | FUSED_UPSCALE_4X, 0);
+    TEST_ASSERT(rc == 0, "init");
+
+    /* The right column of the source should be reflected in the right column
+     * of every upscale level (within tolerance for the bilinear blend). */
+    int src_right = frame.plane_y[frame.width - 1];
+
+    for (int k = 0; k < 2; k++) {
+        const fused_scale_output_t *o = &ctx.upscale_outputs[k];
+        int rcol = o->plane_y[o->width - 1];
+        int diff = rcol - src_right;
+        if (diff < -2 || diff > 2) {
+            TEST_ASSERT(0, "right edge not replicated cleanly");
+        }
+    }
+
+    fused_scaler_free(&ctx);
+    test_frame_free(&frame);
+    TEST_PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * test_upscale_bottom_row_replication
+ *   The bottom row of every upscale level must come from src[h-1] (no garbage
+ *   reads past the source).
+ * -------------------------------------------------------------------------- */
+
+static void test_upscale_bottom_row_replication(void)
+{
+    fused_scaler_ctx_t ctx;
+    test_frame_t frame;
+    int rc = upscale_init_run(&ctx, &frame, 192, 108, PATTERN_VGRADIENT,
+                              FUSED_UPSCALE_2X | FUSED_UPSCALE_4X, 0);
+    TEST_ASSERT(rc == 0, "init");
+
+    /* Sample the source's bottom-row pixel */
+    int src_bottom = frame.plane_y[(frame.height - 1) * frame.y_stride];
+
+    for (int k = 0; k < 2; k++) {
+        const fused_scale_output_t *o = &ctx.upscale_outputs[k];
+        int last = o->plane_y[(o->height - 1) * o->y_stride];
+        int diff = last - src_bottom;
+        if (diff < -2 || diff > 2) {
+            TEST_ASSERT(0, "bottom row not replicated cleanly");
+        }
+    }
+
+    fused_scaler_free(&ctx);
+    test_frame_free(&frame);
+    TEST_PASS();
+}
+
 
 /* --------------------------------------------------------------------------
  * run_correctness_tests
@@ -682,4 +1152,16 @@ void run_correctness_tests(void)
     RUN_TEST(test_non_standard_width_correctness);
     RUN_TEST(test_misaligned_source_fallback);
     RUN_TEST(test_double_free_safety);
+
+    /* Upscale tests */
+    RUN_TEST(test_upscale_output_dimensions);
+    RUN_TEST(test_upscale_solid_color_preservation);
+    RUN_TEST(test_upscale_hgradient_monotonicity);
+    RUN_TEST(test_upscale_vgradient_monotonicity);
+    RUN_TEST(test_upscale_combined_with_downscale);
+    RUN_TEST(test_upscale_tail_only);
+    RUN_TEST(test_upscale_tail_with_cascade);
+    RUN_TEST(test_upscale_deep_cascade);
+    RUN_TEST(test_upscale_edge_replication);
+    RUN_TEST(test_upscale_bottom_row_replication);
 }

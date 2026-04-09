@@ -4,6 +4,8 @@
 #include <stdint.h>
 #include "funnelcake.h"
 
+#include <stddef.h>
+
 /* --------------------------------------------------------------------------
  * Constants
  * -------------------------------------------------------------------------- */
@@ -11,9 +13,39 @@
 /* Maximum number of simultaneous output steps */
 #define FUSED_MAX_STEPS     8
 
+/* Scratch pool bump allocator.  Kernels that need several internal
+ * scratch buffers carve them out of a single persistent pool allocated
+ * in init, avoiding per-frame malloc/free which causes first-touch
+ * page faults and inflates max per-frame latency.  The bump cursor is
+ * rounded up to a 64-byte boundary before each allocation so every
+ * carved sub-buffer is cache-line aligned. */
+typedef struct {
+    uint8_t *base;
+    size_t   used;
+    size_t   size;
+} fused_scratch_t;
+
+static inline void fused_scratch_init(fused_scratch_t *s,
+                                      uint8_t *base, size_t size)
+{
+    s->base = base;
+    s->used = 0;
+    s->size = size;
+}
+
+static inline void *fused_scratch_alloc(fused_scratch_t *s, size_t n)
+{
+    /* Align the cursor up to 64 bytes. */
+    size_t aligned = (s->used + 63) & ~(size_t)63;
+    if (aligned + n > s->size) return NULL;
+    void *p = s->base + aligned;
+    s->used = aligned + n;
+    return p;
+}
+
 /* Kernel family identifiers */
-#define FUSED_FAMILY_THIRDS 0   /* 1.5x/3x/6x/12x — divide-by-3 cascade */
-#define FUSED_FAMILY_POW2   1   /* 2x/4x/8x/16x   — power-of-two cascade */
+#define FUSED_FAMILY_THIRDS 0   /* 1.5x/3x/6x/12x - divide-by-3 cascade */
+#define FUSED_FAMILY_POW2   1   /* 2x/4x/8x/16x   - power-of-two cascade */
 
 
 /* --------------------------------------------------------------------------
@@ -55,6 +87,44 @@ typedef struct {
     int chunks_per_row;     /* number of full SIMD-width chunks per row     */
     int tail_bytes;         /* leftover luma bytes after full chunks        */
     int row_groups;         /* number of complete vert_period-row groups    */
+
+    /* --------------------------------------------------------------------
+     * Upscale cascade - optional. Zero values mean "no upscaling".
+     *
+     * The upscale chain is a contiguous prefix of pow2 2x levels (0..5)
+     * followed optionally by a 1.5x tail. up_out[0..4] hold the 2x..32x
+     * outputs; up_out[5] holds the 1.5x tail (indexed as FUSED_UP_IDX_TAIL).
+     * Slots not in upscale_active have NULL plane pointers.
+     * -------------------------------------------------------------------- */
+    int      upscale_cascade_depth;   /* 0..5 - number of 2x pow2 levels     */
+    int      upscale_tail_1_5x;       /* 0 or 1                              */
+    uint32_t upscale_active;          /* bit i set => up_out[i] is live      */
+
+    struct {
+        int      width;
+        int      height;
+        int      y_stride;
+        int      uv_stride;
+        uint8_t *plane_y;
+        uint8_t *plane_u;
+        uint8_t *plane_v;
+    } up_out[FUSED_MAX_UPSCALE_STEPS];
+
+    /* Persistent scratch row buffer for upscale helpers that need a
+     * vertical-blend intermediate.  Sized at init to the widest input
+     * row any upscale helper will see (deepest 2x level or the 1.5x tail
+     * input).  Shared across Y/U/V passes since they are processed
+     * sequentially.  NULL if no upscale is active. */
+    uint8_t *upscale_scratch;
+
+    /* Scratch pool for downscale kernels.  Allocated once at init and
+     * sized to the max bytes the selected kernel family needs for its
+     * internal vertical-cascade / horizontal-cascade buffers.  Kernels
+     * carve sub-buffers from this pool instead of per-frame malloc,
+     * which was causing first-touch page faults and inflating the max
+     * per-frame latency.  NULL if no downscale is active. */
+    uint8_t *scratch_pool;
+    size_t   scratch_pool_size;
 } fused_kernel_params_t;
 
 
@@ -132,6 +202,66 @@ void fused_kernel_pow2_neon(const fused_kernel_params_t *p,
 #endif /* __aarch64__ */
 
 
+/* --------------------------------------------------------------------------
+ * Upscale kernel entry points (SDR)
+ *
+ * Three variants:
+ *   - upscale-only: downscale flags are zero, only upscale outputs produced
+ *   - thirds_up:    downscale = thirds family AND upscale both active
+ *   - pow2_up:      downscale = pow2 family AND upscale both active
+ *
+ * Scalar always available. SIMD guarded by arch.
+ * -------------------------------------------------------------------------- */
+
+void fused_kernel_upscale_scalar(const fused_kernel_params_t *p,
+                                 const uint8_t *src_y,
+                                 const uint8_t *src_u,
+                                 const uint8_t *src_v);
+
+void fused_kernel_thirds_up_scalar(const fused_kernel_params_t *p,
+                                   const uint8_t *src_y,
+                                   const uint8_t *src_u,
+                                   const uint8_t *src_v);
+
+void fused_kernel_pow2_up_scalar(const fused_kernel_params_t *p,
+                                 const uint8_t *src_y,
+                                 const uint8_t *src_u,
+                                 const uint8_t *src_v);
+
+#if defined(__x86_64__)
+void fused_kernel_upscale_avx2(const fused_kernel_params_t *p,
+                               const uint8_t *src_y,
+                               const uint8_t *src_u,
+                               const uint8_t *src_v);
+
+void fused_kernel_thirds_up_avx2(const fused_kernel_params_t *p,
+                                 const uint8_t *src_y,
+                                 const uint8_t *src_u,
+                                 const uint8_t *src_v);
+
+void fused_kernel_pow2_up_avx2(const fused_kernel_params_t *p,
+                               const uint8_t *src_y,
+                               const uint8_t *src_u,
+                               const uint8_t *src_v);
+#endif /* __x86_64__ */
+
+#if defined(__aarch64__)
+void fused_kernel_upscale_neon(const fused_kernel_params_t *p,
+                               const uint8_t *src_y,
+                               const uint8_t *src_u,
+                               const uint8_t *src_v);
+
+void fused_kernel_thirds_up_neon(const fused_kernel_params_t *p,
+                                 const uint8_t *src_y,
+                                 const uint8_t *src_u,
+                                 const uint8_t *src_v);
+
+void fused_kernel_pow2_up_neon(const fused_kernel_params_t *p,
+                               const uint8_t *src_y,
+                               const uint8_t *src_u,
+                               const uint8_t *src_v);
+#endif /* __aarch64__ */
+
 
 /* ==========================================================================
  * HDR10 internal types
@@ -188,6 +318,34 @@ typedef struct {
     uint16_t *p010_tmp_u;   /* NULL if !is_p010 */
     uint16_t *p010_tmp_v;   /* NULL if !is_p010 */
     int       p010_tmp_stride;  /* bytes per row (32-byte aligned) */
+
+    /* --------------------------------------------------------------------
+     * Upscale cascade - HDR-only for this iteration (no tonemapping).
+     * Same layout as the SDR fused_kernel_params_t but with uint16_t planes.
+     * -------------------------------------------------------------------- */
+    int      upscale_cascade_depth;
+    int      upscale_tail_1_5x;
+    uint32_t upscale_hdr_active;
+
+    struct {
+        int       width;
+        int       height;
+        int       y_stride;
+        int       uv_stride;
+        uint16_t *plane_y;
+        uint16_t *plane_u;
+        uint16_t *plane_v;
+    } hdr_up_out[FUSED_MAX_UPSCALE_STEPS];
+
+    /* Persistent scratch row buffer for HDR upscale helpers (uint16_t).
+     * Same semantics as the SDR upscale_scratch above. */
+    uint16_t *upscale_scratch_hdr;
+
+    /* Scratch pool for HDR downscale kernels.  See fused_kernel_params_t
+     * for rationale.  Sized in bytes; kernels cast to uint16_t* and use
+     * offset arithmetic for their sub-buffers. */
+    uint8_t *scratch_pool;
+    size_t   scratch_pool_size;
 } fused_hdr_kernel_params_t;
 
 
@@ -215,23 +373,23 @@ typedef struct {
     fused_hdr_kernel_fn       kernel_fn;
     int                       has_simd;
 
-    /* Tone mapping LUTs — generated at init from transfer + curve config.
+    /* Tone mapping LUTs - generated at init from transfer + curve config.
      *
-     * lut_y: 10-bit PQ/HLG input → 8-bit BT.709 gamma output (1024 entries).
+     * lut_y: 10-bit PQ/HLG input -> 8-bit BT.709 gamma output (1024 entries).
      *   Used by the luma pass for fast per-pixel tone mapping.
      *
-     * pq_to_linear: 10-bit PQ code → linear luminance as float [0, 1]
+     * pq_to_linear: 10-bit PQ code -> linear luminance as float [0, 1]
      *   where 1.0 = 10000 nits.  Used by the chroma pass to reconstruct
      *   linear-light R, G, B from YCbCr for correct gamut mapping.
      *
-     * linear_to_sdr: linear luminance [0, 1] quantized to 12 bits → 8-bit
+     * linear_to_sdr: linear luminance [0, 1] quantized to 12 bits -> 8-bit
      *   SDR gamma output.  Incorporates tone curve + BT.709 OETF.
      *   Indexed by (linear_value * 4095).  Used by the chroma pass to
      *   tone-map the reconstructed R, G, B channels individually.
      */
     uint8_t  lut_y[1024];
-    float    pq_to_linear[1024];    /* PQ code → linear [0,1] */
-    uint8_t  linear_to_sdr[4096];   /* linear 12-bit → 8-bit SDR gamma */
+    float    pq_to_linear[1024];    /* PQ code -> linear [0,1] */
+    uint8_t  linear_to_sdr[4096];   /* linear 12-bit -> 8-bit SDR gamma */
 
     /* Temp 10-bit buffers for SDR-only outputs (no HDR output requested
      * at that step, but we need a 10-bit intermediate to tone map from).
@@ -284,6 +442,60 @@ void fused_kernel_pow2_hdr_neon(const fused_hdr_kernel_params_t *p,
                                  const uint16_t *src_y,
                                  const uint16_t *src_u,
                                  const uint16_t *src_v);
+#endif /* __aarch64__ */
+
+
+/* --------------------------------------------------------------------------
+ * HDR upscale kernel entry points
+ * -------------------------------------------------------------------------- */
+
+void fused_kernel_upscale_hdr_scalar(const fused_hdr_kernel_params_t *p,
+                                     const uint16_t *src_y,
+                                     const uint16_t *src_u,
+                                     const uint16_t *src_v);
+
+void fused_kernel_thirds_up_hdr_scalar(const fused_hdr_kernel_params_t *p,
+                                       const uint16_t *src_y,
+                                       const uint16_t *src_u,
+                                       const uint16_t *src_v);
+
+void fused_kernel_pow2_up_hdr_scalar(const fused_hdr_kernel_params_t *p,
+                                     const uint16_t *src_y,
+                                     const uint16_t *src_u,
+                                     const uint16_t *src_v);
+
+#if defined(__x86_64__)
+void fused_kernel_upscale_hdr_avx2(const fused_hdr_kernel_params_t *p,
+                                   const uint16_t *src_y,
+                                   const uint16_t *src_u,
+                                   const uint16_t *src_v);
+
+void fused_kernel_thirds_up_hdr_avx2(const fused_hdr_kernel_params_t *p,
+                                     const uint16_t *src_y,
+                                     const uint16_t *src_u,
+                                     const uint16_t *src_v);
+
+void fused_kernel_pow2_up_hdr_avx2(const fused_hdr_kernel_params_t *p,
+                                   const uint16_t *src_y,
+                                   const uint16_t *src_u,
+                                   const uint16_t *src_v);
+#endif /* __x86_64__ */
+
+#if defined(__aarch64__)
+void fused_kernel_upscale_hdr_neon(const fused_hdr_kernel_params_t *p,
+                                   const uint16_t *src_y,
+                                   const uint16_t *src_u,
+                                   const uint16_t *src_v);
+
+void fused_kernel_thirds_up_hdr_neon(const fused_hdr_kernel_params_t *p,
+                                     const uint16_t *src_y,
+                                     const uint16_t *src_u,
+                                     const uint16_t *src_v);
+
+void fused_kernel_pow2_up_hdr_neon(const fused_hdr_kernel_params_t *p,
+                                   const uint16_t *src_y,
+                                   const uint16_t *src_u,
+                                   const uint16_t *src_v);
 #endif /* __aarch64__ */
 
 

@@ -78,7 +78,9 @@ static void scale_plane_pow2_hdr(
     uint16_t *restrict dst_planes[4],
     int dst_widths[4],
     int dst_strides[4],
-    int dst_heights[4])
+    int dst_heights[4],
+    uint8_t *scratch_pool_base,
+    size_t scratch_pool_size)
 {
     (void)dst_heights;
 
@@ -103,26 +105,24 @@ static void scale_plane_pow2_hdr(
     int group_rows = (2 << deepest);
     int num_groups = src_h / group_rows;
 
-    /* Allocate row buffers for vertical intermediates.
-     * Each row is src_w uint16_t elements. */
+    /* Carve scratch buffers from the persistent pool (init-time alloc). */
+    fused_scratch_t scratch;
+    fused_scratch_init(&scratch, scratch_pool_base, scratch_pool_size);
+
     uint16_t *vert_buf[4] = { NULL, NULL, NULL, NULL };
     int vert_rows[4];
 
     for (int k = 0; k <= deepest; k++) {
         vert_rows[k] = group_rows >> (k + 1);
-        vert_buf[k] = (uint16_t *)malloc((size_t)vert_rows[k] * (size_t)src_w * sizeof(uint16_t));
-        if (!vert_buf[k]) {
-            for (int j = 0; j < k; j++) free(vert_buf[j]);
-            return;
-        }
+        vert_buf[k] = (uint16_t *)fused_scratch_alloc(
+            &scratch, (size_t)vert_rows[k] * (size_t)src_w * sizeof(uint16_t));
+        if (!vert_buf[k]) return;
     }
 
     /* Horizontal cascade buffer: max input width = src_w elements. */
-    uint16_t *h_buf = (uint16_t *)malloc((size_t)src_w * sizeof(uint16_t));
-    if (!h_buf) {
-        for (int k = 0; k <= deepest; k++) free(vert_buf[k]);
-        return;
-    }
+    uint16_t *h_buf = (uint16_t *)fused_scratch_alloc(
+        &scratch, (size_t)src_w * sizeof(uint16_t));
+    if (!h_buf) return;
 
     /* Output row cursor per level */
     int out_row[4] = { 0, 0, 0, 0 };
@@ -186,8 +186,7 @@ static void scale_plane_pow2_hdr(
         }
     }
 
-    free(h_buf);
-    for (int k = 0; k <= deepest; k++) free(vert_buf[k]);
+    /* Scratch buffers are carved from the persistent pool - nothing to free. */
 }
 
 
@@ -266,7 +265,9 @@ static void scale_plane_thirds_hdr(
     uint16_t *restrict dst_planes[4],
     int dst_widths[4],
     int dst_strides[4],
-    int dst_heights[4])
+    int dst_heights[4],
+    uint8_t *scratch_pool_base,
+    size_t scratch_pool_size)
 {
     (void)dst_heights;
 
@@ -290,42 +291,45 @@ static void scale_plane_thirds_hdr(
     /* The base processing unit is 6 source rows. */
     int base6_groups = src_h / 6;
 
-    /* Allocate scratch rows at full source width (uint16_t elements). */
+    /* Carve scratch buffers from the persistent pool (init-time alloc). */
+    fused_scratch_t scratch;
+    fused_scratch_init(&scratch, scratch_pool_base, scratch_pool_size);
+
     size_t row_bytes = (size_t)src_w * sizeof(uint16_t);
 
     /* Vertical intermediates */
-    uint16_t *v01  = (uint16_t *)malloc(row_bytes);
-    uint16_t *v23  = (uint16_t *)malloc(row_bytes);
-    uint16_t *v45  = (uint16_t *)malloc(row_bytes);
+    uint16_t *v01  = (uint16_t *)fused_scratch_alloc(&scratch, row_bytes);
+    uint16_t *v23  = (uint16_t *)fused_scratch_alloc(&scratch, row_bytes);
+    uint16_t *v45  = (uint16_t *)fused_scratch_alloc(&scratch, row_bytes);
 
     /* 3x vertical intermediates (2 rows) */
-    uint16_t *v3x_0 = (uint16_t *)malloc(row_bytes);
-    uint16_t *v3x_1 = (uint16_t *)malloc(row_bytes);
+    uint16_t *v3x_0 = (uint16_t *)fused_scratch_alloc(&scratch, row_bytes);
+    uint16_t *v3x_1 = (uint16_t *)fused_scratch_alloc(&scratch, row_bytes);
 
     /* 6x vertical intermediate (1 row) */
-    uint16_t *v6x = (uint16_t *)malloc(row_bytes);
+    uint16_t *v6x = (uint16_t *)fused_scratch_alloc(&scratch, row_bytes);
 
     /* Horizontal scratch buffers */
     int w_3x = src_w / 3;
-    uint16_t *h_3x_buf = (uint16_t *)malloc((size_t)w_3x * sizeof(uint16_t));
+    uint16_t *h_3x_buf = (uint16_t *)fused_scratch_alloc(
+        &scratch, (size_t)w_3x * sizeof(uint16_t));
 
     int w_6x = w_3x / 2;
-    uint16_t *h_6x_buf = (uint16_t *)malloc((size_t)(w_6x > 0 ? w_6x : 1) * sizeof(uint16_t));
+    uint16_t *h_6x_buf = (uint16_t *)fused_scratch_alloc(
+        &scratch, (size_t)(w_6x > 0 ? w_6x : 1) * sizeof(uint16_t));
 
     /* For 12x: need to save a 6x row from the first half of the 12-row group */
-    uint16_t *v6x_prev = need_12x ? (uint16_t *)malloc(row_bytes) : NULL;
+    uint16_t *v6x_prev = need_12x
+        ? (uint16_t *)fused_scratch_alloc(&scratch, row_bytes) : NULL;
 
     /* For 1.5x blended rows (rows 1 and 2 of the 4-row output) */
     int need_1_5x = (active_outputs & (1u << 0)) != 0;
-    uint16_t *blend_tmp = need_1_5x ? (uint16_t *)malloc(row_bytes) : NULL;
+    uint16_t *blend_tmp = need_1_5x
+        ? (uint16_t *)fused_scratch_alloc(&scratch, row_bytes) : NULL;
 
     if (!v01 || !v23 || !v45 || !v3x_0 || !v3x_1 || !v6x ||
         !h_3x_buf || !h_6x_buf ||
         (need_12x && !v6x_prev) || (need_1_5x && !blend_tmp)) {
-        free(v01); free(v23); free(v45);
-        free(v3x_0); free(v3x_1); free(v6x);
-        free(h_3x_buf); free(h_6x_buf); free(v6x_prev);
-        free(blend_tmp);
         return;
     }
 
@@ -457,10 +461,7 @@ static void scale_plane_thirds_hdr(
         }
     }
 
-    free(v01); free(v23); free(v45);
-    free(v3x_0); free(v3x_1); free(v6x);
-    free(h_3x_buf); free(h_6x_buf); free(v6x_prev);
-    free(blend_tmp);
+    /* Scratch buffers are carved from the persistent pool - nothing to free. */
 }
 
 
@@ -521,7 +522,8 @@ void fused_kernel_pow2_hdr_scalar(const fused_hdr_kernel_params_t *p,
     scale_plane_pow2_hdr(src_y,
                          p->src_width, p->src_height, p->src_y_stride,
                          p->active_outputs,
-                         y_planes, y_widths, y_strides, y_heights);
+                         y_planes, y_widths, y_strides, y_heights,
+                         p->scratch_pool, p->scratch_pool_size);
 
     /* Chroma planes */
     int chroma_w = p->src_width / 2;
@@ -547,24 +549,28 @@ void fused_kernel_pow2_hdr_scalar(const fused_hdr_kernel_params_t *p,
         scale_plane_pow2_hdr(p->p010_tmp_u,
                              chroma_w, chroma_h, p->p010_tmp_stride,
                              p->active_outputs,
-                             u_planes, uv_widths, uv_strides, uv_heights);
+                             u_planes, uv_widths, uv_strides, uv_heights,
+                             p->scratch_pool, p->scratch_pool_size);
 
         scale_plane_pow2_hdr(p->p010_tmp_v,
                              chroma_w, chroma_h, p->p010_tmp_stride,
                              p->active_outputs,
-                             v_planes, uv_widths, uv_strides, uv_heights);
-        /* No free — buffers are owned by the context */
+                             v_planes, uv_widths, uv_strides, uv_heights,
+                             p->scratch_pool, p->scratch_pool_size);
+        /* No free - buffers are owned by the context */
     } else {
         /* I010: separate U and V planes */
         scale_plane_pow2_hdr(src_u,
                              chroma_w, chroma_h, p->src_uv_stride,
                              p->active_outputs,
-                             u_planes, uv_widths, uv_strides, uv_heights);
+                             u_planes, uv_widths, uv_strides, uv_heights,
+                             p->scratch_pool, p->scratch_pool_size);
 
         scale_plane_pow2_hdr(src_v,
                              chroma_w, chroma_h, p->src_uv_stride,
                              p->active_outputs,
-                             v_planes, uv_widths, uv_strides, uv_heights);
+                             v_planes, uv_widths, uv_strides, uv_heights,
+                             p->scratch_pool, p->scratch_pool_size);
     }
 }
 
@@ -610,7 +616,8 @@ void fused_kernel_thirds_hdr_scalar(const fused_hdr_kernel_params_t *p,
     scale_plane_thirds_hdr(src_y,
                            p->src_width, p->src_height, p->src_y_stride,
                            p->active_outputs,
-                           y_planes, y_widths, y_strides, y_heights);
+                           y_planes, y_widths, y_strides, y_heights,
+                           p->scratch_pool, p->scratch_pool_size);
 
     /* Chroma planes */
     int chroma_w = p->src_width / 2;
@@ -634,23 +641,27 @@ void fused_kernel_thirds_hdr_scalar(const fused_hdr_kernel_params_t *p,
         scale_plane_thirds_hdr(p->p010_tmp_u,
                                chroma_w, chroma_h, p->p010_tmp_stride,
                                p->active_outputs,
-                               u_planes, uv_widths, uv_strides, uv_heights);
+                               u_planes, uv_widths, uv_strides, uv_heights,
+                               p->scratch_pool, p->scratch_pool_size);
 
         scale_plane_thirds_hdr(p->p010_tmp_v,
                                chroma_w, chroma_h, p->p010_tmp_stride,
                                p->active_outputs,
-                               v_planes, uv_widths, uv_strides, uv_heights);
-        /* No free — buffers are owned by the context */
+                               v_planes, uv_widths, uv_strides, uv_heights,
+                               p->scratch_pool, p->scratch_pool_size);
+        /* No free - buffers are owned by the context */
     } else {
         /* I010: separate U and V planes */
         scale_plane_thirds_hdr(src_u,
                                chroma_w, chroma_h, p->src_uv_stride,
                                p->active_outputs,
-                               u_planes, uv_widths, uv_strides, uv_heights);
+                               u_planes, uv_widths, uv_strides, uv_heights,
+                               p->scratch_pool, p->scratch_pool_size);
 
         scale_plane_thirds_hdr(src_v,
                                chroma_w, chroma_h, p->src_uv_stride,
                                p->active_outputs,
-                               v_planes, uv_widths, uv_strides, uv_heights);
+                               v_planes, uv_widths, uv_strides, uv_heights,
+                               p->scratch_pool, p->scratch_pool_size);
     }
 }

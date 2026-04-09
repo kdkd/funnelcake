@@ -80,7 +80,7 @@ void run_hdr_bench_tests(const char *filter);
 void run_swscale_bench_tests(const char *filter);
 
 /* Shared benchmark results for comparison table */
-#define BENCH_MAX_CONFIGS 8
+#define BENCH_MAX_CONFIGS 32
 typedef struct {
     const char *label;
     double      funnelcake_med;     /* funnelcake median µs (0 = not run) */

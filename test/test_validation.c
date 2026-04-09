@@ -22,7 +22,7 @@ static void suppress_log(fused_scaler_ctx_t *ctx)
 
 /* --------------------------------------------------------------------------
  * 1. test_valid_1080p_thirds
- *    1920x1080, flags 1.5x|3x|6x → FUSED_OK
+ *    1920x1080, flags 1.5x|3x|6x -> FUSED_OK
  * -------------------------------------------------------------------------- */
 
 static void test_valid_1080p_thirds(void)
@@ -53,7 +53,7 @@ static void test_valid_1080p_thirds(void)
 
 /* --------------------------------------------------------------------------
  * 2. test_valid_720p_pow2
- *    1280x720, flags 2x|4x → FUSED_OK
+ *    1280x720, flags 2x|4x -> FUSED_OK
  * -------------------------------------------------------------------------- */
 
 static void test_valid_720p_pow2(void)
@@ -80,7 +80,7 @@ static void test_valid_720p_pow2(void)
 
 /* --------------------------------------------------------------------------
  * 3. test_valid_4k_full_thirds
- *    3840x2160, flags 1.5x|3x|6x|12x → FUSED_OK
+ *    3840x2160, flags 1.5x|3x|6x|12x -> FUSED_OK
  * -------------------------------------------------------------------------- */
 
 static void test_valid_4k_full_thirds(void)
@@ -106,7 +106,7 @@ static void test_valid_4k_full_thirds(void)
 
 /* --------------------------------------------------------------------------
  * 4. test_mixed_families
- *    1920x1080, flags 1.5x|2x → FUSED_ERR_INVALID_FLAGS
+ *    1920x1080, flags 1.5x|2x -> FUSED_ERR_INVALID_FLAGS
  * -------------------------------------------------------------------------- */
 
 static void test_mixed_families(void)
@@ -121,14 +121,14 @@ static void test_mixed_families(void)
     suppress_log(&ctx);
 
     int rc = fused_scaler_init(&ctx);
-    TEST_ASSERT_EQ(rc, FUSED_ERR_INVALID_FLAGS, "mixed families → FUSED_ERR_INVALID_FLAGS");
+    TEST_ASSERT_EQ(rc, FUSED_ERR_INVALID_FLAGS, "mixed families -> FUSED_ERR_INVALID_FLAGS");
 
     TEST_PASS();
 }
 
 /* --------------------------------------------------------------------------
  * 5. test_empty_flags
- *    flags=0 → FUSED_ERR_INVALID_FLAGS
+ *    flags=0 -> FUSED_ERR_INVALID_FLAGS
  * -------------------------------------------------------------------------- */
 
 static void test_empty_flags(void)
@@ -143,14 +143,14 @@ static void test_empty_flags(void)
     suppress_log(&ctx);
 
     int rc = fused_scaler_init(&ctx);
-    TEST_ASSERT_EQ(rc, FUSED_ERR_INVALID_FLAGS, "empty flags → FUSED_ERR_INVALID_FLAGS");
+    TEST_ASSERT_EQ(rc, FUSED_ERR_INVALID_FLAGS, "empty flags -> FUSED_ERR_INVALID_FLAGS");
 
     TEST_PASS();
 }
 
 /* --------------------------------------------------------------------------
  * 6. test_bad_dimensions_zero
- *    width=0 → FUSED_ERR_BAD_DIMENSIONS
+ *    width=0 -> FUSED_ERR_BAD_DIMENSIONS
  * -------------------------------------------------------------------------- */
 
 static void test_bad_dimensions_zero(void)
@@ -165,14 +165,14 @@ static void test_bad_dimensions_zero(void)
     suppress_log(&ctx);
 
     int rc = fused_scaler_init(&ctx);
-    TEST_ASSERT_EQ(rc, FUSED_ERR_BAD_DIMENSIONS, "zero width → FUSED_ERR_BAD_DIMENSIONS");
+    TEST_ASSERT_EQ(rc, FUSED_ERR_BAD_DIMENSIONS, "zero width -> FUSED_ERR_BAD_DIMENSIONS");
 
     TEST_PASS();
 }
 
 /* --------------------------------------------------------------------------
  * 7. test_bad_dimensions_odd
- *    width=1921, height=1081 → FUSED_ERR_BAD_DIMENSIONS
+ *    width=1921, height=1081 -> FUSED_ERR_BAD_DIMENSIONS
  * -------------------------------------------------------------------------- */
 
 static void test_bad_dimensions_odd(void)
@@ -187,14 +187,14 @@ static void test_bad_dimensions_odd(void)
     suppress_log(&ctx);
 
     int rc = fused_scaler_init(&ctx);
-    TEST_ASSERT_EQ(rc, FUSED_ERR_BAD_DIMENSIONS, "odd dims → FUSED_ERR_BAD_DIMENSIONS");
+    TEST_ASSERT_EQ(rc, FUSED_ERR_BAD_DIMENSIONS, "odd dims -> FUSED_ERR_BAD_DIMENSIONS");
 
     TEST_PASS();
 }
 
 /* --------------------------------------------------------------------------
  * 8. test_bad_alignment
- *    stride=100 (not 32-byte aligned) → FUSED_ERR_BAD_ALIGNMENT
+ *    stride=100 (not 32-byte aligned) -> FUSED_ERR_BAD_ALIGNMENT
  * -------------------------------------------------------------------------- */
 
 static void test_bad_alignment(void)
@@ -209,7 +209,7 @@ static void test_bad_alignment(void)
     suppress_log(&ctx);
 
     int rc = fused_scaler_init(&ctx);
-    TEST_ASSERT_EQ(rc, FUSED_ERR_BAD_ALIGNMENT, "bad stride → FUSED_ERR_BAD_ALIGNMENT");
+    TEST_ASSERT_EQ(rc, FUSED_ERR_BAD_ALIGNMENT, "bad stride -> FUSED_ERR_BAD_ALIGNMENT");
 
     TEST_PASS();
 }
@@ -250,8 +250,8 @@ static void test_crop_to_fit(void)
  * 10. test_no_crop_rejects
  *     1360x762, flags=2x, FUSED_OPT_NO_CROP
  *
- *     Without crop-to-fit, eff_h=762. out_h=381 (odd) → step rejected.
- *     achieved=0 → FUSED_ERR_NO_STEPS (negative, not FUSED_WARN_BIT_PARTIAL).
+ *     Without crop-to-fit, eff_h=762. out_h=381 (odd) -> step rejected.
+ *     achieved=0 -> FUSED_ERR_NO_STEPS (negative, not FUSED_WARN_BIT_PARTIAL).
  * -------------------------------------------------------------------------- */
 
 static void test_no_crop_rejects(void)
@@ -267,8 +267,8 @@ static void test_no_crop_rejects(void)
     suppress_log(&ctx);
 
     int rc = fused_scaler_init(&ctx);
-    /* Step rejected, achieved=0 → hard error */
-    TEST_ASSERT(rc < 0, "1360x762 2x NO_CROP: step rejected → negative return code");
+    /* Step rejected, achieved=0 -> hard error */
+    TEST_ASSERT(rc < 0, "1360x762 2x NO_CROP: step rejected -> negative return code");
 
     TEST_PASS();
 }
@@ -276,7 +276,7 @@ static void test_no_crop_rejects(void)
 /* --------------------------------------------------------------------------
  * 11. test_scalar_fallback_oddball
  *     1184x660, flags=2x, y_stride=1216, uv_stride=608 (no fallback opt)
- *     chroma output width = 592/2 = 296; 296%32 != 0 → scalar fallback.
+ *     chroma output width = 592/2 = 296; 296%32 != 0 -> scalar fallback.
  *     Should succeed with FUSED_WARN_BIT_SCALAR, outputs[1].fallback=1.
  * -------------------------------------------------------------------------- */
 
@@ -304,7 +304,7 @@ static void test_scalar_fallback_oddball(void)
 /* --------------------------------------------------------------------------
  * 12. test_no_fallback_rejects
  *     Same as above but with FUSED_OPT_NO_FALLBACK.
- *     chroma output width 296 not %32, fallback rejected → achieved=0 →
+ *     chroma output width 296 not %32, fallback rejected -> achieved=0 ->
  *     FUSED_ERR_NO_STEPS (negative).
  * -------------------------------------------------------------------------- */
 
@@ -321,8 +321,8 @@ static void test_no_fallback_rejects(void)
     suppress_log(&ctx);
 
     int rc = fused_scaler_init(&ctx);
-    /* Step rejected (chroma width not %32), achieved=0 → hard error */
-    TEST_ASSERT(rc < 0, "NO_FALLBACK oddball: step rejected → negative return code");
+    /* Step rejected (chroma width not %32), achieved=0 -> hard error */
+    TEST_ASSERT(rc < 0, "NO_FALLBACK oddball: step rejected -> negative return code");
 
     TEST_PASS();
 }
@@ -330,8 +330,8 @@ static void test_no_fallback_rejects(void)
 /* --------------------------------------------------------------------------
  * 13. test_deep_step_only
  *     1920x1080, flags=6x only (bit 4).
- *     Shallow slots (0, 2) not requested → width=0, plane_y=NULL.
- *     outputs[4] (6x) → width=320.
+ *     Shallow slots (0, 2) not requested -> width=0, plane_y=NULL.
+ *     outputs[4] (6x) -> width=320.
  * -------------------------------------------------------------------------- */
 
 static void test_deep_step_only(void)
@@ -446,7 +446,7 @@ static void test_all_production_ladders(void)
 
 /* --------------------------------------------------------------------------
  * 16. test_free_cleans_up
- *     init then free → all output plane pointers should be NULL.
+ *     init then free -> all output plane pointers should be NULL.
  * -------------------------------------------------------------------------- */
 
 static void test_free_cleans_up(void)
@@ -525,7 +525,7 @@ static void test_diagnostic_callback(void)
 
 /* --------------------------------------------------------------------------
  * 18. test_minimum_dimensions_pow2
- *     64x4 with FUSED_SCALE_2X → init succeeds, output 32x2.
+ *     64x4 with FUSED_SCALE_2X -> init succeeds, output 32x2.
  *     This is the minimum valid configuration for pow2.
  * -------------------------------------------------------------------------- */
 
@@ -551,7 +551,7 @@ static void test_minimum_dimensions_pow2(void)
 
 /* --------------------------------------------------------------------------
  * 19. test_minimum_dimensions_thirds
- *     96x6 with FUSED_SCALE_1_5X → init succeeds, output 64x4.
+ *     96x6 with FUSED_SCALE_1_5X -> init succeeds, output 64x4.
  *     Minimum valid configuration for thirds.
  * -------------------------------------------------------------------------- */
 
@@ -604,7 +604,7 @@ static void test_non_standard_width(void)
 
 /* --------------------------------------------------------------------------
  * 21. test_16x_deep_step
- *     1920x1088 with FUSED_SCALE_16X only → output 120x68.
+ *     1920x1088 with FUSED_SCALE_16X only -> output 120x68.
  *     Tests the deepest pow2 cascade in isolation.
  * -------------------------------------------------------------------------- */
 
@@ -630,7 +630,7 @@ static void test_16x_deep_step(void)
 
 /* --------------------------------------------------------------------------
  * 22. test_12x_deep_step
- *     1920x1080 with FUSED_SCALE_12X only → output 160x90.
+ *     1920x1080 with FUSED_SCALE_12X only -> output 160x90.
  *     Tests 12x ping-pong in isolation without 1.5x/3x/6x.
  * -------------------------------------------------------------------------- */
 
@@ -656,8 +656,8 @@ static void test_12x_deep_step(void)
 
 /* --------------------------------------------------------------------------
  * 23. test_combined_warnings
- *     1184x662, FUSED_SCALE_2X → triggers BOTH FUSED_WARN_BIT_CROPPED
- *     (height 662 → 660) AND FUSED_WARN_BIT_SCALAR (chroma width 296,
+ *     1184x662, FUSED_SCALE_2X -> triggers BOTH FUSED_WARN_BIT_CROPPED
+ *     (height 662 -> 660) AND FUSED_WARN_BIT_SCALAR (chroma width 296,
  *     not %32). Verify both warning bits are set.
  * -------------------------------------------------------------------------- */
 

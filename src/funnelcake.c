@@ -88,22 +88,45 @@ int fused_scaler_init(fused_scaler_ctx_t *ctx)
     }
 
     /* ------------------------------------------------------------------ */
-    /* 2. Validate requested_flags                                          */
+    /* 2. Validate requested_flags and upscale_flags                        */
     /* ------------------------------------------------------------------ */
 
-    uint32_t req = ctx->requested_flags;
+    uint32_t req       = ctx->requested_flags;
+    uint32_t up_req    = ctx->upscale_flags;
+    int      up_tail   = ctx->upscale_tail_1_5x ? 1 : 0;
 
-    if (req == 0) {
+    /* Relaxed zero-flags rule: allow req == 0 iff upscale is requested. */
+    if (req == 0 && up_req == 0 && !up_tail) {
         fused_log(&ctx->log_errors, FUSED_LOG_ERROR,
-            "funnelcake: requested_flags is zero\n");
+            "funnelcake: requested_flags and upscale_flags are both zero\n");
         return FUSED_ERR_INVALID_FLAGS;
     }
 
-    /* Check for unknown bits (outside 0..7) */
+    /* Check for unknown downscale bits (outside 0..7) */
     if (req & ~0xFFu) {
         fused_log(&ctx->log_errors, FUSED_LOG_ERROR,
             "funnelcake: requested_flags 0x%08X contains unknown bits\n", req);
         return FUSED_ERR_INVALID_FLAGS;
+    }
+
+    /* Check for unknown upscale bits */
+    if (up_req & ~FUSED_UPSCALE_POW2_MASK) {
+        fused_log(&ctx->log_errors, FUSED_LOG_ERROR,
+            "funnelcake: upscale_flags 0x%08X contains unknown bits\n", up_req);
+        return FUSED_ERR_INVALID_FLAGS;
+    }
+
+    /* Upscale cascade must be a contiguous prefix: {}, {2x}, {2x,4x}, etc.
+     * Equivalent to: the set bits form (2^N - 1) for some N in [0..5]. */
+    {
+        uint32_t tmp = up_req;
+        while (tmp & 1) tmp >>= 1;
+        if (tmp != 0) {
+            fused_log(&ctx->log_errors, FUSED_LOG_ERROR,
+                "funnelcake: upscale_flags 0x%02X is not a contiguous prefix "
+                "(must be {}, {2x}, {2x,4x}, {2x,4x,8x}, ...)\n", up_req);
+            return FUSED_ERR_INVALID_FLAGS;
+        }
     }
 
     int has_thirds = (req & FUSED_SCALE_THIRDS_MASK) != 0;
@@ -115,7 +138,13 @@ int fused_scaler_init(fused_scaler_ctx_t *ctx)
         return FUSED_ERR_INVALID_FLAGS;
     }
 
-    int family = has_thirds ? FUSED_FAMILY_THIRDS : FUSED_FAMILY_POW2;
+    /* Family: if no downscale requested, default to THIRDS (unused for upscale
+     * dispatch, but the params struct needs something).  The upscale-only
+     * dispatch path will use fused_kernel_upscale_* which ignores family. */
+    int family;
+    if (has_thirds) family = FUSED_FAMILY_THIRDS;
+    else if (has_pow2) family = FUSED_FAMILY_POW2;
+    else family = FUSED_FAMILY_POW2;  /* arbitrary - upscale-only */
 
     /* ------------------------------------------------------------------ */
     /* 3. Compute effective dimensions (crop-to-fit)                        */
@@ -124,7 +153,7 @@ int fused_scaler_init(fused_scaler_ctx_t *ctx)
     int eff_w = ctx->src_width;
     int eff_h = ctx->src_height;
 
-    if (!(ctx->options & FUSED_OPT_NO_CROP)) {
+    if (!(ctx->options & FUSED_OPT_NO_CROP) && req != 0) {
         /*
          * The crop divisor must ensure ALL output luma dimensions are:
          *   (a) exact integers (source divisible by ratio denominator)
@@ -137,6 +166,10 @@ int fused_scaler_init(fused_scaler_ctx_t *ctx)
          * 3x = src/3 even requires src%6==0. 6x = src/6 even requires
          * src%12==0. 12x = src/12 even requires src%24==0.
          * Height also needs divisibility by the vertical period (6 or 12).
+         *
+         * Upscale paths never constrain source dimensions beyond the basic
+         * even-luma requirement enforced in step 1, so they contribute no
+         * additional crop divisor.
          */
         if (family == FUSED_FAMILY_THIRDS) {
             int w_div = 3;   /* 1.5x: src%3==0 sufficient */
@@ -186,20 +219,29 @@ int fused_scaler_init(fused_scaler_ctx_t *ctx)
     const fused_cpu_caps_t *caps = fused_detect_cpu();
 
     int has_simd = 0;
-    fused_kernel_fn simd_thirds_fn = NULL;
-    fused_kernel_fn simd_pow2_fn   = NULL;
+    fused_kernel_fn simd_thirds_fn    = NULL;
+    fused_kernel_fn simd_pow2_fn      = NULL;
+    fused_kernel_fn simd_upscale_fn   = NULL;
+    fused_kernel_fn simd_thirds_up_fn = NULL;
+    fused_kernel_fn simd_pow2_up_fn   = NULL;
 
 #if defined(__aarch64__)
     if (caps->has_neon) {
         has_simd = 1;
-        simd_thirds_fn = fused_kernel_thirds_neon;
-        simd_pow2_fn   = fused_kernel_pow2_neon;
+        simd_thirds_fn    = fused_kernel_thirds_neon;
+        simd_pow2_fn      = fused_kernel_pow2_neon;
+        simd_upscale_fn   = fused_kernel_upscale_neon;
+        simd_thirds_up_fn = fused_kernel_thirds_up_neon;
+        simd_pow2_up_fn   = fused_kernel_pow2_up_neon;
     }
 #elif defined(__x86_64__)
     if (caps->has_avx2) {
         has_simd = 1;
-        simd_thirds_fn = fused_kernel_thirds_avx2;
-        simd_pow2_fn   = fused_kernel_pow2_avx2;
+        simd_thirds_fn    = fused_kernel_thirds_avx2;
+        simd_pow2_fn      = fused_kernel_pow2_avx2;
+        simd_upscale_fn   = fused_kernel_upscale_avx2;
+        simd_thirds_up_fn = fused_kernel_thirds_up_avx2;
+        simd_pow2_up_fn   = fused_kernel_pow2_up_avx2;
     }
 #else
     (void)caps;
@@ -293,7 +335,7 @@ int fused_scaler_init(fused_scaler_ctx_t *ctx)
         if (posix_memalign(&py, 32, (size_t)y_stride  * (size_t)out_h)  != 0 ||
             posix_memalign(&pu, 32, (size_t)uv_stride * (size_t)chroma_h) != 0 ||
             posix_memalign(&pv, 32, (size_t)uv_stride * (size_t)chroma_h) != 0) {
-            /* Allocation failure — free what we got and reject this step */
+            /* Allocation failure - free what we got and reject this step */
             free(py); free(pu); free(pv);
             fused_log(&ctx->log_warnings, FUSED_LOG_WARN,
                 "funnelcake: %s rejected: out-of-memory allocating output planes\n",
@@ -315,6 +357,145 @@ int fused_scaler_init(fused_scaler_ctx_t *ctx)
     }
 
     /* ------------------------------------------------------------------ */
+    /* 5b. Validate upscale levels and allocate upscale output buffers      */
+    /* ------------------------------------------------------------------ */
+
+    /* Upscale dimensions: level k (0..4) = eff * 2^(k+1).
+     * Tail when N==0 reads source directly -> tail = eff*3/2.
+     * Tail when N>=1 reads level N-1 output -> tail = eff*2^N * 3/2.
+     * Soft-reject individual levels whose luma dimension exceeds 16384. */
+    #define FUSED_UPSCALE_SIZE_CAP 16384
+
+    uint32_t up_achieved = 0;
+    int      up_achieved_tail = 0;
+
+    memset(ctx->upscale_outputs, 0, sizeof(ctx->upscale_outputs));
+
+    /* Recompute cascade depth from the validated contiguous-prefix mask */
+    int up_N = 0;
+    {
+        uint32_t tmp = up_req;
+        while (tmp & 1) { up_N++; tmp >>= 1; }
+    }
+
+    for (int k = 0; k < up_N; k++) {
+        int up_w = eff_w << (k + 1);
+        int up_h = eff_h << (k + 1);
+
+        if (up_w > FUSED_UPSCALE_SIZE_CAP || up_h > FUSED_UPSCALE_SIZE_CAP) {
+            fused_log(&ctx->log_warnings, FUSED_LOG_WARN,
+                "funnelcake: upscale level %dx rejected: output %dx%d exceeds "
+                "size cap %d\n", (1 << (k + 1)), up_w, up_h,
+                FUSED_UPSCALE_SIZE_CAP);
+            warn_bits |= FUSED_WARN_BIT_PARTIAL;
+            continue;
+        }
+
+        int uv_w = up_w / 2;
+        int y_stride  = stride_for(up_w);
+        int uv_stride = stride_for(uv_w);
+        int chroma_h  = up_h / 2;
+
+        void *py = NULL, *pu = NULL, *pv = NULL;
+        if (posix_memalign(&py, 32, (size_t)y_stride  * (size_t)up_h)   != 0 ||
+            posix_memalign(&pu, 32, (size_t)uv_stride * (size_t)chroma_h) != 0 ||
+            posix_memalign(&pv, 32, (size_t)uv_stride * (size_t)chroma_h) != 0) {
+            free(py); free(pu); free(pv);
+            fused_log(&ctx->log_warnings, FUSED_LOG_WARN,
+                "funnelcake: upscale level %dx rejected: out-of-memory\n",
+                (1 << (k + 1)));
+            warn_bits |= FUSED_WARN_BIT_PARTIAL;
+            continue;
+        }
+
+        ctx->upscale_outputs[k].width     = up_w;
+        ctx->upscale_outputs[k].height    = up_h;
+        ctx->upscale_outputs[k].y_stride  = y_stride;
+        ctx->upscale_outputs[k].uv_stride = uv_stride;
+        ctx->upscale_outputs[k].plane_y   = (uint8_t *)py;
+        ctx->upscale_outputs[k].plane_u   = (uint8_t *)pu;
+        ctx->upscale_outputs[k].plane_v   = (uint8_t *)pv;
+        ctx->upscale_outputs[k].fallback  = 0;
+
+        up_achieved |= (1u << k);
+    }
+
+    /* 1.5x tail */
+    if (up_tail) {
+        int tail_src_w, tail_src_h;
+        if (up_N == 0) {
+            tail_src_w = eff_w;
+            tail_src_h = eff_h;
+        } else {
+            /* Tail reads from the deepest pow2 level - but only if that level
+             * was actually achieved. If the deepest level was rejected, the
+             * tail cannot be produced either. */
+            if (!(up_achieved & (1u << (up_N - 1)))) {
+                fused_log(&ctx->log_warnings, FUSED_LOG_WARN,
+                    "funnelcake: upscale 1.5x tail rejected: deepest pow2 "
+                    "level %dx was not achieved\n", (1 << up_N));
+                warn_bits |= FUSED_WARN_BIT_PARTIAL;
+                goto tail_done;
+            }
+            tail_src_w = eff_w << up_N;
+            tail_src_h = eff_h << up_N;
+        }
+
+        int tail_w = tail_src_w * 3 / 2;
+        int tail_h = tail_src_h * 3 / 2;
+
+        /* Source dimensions must be even for the 1.5x output to be exact and
+         * even-aligned (YUV420). eff_w/eff_h are guaranteed even by step 1. */
+        if (tail_w > FUSED_UPSCALE_SIZE_CAP || tail_h > FUSED_UPSCALE_SIZE_CAP) {
+            fused_log(&ctx->log_warnings, FUSED_LOG_WARN,
+                "funnelcake: upscale 1.5x tail rejected: output %dx%d "
+                "exceeds size cap %d\n", tail_w, tail_h, FUSED_UPSCALE_SIZE_CAP);
+            warn_bits |= FUSED_WARN_BIT_PARTIAL;
+            goto tail_done;
+        }
+
+        /* Tail output dimensions must be even (YUV420 constraint). */
+        if ((tail_w & 1) || (tail_h & 1)) {
+            fused_log(&ctx->log_warnings, FUSED_LOG_WARN,
+                "funnelcake: upscale 1.5x tail rejected: output %dx%d has "
+                "odd dimension\n", tail_w, tail_h);
+            warn_bits |= FUSED_WARN_BIT_PARTIAL;
+            goto tail_done;
+        }
+
+        int tail_uv_w   = tail_w / 2;
+        int y_stride    = stride_for(tail_w);
+        int uv_stride   = stride_for(tail_uv_w);
+        int chroma_h    = tail_h / 2;
+
+        void *py = NULL, *pu = NULL, *pv = NULL;
+        if (posix_memalign(&py, 32, (size_t)y_stride  * (size_t)tail_h)   != 0 ||
+            posix_memalign(&pu, 32, (size_t)uv_stride * (size_t)chroma_h) != 0 ||
+            posix_memalign(&pv, 32, (size_t)uv_stride * (size_t)chroma_h) != 0) {
+            free(py); free(pu); free(pv);
+            fused_log(&ctx->log_warnings, FUSED_LOG_WARN,
+                "funnelcake: upscale 1.5x tail rejected: out-of-memory\n");
+            warn_bits |= FUSED_WARN_BIT_PARTIAL;
+            goto tail_done;
+        }
+
+        ctx->upscale_outputs[FUSED_UP_IDX_TAIL].width     = tail_w;
+        ctx->upscale_outputs[FUSED_UP_IDX_TAIL].height    = tail_h;
+        ctx->upscale_outputs[FUSED_UP_IDX_TAIL].y_stride  = y_stride;
+        ctx->upscale_outputs[FUSED_UP_IDX_TAIL].uv_stride = uv_stride;
+        ctx->upscale_outputs[FUSED_UP_IDX_TAIL].plane_y   = (uint8_t *)py;
+        ctx->upscale_outputs[FUSED_UP_IDX_TAIL].plane_u   = (uint8_t *)pu;
+        ctx->upscale_outputs[FUSED_UP_IDX_TAIL].plane_v   = (uint8_t *)pv;
+        ctx->upscale_outputs[FUSED_UP_IDX_TAIL].fallback  = 0;
+
+        up_achieved_tail = 1;
+    }
+tail_done:
+
+    ctx->achieved_upscale_flags = up_achieved;
+    ctx->achieved_upscale_tail  = up_achieved_tail;
+
+    /* ------------------------------------------------------------------ */
     /* 6. Check that at least one step was achieved                         */
     /* ------------------------------------------------------------------ */
 
@@ -323,8 +504,11 @@ int fused_scaler_init(fused_scaler_ctx_t *ctx)
 
     if (rejected) warn_bits |= FUSED_WARN_BIT_PARTIAL;
 
-    if (achieved == 0) {
-        /* Free any planes allocated before the first success (none, but be safe) */
+    int want_down = (achieved != 0);
+    int want_up   = (up_achieved != 0) || up_achieved_tail;
+
+    if (!want_down && !want_up) {
+        /* Free any planes allocated before the first success */
         fused_scaler_free(ctx);
         fused_log(&ctx->log_errors, FUSED_LOG_ERROR,
             "funnelcake: no valid output steps after validation\n");
@@ -379,14 +563,123 @@ int fused_scaler_init(fused_scaler_ctx_t *ctx)
     p->tail_bytes     = eff_w % 32;
     p->row_groups     = eff_h / p->vert_period;
 
-    /* Select kernel function */
+    /* Upscale parameters */
+    p->upscale_cascade_depth = up_N;
+    p->upscale_tail_1_5x     = up_achieved_tail;
+    p->upscale_active        = up_achieved | (up_achieved_tail
+                                               ? (1u << FUSED_UP_IDX_TAIL)
+                                               : 0u);
+
+    for (int k = 0; k < FUSED_MAX_UPSCALE_STEPS; k++) {
+        if (!(p->upscale_active & (1u << k))) continue;
+        p->up_out[k].width     = ctx->upscale_outputs[k].width;
+        p->up_out[k].height    = ctx->upscale_outputs[k].height;
+        p->up_out[k].y_stride  = ctx->upscale_outputs[k].y_stride;
+        p->up_out[k].uv_stride = ctx->upscale_outputs[k].uv_stride;
+        p->up_out[k].plane_y   = ctx->upscale_outputs[k].plane_y;
+        p->up_out[k].plane_u   = ctx->upscale_outputs[k].plane_u;
+        p->up_out[k].plane_v   = ctx->upscale_outputs[k].plane_v;
+    }
+
+    /* Upscale scratch buffer - one persistent row sized to the widest
+     * source row any upscale helper will process.  Allocated once here
+     * so the per-frame hot path does not malloc/free, which was causing
+     * first-touch page faults and high max latency. */
+    p->upscale_scratch = NULL;
+    if (want_up) {
+        int max_scratch_w = 0;
+        if (up_N >= 1) {
+            /* Deepest 2x helper at level N-1 has input width eff_w << (N-1). */
+            int dv = eff_w << (up_N - 1);
+            if (dv > max_scratch_w) max_scratch_w = dv;
+        }
+        if (up_achieved_tail) {
+            /* 1.5x tail reads either source (N==0) or the deepest pow2
+             * output (width eff_w << N). */
+            int tv = (up_N == 0) ? eff_w : (eff_w << up_N);
+            if (tv > max_scratch_w) max_scratch_w = tv;
+        }
+        if (max_scratch_w > 0) {
+            size_t bytes = (size_t)((max_scratch_w + 63) & ~63);
+            void *sp = NULL;
+            if (posix_memalign(&sp, 64, bytes) == 0) {
+                p->upscale_scratch = (uint8_t *)sp;
+            } else {
+                fused_log(&ctx->log_warnings, FUSED_LOG_WARN,
+                    "funnelcake: failed to allocate upscale scratch buffer\n");
+            }
+        }
+    }
+
+    /* Downscale scratch pool - pre-allocated at init to avoid per-frame
+     * malloc in the kernel hot path.  Sized to the max bytes the selected
+     * kernel family will need for its vertical and horizontal cascade
+     * scratch buffers (plus generous 64-byte alignment padding between
+     * sub-buffers). */
+    p->scratch_pool      = NULL;
+    p->scratch_pool_size = 0;
+    if (want_down) {
+        size_t pool_bytes = 0;
+        if (family == FUSED_FAMILY_POW2) {
+            /* Per kernels_scalar.c / kernels_neon.c / kernels_avx2.c:
+             * vert_buf[k] = vert_rows[k] * src_w for k=0..deepest,
+             * plus h_buf = src_w.
+             * vert_rows[k] = group_rows >> (k+1) where group_rows = 2<<deepest.
+             * Sum over k=0..deepest = group_rows - 1.
+             * Deepest bit set in achieved determines deepest level. */
+            int down_deepest = -1;
+            for (int i = 3; i >= 0; i--) {
+                if (achieved & (1u << (1 + 2 * i))) { down_deepest = i; break; }
+            }
+            if (down_deepest < 0) down_deepest = 0;
+            int group_rows = 2 << down_deepest;
+            size_t vert_total = (size_t)(group_rows - 1) * (size_t)eff_w;
+            pool_bytes  = vert_total + (size_t)eff_w;
+            pool_bytes += (size_t)(down_deepest + 2) * 64;  /* alignment slack */
+        } else {
+            /* Thirds: up to 8 full-width rows (v01,v23,v45, v3x_0,v3x_1, v6x,
+             * v6x_prev, blend_tmp) + h_3x_buf (~eff_w/3) + h_6x_buf (~eff_w/6). */
+            pool_bytes  = (size_t)eff_w * 8;
+            pool_bytes += (size_t)((eff_w / 3) + (eff_w / 6 + 1));
+            pool_bytes += 12 * 64;  /* alignment slack */
+        }
+        if (pool_bytes > 0) {
+            void *sp = NULL;
+            size_t aligned_bytes = (pool_bytes + 63) & ~(size_t)63;
+            if (posix_memalign(&sp, 64, aligned_bytes) == 0) {
+                p->scratch_pool      = (uint8_t *)sp;
+                p->scratch_pool_size = aligned_bytes;
+            } else {
+                fused_log(&ctx->log_warnings, FUSED_LOG_WARN,
+                    "funnelcake: failed to allocate downscale scratch pool "
+                    "(%zu bytes)\n", aligned_bytes);
+            }
+        }
+    }
+
+    /* Select kernel function based on (want_down, want_up) */
     if (has_simd) {
-        state->kernel_fn = (family == FUSED_FAMILY_THIRDS) ? simd_thirds_fn
-                                                            : simd_pow2_fn;
+        if (want_down && want_up) {
+            state->kernel_fn = (family == FUSED_FAMILY_THIRDS)
+                                   ? simd_thirds_up_fn : simd_pow2_up_fn;
+        } else if (want_up) {
+            state->kernel_fn = simd_upscale_fn;
+        } else {
+            state->kernel_fn = (family == FUSED_FAMILY_THIRDS)
+                                   ? simd_thirds_fn : simd_pow2_fn;
+        }
     } else {
-        state->kernel_fn = (family == FUSED_FAMILY_THIRDS)
-                           ? fused_kernel_thirds_scalar
-                           : fused_kernel_pow2_scalar;
+        if (want_down && want_up) {
+            state->kernel_fn = (family == FUSED_FAMILY_THIRDS)
+                                   ? fused_kernel_thirds_up_scalar
+                                   : fused_kernel_pow2_up_scalar;
+        } else if (want_up) {
+            state->kernel_fn = fused_kernel_upscale_scalar;
+        } else {
+            state->kernel_fn = (family == FUSED_FAMILY_THIRDS)
+                                   ? fused_kernel_thirds_scalar
+                                   : fused_kernel_pow2_scalar;
+        }
     }
     state->has_simd = has_simd;
 
@@ -420,11 +713,23 @@ void fused_scaler_run(fused_scaler_ctx_t *ctx,
                 (const void*)src_y, (const void*)src_u, (const void*)src_v);
             warned = 1;
         }
-        /* Fall back to scalar */
-        if (state->params.family == FUSED_FAMILY_THIRDS)
-            fused_kernel_thirds_scalar(&state->params, src_y, src_u, src_v);
-        else
-            fused_kernel_pow2_scalar(&state->params, src_y, src_u, src_v);
+        /* Fall back to scalar - pick the variant matching the configured
+         * (want_down, want_up) combination. */
+        const fused_kernel_params_t *p = &state->params;
+        int want_down = (p->active_outputs != 0);
+        int want_up   = (p->upscale_active != 0);
+        if (want_down && want_up) {
+            if (p->family == FUSED_FAMILY_THIRDS)
+                fused_kernel_thirds_up_scalar(p, src_y, src_u, src_v);
+            else
+                fused_kernel_pow2_up_scalar(p, src_y, src_u, src_v);
+        } else if (want_up) {
+            fused_kernel_upscale_scalar(p, src_y, src_u, src_v);
+        } else if (p->family == FUSED_FAMILY_THIRDS) {
+            fused_kernel_thirds_scalar(p, src_y, src_u, src_v);
+        } else {
+            fused_kernel_pow2_scalar(p, src_y, src_u, src_v);
+        }
         return;
     }
 
@@ -444,8 +749,24 @@ void fused_scaler_free(fused_scaler_ctx_t *ctx)
         free(ctx->outputs[i].plane_v);
         memset(&ctx->outputs[i], 0, sizeof(fused_scale_output_t));
     }
+    for (int i = 0; i < FUSED_MAX_UPSCALE_STEPS; i++) {
+        free(ctx->upscale_outputs[i].plane_y);
+        free(ctx->upscale_outputs[i].plane_u);
+        free(ctx->upscale_outputs[i].plane_v);
+        memset(&ctx->upscale_outputs[i], 0, sizeof(fused_scale_output_t));
+    }
+    if (ctx->_internal) {
+        fused_internal_t *state = (fused_internal_t *)ctx->_internal;
+        free(state->params.upscale_scratch);
+        state->params.upscale_scratch = NULL;
+        free(state->params.scratch_pool);
+        state->params.scratch_pool = NULL;
+        state->params.scratch_pool_size = 0;
+    }
     free(ctx->_internal);
-    ctx->_internal      = NULL;
-    ctx->achieved_flags = 0;
-    ctx->rejected_flags = 0;
+    ctx->_internal              = NULL;
+    ctx->achieved_flags         = 0;
+    ctx->rejected_flags         = 0;
+    ctx->achieved_upscale_flags = 0;
+    ctx->achieved_upscale_tail  = 0;
 }

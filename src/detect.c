@@ -1,7 +1,7 @@
 #include "detect.h"
 #include <stdint.h>
 
-/* Static cache — zero-initialised at startup */
+/* Static cache - zero-initialised at startup */
 static fused_cpu_caps_t g_caps = {0, 0};
 static int              g_detected = 0;
 
@@ -18,7 +18,7 @@ static int              g_detected = 0;
  * Detect AVX2 on x86_64.
  *
  * A full AVX2 check requires three things:
- *  1. The CPU advertises OSXSAVE (cpuid eax=1, ecx bit 27) — OS has enabled
+ *  1. The CPU advertises OSXSAVE (cpuid eax=1, ecx bit 27) - OS has enabled
  *     the XSAVE instruction.
  *  2. The CPU advertises AVX support (cpuid eax=1, ecx bit 28).
  *  3. The OS has enabled YMM state in XCR0 (xgetbv xcr0, bits 1 and 2 set).
@@ -33,7 +33,7 @@ static void detect_x86(void)
 
     /* Step 1+2: check OSXSAVE and AVX in cpuid leaf 1 */
     if (__get_cpuid(1, &eax, &ebx, &ecx, &edx) == 0) {
-        return; /* cpuid not supported — very old CPU */
+        return; /* cpuid not supported - very old CPU */
     }
 
     /* ecx bit 27 = OSXSAVE, ecx bit 28 = AVX */
@@ -58,12 +58,12 @@ static void detect_x86(void)
         uint32_t xcr0_lo, xcr0_hi;
         __asm__ volatile ("xgetbv" : "=a"(xcr0_lo), "=d"(xcr0_hi) : "c"(0));
         (void)xcr0_hi;  /* high 32 bits not needed; bits 1 and 2 are in eax */
-        /* bit 1 = SSE state, bit 2 = AVX/YMM state — both must be set */
+        /* bit 1 = SSE state, bit 2 = AVX/YMM state - both must be set */
         if ((xcr0_lo & 0x6) != 0x6) {
             return;
         }
 #else
-        return; /* can't check without inline asm — be conservative */
+        return; /* can't check without inline asm - be conservative */
 #endif
     }
 
@@ -120,7 +120,7 @@ static void detect_aarch64(void)
         if (strstr(line, "neon") != NULL || strstr(line, "asimd") != NULL) {
             g_caps.has_neon = 1;
         }
-        break; /* Features line found — no need to keep reading */
+        break; /* Features line found - no need to keep reading */
     }
 
     fclose(f);

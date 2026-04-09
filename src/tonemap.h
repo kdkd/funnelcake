@@ -25,7 +25,7 @@ void fused_tonemap_generate_luts(fused_hdr_internal_t *hdr,
 
 
 /* --------------------------------------------------------------------------
- * Tone mapping application — planar I010 chroma
+ * Tone mapping application - planar I010 chroma
  *
  * Applies the precomputed LUTs to 10-bit YUV420 planes, producing 8-bit
  * SDR output planes.
@@ -53,7 +53,7 @@ void fused_tonemap_apply(
 
 
 /* --------------------------------------------------------------------------
- * Tone mapping application — interleaved P010 chroma
+ * Tone mapping application - interleaved P010 chroma
  *
  * Same as fused_tonemap_apply but reads chroma from a single interleaved
  * uint16_t UV plane (even indices = U, odd indices = V) instead of

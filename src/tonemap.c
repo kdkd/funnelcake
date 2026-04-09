@@ -55,7 +55,7 @@ static const double HABLE_F = 0.30;
  * RGB conversion matrix.  U (Cb) compresses by ~0.945, V (Cr) by ~0.918.
  * -------------------------------------------------------------------------- */
 
-/* BT.2020→BT.709 chroma scale constants removed — chroma tone mapping now
+/* BT.2020->BT.709 chroma scale constants removed - chroma tone mapping now
  * uses per-channel RGB reconstruction instead of YCbCr-domain scaling. */
 
 
@@ -230,14 +230,14 @@ void fused_tonemap_generate_luts(fused_hdr_internal_t *hdr,
             else
                 nits = L * 10000.0;
 
-            /* Step 4: apply tone curve — compress into [0, 1] */
+            /* Step 4: apply tone curve - compress into [0, 1] */
             double mapped;
 
             switch (curve) {
             case FUSED_TONEMAP_REINHARD: {
                 double x_norm = nits / peak_f;  /* [0, 1] */
                 double raw = x_norm / (1.0 + x_norm);
-                /* Normalize: target_nits → 1.0 */
+                /* Normalize: target_nits -> 1.0 */
                 double ref = (target_f / peak_f) / (1.0 + target_f / peak_f);
                 mapped = (ref > 0.0) ? clamp_d(raw / ref, 0.0, 1.0) : raw;
                 break;
@@ -256,7 +256,7 @@ void fused_tonemap_generate_luts(fused_hdr_internal_t *hdr,
                     double m0 = 1.0 * (bt2390_maxlum - bt2390_ks) / bt2390_maxlum, m1 = 0.0;
                     raw = (2*t3-3*t2+1)*p0 + (t3-2*t2+t)*m0 + (-2*t3+3*t2)*p1 + (t3-t2)*m1;
                 }
-                /* Normalize: target_nits → 1.0 */
+                /* Normalize: target_nits -> 1.0 */
                 mapped = (bt2390_ref > 0.0) ? clamp_d(raw / bt2390_ref, 0.0, 1.0) : raw;
                 break;
             }
@@ -264,7 +264,7 @@ void fused_tonemap_generate_luts(fused_hdr_internal_t *hdr,
             case FUSED_TONEMAP_HABLE:
             default: {
                 double raw = hable_curve(nits / target_f * hable_exposure) / hable_denom;
-                /* Normalize: target_nits → 1.0 (full SDR white) */
+                /* Normalize: target_nits -> 1.0 (full SDR white) */
                 mapped = clamp_d(raw / hable_ref, 0.0, 1.0);
                 break;
             }
@@ -279,7 +279,7 @@ void fused_tonemap_generate_luts(fused_hdr_internal_t *hdr,
     }
 
     /* ------------------------------------------------------------------ */
-    /* PQ-to-linear LUT: 10-bit PQ code → linear luminance [0, 1]          */
+    /* PQ-to-linear LUT: 10-bit PQ code -> linear luminance [0, 1]          */
     /*                                                                     */
     /* Used by the chroma tone mapping pass to reconstruct linear-light    */
     /* R, G, B from YCbCr.  Each entry is the result of the PQ EOTF       */
@@ -295,7 +295,7 @@ void fused_tonemap_generate_luts(fused_hdr_internal_t *hdr,
     }
 
     /* ------------------------------------------------------------------ */
-    /* Linear-to-SDR LUT: linear [0, 1] → 8-bit SDR gamma output          */
+    /* Linear-to-SDR LUT: linear [0, 1] -> 8-bit SDR gamma output          */
     /*                                                                     */
     /* Incorporates: absolute nits scaling, tone curve, BT.709 OETF.       */
     /* Indexed by (linear_value * 4095).  Used by the chroma pass to       */
@@ -313,7 +313,7 @@ void fused_tonemap_generate_luts(fused_hdr_internal_t *hdr,
             nits = L * 10000.0;
 
         /* Apply tone curve with normalization (same as luma LUT).
-         * Each curve is normalized so target_nits → 1.0. */
+         * Each curve is normalized so target_nits -> 1.0. */
         double mapped;
         switch (curve) {
         case FUSED_TONEMAP_REINHARD: {
@@ -350,7 +350,7 @@ void fused_tonemap_generate_luts(fused_hdr_internal_t *hdr,
     }
 
     fused_log(log_warn, FUSED_LOG_WARN,
-        "funnelcake: tone map LUTs generated — transfer=%s curve=%d "
+        "funnelcake: tone map LUTs generated - transfer=%s curve=%d "
         "peak=%d target=%d\n",
         (src_transfer == FUSED_TRC_HLG) ? "HLG" : "PQ",
         curve, peak_nits, target_nits);
@@ -358,7 +358,7 @@ void fused_tonemap_generate_luts(fused_hdr_internal_t *hdr,
 
 
 /* --------------------------------------------------------------------------
- * SIMD luma tone mapping — exact LUT with batched lookups
+ * SIMD luma tone mapping - exact LUT with batched lookups
  *
  * The luma pass applies: dst[x] = lut_y[src[x] & 0x3FF]
  *
@@ -373,7 +373,7 @@ void fused_tonemap_generate_luts(fused_hdr_internal_t *hdr,
 #if defined(__x86_64__)
 
 /*
- * tonemap_luma_avx2 — exact LUT tone mapping, 16 pixels per iteration.
+ * tonemap_luma_avx2 - exact LUT tone mapping, 16 pixels per iteration.
  *
  * Loads 16 source values, masks to 10 bits, extracts each lane for scalar
  * LUT lookup, packs 16 result bytes, and stores.  The LUT stays L1-hot
@@ -440,7 +440,7 @@ static void tonemap_luma_avx2(const uint8_t *lut_y,
 #if defined(__aarch64__)
 
 /*
- * tonemap_luma_neon — exact LUT tone mapping, 16 pixels per iteration.
+ * tonemap_luma_neon - exact LUT tone mapping, 16 pixels per iteration.
  *
  * Extracts each lane for scalar LUT lookup, packs results into uint8x16_t.
  */
@@ -498,7 +498,7 @@ static void tonemap_luma_neon(const uint8_t *lut_y,
  * NCL chroma reconstruction helpers
  *
  * HDR10 uses non-constant-luminance (NCL) YCbCr encoding:
- *   Y' = PQ(0.2627*R + 0.6780*G + 0.0593*B)   ← PQ of linear luma
+ *   Y' = PQ(0.2627*R + 0.6780*G + 0.0593*B)   <- PQ of linear luma
  *   Cb = (PQ(B) - Y') / 1.8814
  *   Cr = (PQ(R) - Y') / 1.4746
  *
@@ -524,7 +524,7 @@ static void tonemap_luma_neon(const uint8_t *lut_y,
 
 
 /* --------------------------------------------------------------------------
- * fused_tonemap_apply — planar I010 chroma
+ * fused_tonemap_apply - planar I010 chroma
  * -------------------------------------------------------------------------- */
 
 /* --------------------------------------------------------------------------
@@ -615,7 +615,7 @@ void fused_tonemap_apply(
                     dy[x] = lut_y[sy[x] & 0x3FF];
             }
         }
-        /* Chroma pass — simple scaling */
+        /* Chroma pass - simple scaling */
         for (int cy = 0; cy < chroma_h; cy++) {
             const uint16_t *su = src_u + cy * src_uv_pitch;
             const uint16_t *sv = src_v + cy * src_uv_pitch;
@@ -664,7 +664,7 @@ void fused_tonemap_apply(
         }
     }
 
-    /* Chroma at chroma resolution — compute from tone-mapped RGB */
+    /* Chroma at chroma resolution - compute from tone-mapped RGB */
     for (int cy = 0; cy < chroma_h; cy++) {
         const uint16_t *su = src_u + cy * src_uv_pitch;
         const uint16_t *sv = src_v + cy * src_uv_pitch;
@@ -695,7 +695,7 @@ void fused_tonemap_apply(
 
 
 /* --------------------------------------------------------------------------
- * fused_tonemap_apply_p010 — interleaved P010 chroma
+ * fused_tonemap_apply_p010 - interleaved P010 chroma
  * -------------------------------------------------------------------------- */
 
 __attribute__((hot))

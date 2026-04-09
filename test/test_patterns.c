@@ -36,7 +36,7 @@ static uint8_t *alloc_plane(int stride, int rows)
     return (uint8_t *)ptr;
 }
 
-/* Simple xorshift32 PRNG — returns next state and writes value via *val. */
+/* Simple xorshift32 PRNG - returns next state and writes value via *val. */
 static uint32_t xorshift32(uint32_t state, uint8_t *val)
 {
     state ^= state << 13;
@@ -52,7 +52,7 @@ static uint32_t xorshift32(uint32_t state, uint8_t *val)
 
 static void fill_solid(test_frame_t *f)
 {
-    /* Y=128, U=128, V=128 — neutral gray */
+    /* Y=128, U=128, V=128 - neutral gray */
     for (int y = 0; y < f->height; y++)
         memset(f->plane_y + y * f->y_stride, 128, (size_t)f->width);
 
@@ -260,7 +260,7 @@ static uint16_t linear_to_pq(double L)
 
 static void fill_hdr_solid(test_hdr_frame_t *f)
 {
-    /* Y=512, U=512, V=512 — mid-range 10-bit */
+    /* Y=512, U=512, V=512 - mid-range 10-bit */
     int samples_per_row = f->y_stride / (int)sizeof(uint16_t);
     for (int y = 0; y < f->height; y++) {
         uint16_t *row = f->plane_y + y * samples_per_row;
@@ -477,7 +477,7 @@ static void fill_hdr_saturated_2020(test_hdr_frame_t *f)
  * Creates proper PQ-encoded color bars that can be tone-mapped to SDR to
  * visually verify the tone mapping pipeline.  Each bar is defined as a
  * linear-light RGB color (in nits, BT.2020 primaries), converted through
- * the BT.2020 RGB→YCbCr matrix, and then PQ-encoded.
+ * the BT.2020 RGB->YCbCr matrix, and then PQ-encoded.
  *
  * The 7 standard bars at 75% intensity (~200 nits peak for SDR-equivalent
  * content represented in HDR):
@@ -487,7 +487,7 @@ static void fill_hdr_saturated_2020(test_hdr_frame_t *f)
 static void fill_hdr_pq_colorbars(test_hdr_frame_t *f)
 {
     /* 75% bars in linear light (nits).  200 nits ≈ 75% SDR on a 1000-nit display.
-     * These are approximate — the exact values depend on the display, but
+     * These are approximate - the exact values depend on the display, but
      * they're standard enough to produce recognizable bars after tone mapping. */
     static const struct { double r, g, b; } bars[8] = {
         /* White   */ { 200.0, 200.0, 200.0 },

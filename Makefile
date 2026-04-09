@@ -104,15 +104,19 @@ endif
 
 # Library sources (always compiled)
 LIB_SRCS = src/funnelcake.c src/funnelcake_hdr.c src/log.c src/detect.c \
-           src/kernels_scalar.c src/kernels_hdr_scalar.c src/tonemap.c
+           src/kernels_scalar.c src/kernels_hdr_scalar.c src/tonemap.c \
+           src/kernels_upscale_scalar.c
 
-# Platform-specific SIMD kernels (SDR + HDR)
+# Platform-specific SIMD kernels (SDR + HDR + upscale)
 ifeq ($(UNAME_M),x86_64)
-  LIB_SRCS += src/kernels_avx2.c src/kernels_hdr_avx2.c
+  LIB_SRCS += src/kernels_avx2.c src/kernels_hdr_avx2.c \
+              src/kernels_upscale_avx2.c
 else ifeq ($(UNAME_M),aarch64)
-  LIB_SRCS += src/kernels_neon.c src/kernels_hdr_neon.c
+  LIB_SRCS += src/kernels_neon.c src/kernels_hdr_neon.c \
+              src/kernels_upscale_neon.c
 else ifeq ($(UNAME_M),arm64)
-  LIB_SRCS += src/kernels_neon.c src/kernels_hdr_neon.c
+  LIB_SRCS += src/kernels_neon.c src/kernels_hdr_neon.c \
+              src/kernels_upscale_neon.c
 endif
 
 LIB_OBJS = $(LIB_SRCS:.c=.o)
@@ -173,7 +177,7 @@ fetch-samples:
 		-vf "zscale=tin=bt709:min=bt709:pin=bt709:t=smpte2084:m=bt2020nc:p=bt2020,format=yuv420p10le" \
 		-f rawvideo -frames:v 1 \
 		test/samples/bars_1080p_i010_pq.yuv 2>/dev/null \
-		&& echo "    test/samples/bars_1080p_i010_pq.yuv" || echo "    (failed — zscale filter may not be available)"
+		&& echo "    test/samples/bars_1080p_i010_pq.yuv" || echo "    (failed - zscale filter may not be available)"
 	@echo "  Color gradients (1080p, PQ I010)..."
 	@ffmpeg -y -f lavfi -i "gradients=size=1920x1080:rate=1:duration=1:nb_colors=6" \
 		-vf "zscale=tin=bt709:min=bt709:pin=bt709:t=smpte2084:m=bt2020nc:p=bt2020,format=yuv420p10le" \
@@ -195,7 +199,7 @@ fetch-samples:
 	@echo ""
 	@echo "=== Downloading real-world HDR test content ==="
 	@echo ""
-	@echo "  haasn/hdr-tests colorbars (1080p HEVC HDR10, 258 KB) → extracting 1 frame..."
+	@echo "  haasn/hdr-tests colorbars (1080p HEVC HDR10, 258 KB) -> extracting 1 frame..."
 	@curl -fsSL -o test/samples/hdr_colorbars.mp4 \
 		"https://github.com/haasn/hdr-tests/raw/master/colorbars.mp4" 2>/dev/null \
 		&& ffmpeg -y -i test/samples/hdr_colorbars.mp4 -frames:v 1 \
@@ -204,7 +208,7 @@ fetch-samples:
 		&& rm -f test/samples/hdr_colorbars.mp4 \
 		&& echo "    test/samples/hdr_colorbars_1080p_i010_pq.yuv (1080p PQ, from haasn/hdr-tests)" \
 		|| { rm -f test/samples/hdr_colorbars.mp4; echo "    (skipped: download or conversion failed)"; }
-	@echo "  haasn/hdr-tests snow-fades (1080p HEVC HDR10, 3.4 MB) → extracting 1 frame..."
+	@echo "  haasn/hdr-tests snow-fades (1080p HEVC HDR10, 3.4 MB) -> extracting 1 frame..."
 	@curl -fsSL -o test/samples/hdr_snow.mp4 \
 		"https://github.com/haasn/hdr-tests/raw/master/snow-fades.mp4" 2>/dev/null \
 		&& ffmpeg -y -i test/samples/hdr_snow.mp4 -frames:v 1 \
@@ -213,7 +217,7 @@ fetch-samples:
 		&& rm -f test/samples/hdr_snow.mp4 \
 		&& echo "    test/samples/hdr_snow_i010_pq.yuv (PQ, from haasn/hdr-tests)" \
 		|| { rm -f test/samples/hdr_snow.mp4; echo "    (skipped: download or conversion failed)"; }
-	@echo "  OpenEXR StillLife → PQ I010 via zscale..."
+	@echo "  OpenEXR StillLife -> PQ I010 via zscale..."
 	@curl -fsSL -o test/samples/StillLife.exr \
 		"https://raw.githubusercontent.com/AcademySoftwareFoundation/openexr-images/main/ScanLines/StillLife.exr" 2>/dev/null \
 		&& ffmpeg -y -i test/samples/StillLife.exr \
@@ -234,7 +238,7 @@ fetch-samples:
 		w=$$(echo "$$dims" | cut -dx -f1); \
 		h=$$(echo "$$dims" | cut -dx -f2); \
 		h=$$(( (h / 2) * 2 )); \
-		echo "  $$src → $$out ($${w}x$${h})..."; \
+		echo "  $$src -> $$out ($${w}x$${h})..."; \
 		ffmpeg -y -i "$$src" \
 			-vf "crop=$${w}:$${h},zscale=tin=bt709:min=bt709:pin=bt709:t=smpte2084:m=bt2020nc:p=bt2020,format=yuv420p10le" \
 			-f rawvideo -frames:v 1 "$$out" 2>/dev/null \
@@ -308,6 +312,16 @@ src/kernels_hdr_avx2.o: src/kernels_hdr_avx2.c
 src/kernels_hdr_neon.o: src/kernels_hdr_neon.c
 	$(CC) $(LIB_CFLAGS) -c -o $@ $<
 
+# Upscale kernels
+src/kernels_upscale_scalar.o: src/kernels_upscale_scalar.c
+	$(CC) $(LIB_CFLAGS) $(SCALAR_CFLAGS) -c -o $@ $<
+
+src/kernels_upscale_avx2.o: src/kernels_upscale_avx2.c
+	$(CC) $(LIB_CFLAGS) -mavx2 -c -o $@ $<
+
+src/kernels_upscale_neon.o: src/kernels_upscale_neon.c
+	$(CC) $(LIB_CFLAGS) -c -o $@ $<
+
 # Test source files use TEST_CFLAGS (O2)
 test/%.o: test/%.c
 	$(CC) $(TEST_CFLAGS) -c -o $@ $<
@@ -317,5 +331,5 @@ test/test_swscale_bench.o: test/test_swscale_bench.c
 	$(CC) $(TEST_CFLAGS) $(SWSCALE_TEST_CFLAGS) -c -o $@ $<
 
 # Header dependencies (conservative: rebuild all on header change)
-$(LIB_OBJS): include/funnelcake.h src/internal.h src/log.h src/detect.h src/tonemap.h
+$(LIB_OBJS): include/funnelcake.h src/internal.h src/log.h src/detect.h src/tonemap.h src/upscale_chunk.h
 $(TEST_OBJS): include/funnelcake.h test/test_main.h test/test_patterns.h

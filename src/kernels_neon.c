@@ -1,9 +1,9 @@
 /*
- * kernels_neon.c — NEON (aarch64) fused downscale kernels.
+ * kernels_neon.c - NEON (aarch64) fused downscale kernels.
  *
  * Two entry points:
- *   fused_kernel_pow2_neon   — power-of-two family (2x/4x/8x/16x)
- *   fused_kernel_thirds_neon — thirds family (1.5x/3x/6x/12x)
+ *   fused_kernel_pow2_neon   - power-of-two family (2x/4x/8x/16x)
+ *   fused_kernel_thirds_neon - thirds family (1.5x/3x/6x/12x)
  *
  * Both process YUV420 I420 frames plane-by-plane.
  *
@@ -71,7 +71,7 @@ static inline uint8_t blend_2_1(uint8_t a, uint8_t b)
  *
  * (x * 0x5556) >> 16 is an integer approximation of x/3.  The magic
  * multiplier 0x5556/0x10000 = 21846/65536 ≈ 1/3, and the result is exact
- * for all x in [0, 765] — the maximum sum of three uint8 values. */
+ * for all x in [0, 765] - the maximum sum of three uint8 values. */
 static inline uint8_t div3_u16(uint16_t sum)
 {
     return (uint8_t)((sum * (uint32_t)0x5556) >> 16);
@@ -237,7 +237,9 @@ static void __attribute__((hot)) scale_plane_pow2_neon(
     uint8_t *restrict dst_planes[4],
     int dst_widths[4],
     int dst_strides[4],
-    int dst_heights[4])
+    int dst_heights[4],
+    uint8_t *scratch_pool_base,
+    size_t scratch_pool_size)
 {
     (void)dst_heights;
 
@@ -256,25 +258,23 @@ static void __attribute__((hot)) scale_plane_pow2_neon(
     int group_rows = (2 << deepest);
     int num_groups = src_h / group_rows;
 
-    /* Allocate vertical intermediate row buffers */
+    /* Carve scratch buffers from the persistent pool (init-time alloc). */
+    fused_scratch_t scratch;
+    fused_scratch_init(&scratch, scratch_pool_base, scratch_pool_size);
+
     uint8_t *vert_buf[4] = { NULL, NULL, NULL, NULL };
     int vert_rows[4];
 
     for (int k = 0; k <= deepest; k++) {
         vert_rows[k] = group_rows >> (k + 1);
-        vert_buf[k] = (uint8_t *)malloc((size_t)vert_rows[k] * (size_t)src_w);
-        if (!vert_buf[k]) {
-            for (int j = 0; j < k; j++) free(vert_buf[j]);
-            return;
-        }
+        vert_buf[k] = (uint8_t *)fused_scratch_alloc(
+            &scratch, (size_t)vert_rows[k] * (size_t)src_w);
+        if (!vert_buf[k]) return;
     }
 
     /* Horizontal cascade buffer */
-    uint8_t *h_buf = (uint8_t *)malloc((size_t)src_w);
-    if (!h_buf) {
-        for (int k = 0; k <= deepest; k++) free(vert_buf[k]);
-        return;
-    }
+    uint8_t *h_buf = (uint8_t *)fused_scratch_alloc(&scratch, (size_t)src_w);
+    if (!h_buf) return;
 
     int out_row[4] = { 0, 0, 0, 0 };
 
@@ -369,8 +369,7 @@ static void __attribute__((hot)) scale_plane_pow2_neon(
         }
     }
 
-    free(h_buf);
-    for (int k = 0; k <= deepest; k++) free(vert_buf[k]);
+    /* Scratch buffers are carved from the persistent pool - nothing to free. */
 }
 
 
@@ -491,7 +490,7 @@ static inline uint8x16x3_t deinterleave_chunk(
 }
 
 /* Bilinear blend of two 16-byte registers: (a*171 + b*85 + 128) >> 8.
- * SIMD equivalent of blend_2_1 for a full 16-byte register — used during
+ * SIMD equivalent of blend_2_1 for a full 16-byte register - used during
  * the 1.5x vertical blending phase to blend between two row-pair averages. */
 static inline uint8x16_t neon_blend_reg(uint8x16_t a, uint8x16_t b,
                                          uint8x8_t w171, uint8x8_t w85)
@@ -511,7 +510,9 @@ static void __attribute__((hot)) scale_plane_thirds_neon(
     uint8_t *restrict dst_planes[4],
     int dst_widths[4],
     int dst_strides[4],
-    int dst_heights[4])
+    int dst_heights[4],
+    uint8_t *scratch_pool_base,
+    size_t scratch_pool_size)
 {
     (void)dst_heights;
 
@@ -534,18 +535,19 @@ static void __attribute__((hot)) scale_plane_thirds_neon(
     int base6_groups = src_h / 6;
     size_t row_bytes = (size_t)src_w;
 
+    /* Carve scratch buffers from the persistent pool (init-time alloc). */
+    fused_scratch_t scratch;
+    fused_scratch_init(&scratch, scratch_pool_base, scratch_pool_size);
+
     /* For 12x: two buffers to hold 6x vertical intermediates across
      * consecutive 6-row groups. On even groups we write to v6x_cur,
      * then swap pointers so the odd group can read the previous. */
     uint8_t *v6x_buf_a = NULL, *v6x_buf_b = NULL;
     uint8_t *v6x_cur = NULL, *v6x_prev = NULL;
     if (need_12x) {
-        if (posix_memalign((void **)&v6x_buf_a, 32, row_bytes) != 0 ||
-            posix_memalign((void **)&v6x_buf_b, 32, row_bytes) != 0) {
-            free(v6x_buf_a);
-            free(v6x_buf_b);
-            return;
-        }
+        v6x_buf_a = (uint8_t *)fused_scratch_alloc(&scratch, row_bytes);
+        v6x_buf_b = (uint8_t *)fused_scratch_alloc(&scratch, row_bytes);
+        if (!v6x_buf_a || !v6x_buf_b) return;
         v6x_cur  = v6x_buf_a;
         v6x_prev = v6x_buf_b;
     }
@@ -555,12 +557,10 @@ static void __attribute__((hot)) scale_plane_thirds_neon(
     int w_6x = w_3x / 2;
     uint8_t *h_3x_buf = NULL, *h_6x_buf = NULL;
     if (need_12x && (active_outputs & (1u << 6))) {
-        if (posix_memalign((void **)&h_3x_buf, 32, (size_t)w_3x) != 0 ||
-            posix_memalign((void **)&h_6x_buf, 32, (size_t)(w_6x > 0 ? w_6x : 1)) != 0) {
-            free(v6x_buf_a); free(v6x_buf_b);
-            free(h_3x_buf); free(h_6x_buf);
-            return;
-        }
+        h_3x_buf = (uint8_t *)fused_scratch_alloc(&scratch, (size_t)w_3x);
+        h_6x_buf = (uint8_t *)fused_scratch_alloc(
+            &scratch, (size_t)(w_6x > 0 ? w_6x : 1));
+        if (!h_3x_buf || !h_6x_buf) return;
     }
 
     /* NEON weight constants */
@@ -671,7 +671,7 @@ static void __attribute__((hot)) scale_plane_thirds_neon(
              * A 6-source-row group produces 4 output rows at 1.5x.  Rows 0
              * and 3 come directly from v01 and v45 (the pair averages
              * themselves).  Rows 1 and 2 are bilinear blends between
-             * adjacent pair averages — blend(v01,v23) and blend(v23,v45) —
+             * adjacent pair averages - blend(v01,v23) and blend(v23,v45) -
              * representing the vertical positions 1/3 and 2/3 of the way
              * through the group. */
             if (need_1_5x) {
@@ -890,8 +890,7 @@ static void __attribute__((hot)) scale_plane_thirds_neon(
         }
     } /* end g6 loop */
 
-    free(v6x_buf_a); free(v6x_buf_b);
-    free(h_3x_buf);  free(h_6x_buf);
+    /* Scratch buffers are carved from the persistent pool - nothing to free. */
 }
 
 
@@ -938,19 +937,22 @@ void __attribute__((hot)) fused_kernel_pow2_neon(const fused_kernel_params_t *p,
     scale_plane_pow2_neon(src_y,
                           p->src_width, p->src_height, p->src_y_stride,
                           p->active_outputs,
-                          y_planes, y_widths, y_strides, y_heights);
+                          y_planes, y_widths, y_strides, y_heights,
+                          p->scratch_pool, p->scratch_pool_size);
 
     /* U plane (half dimensions) */
     scale_plane_pow2_neon(src_u,
                           p->src_width / 2, p->src_height / 2, p->src_uv_stride,
                           p->active_outputs,
-                          u_planes, uv_widths, uv_strides, uv_heights);
+                          u_planes, uv_widths, uv_strides, uv_heights,
+                          p->scratch_pool, p->scratch_pool_size);
 
     /* V plane (half dimensions) */
     scale_plane_pow2_neon(src_v,
                           p->src_width / 2, p->src_height / 2, p->src_uv_stride,
                           p->active_outputs,
-                          v_planes, uv_widths, uv_strides, uv_heights);
+                          v_planes, uv_widths, uv_strides, uv_heights,
+                          p->scratch_pool, p->scratch_pool_size);
 }
 
 
@@ -989,19 +991,22 @@ void __attribute__((hot)) fused_kernel_thirds_neon(const fused_kernel_params_t *
     scale_plane_thirds_neon(src_y,
                             p->src_width, p->src_height, p->src_y_stride,
                             p->active_outputs,
-                            y_planes, y_widths, y_strides, y_heights);
+                            y_planes, y_widths, y_strides, y_heights,
+                            p->scratch_pool, p->scratch_pool_size);
 
     /* U plane (half dimensions) */
     scale_plane_thirds_neon(src_u,
                             p->src_width / 2, p->src_height / 2, p->src_uv_stride,
                             p->active_outputs,
-                            u_planes, uv_widths, uv_strides, uv_heights);
+                            u_planes, uv_widths, uv_strides, uv_heights,
+                            p->scratch_pool, p->scratch_pool_size);
 
     /* V plane (half dimensions) */
     scale_plane_thirds_neon(src_v,
                             p->src_width / 2, p->src_height / 2, p->src_uv_stride,
                             p->active_outputs,
-                            v_planes, uv_widths, uv_strides, uv_heights);
+                            v_planes, uv_widths, uv_strides, uv_heights,
+                            p->scratch_pool, p->scratch_pool_size);
 }
 
 #endif /* __aarch64__ */

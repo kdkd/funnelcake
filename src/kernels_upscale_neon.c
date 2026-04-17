@@ -529,14 +529,11 @@ static inline void up_vblend_21_row_neon_u16(const uint16_t *a_row,
     for (; x + 8 <= w; x += 8) {
         uint16x8_t av = vld1q_u16(a_row + x);
         uint16x8_t bv = vld1q_u16(b_row + x);
-        /* Low 4 lanes: widen to u32 via vmull_u16. */
-        uint32x4_t lo = vmull_u16(vget_low_u16(av), w85_4);
+        /* +128 folds into the first vmlal; saves a separate vaddq_u32. */
+        uint32x4_t lo = vmlal_u16(r128_32, vget_low_u16(av), w85_4);
         lo = vmlal_u16(lo, vget_low_u16(bv), w171_4);
-        lo = vaddq_u32(lo, r128_32);
-        /* High 4 lanes. */
-        uint32x4_t hi = vmull_u16(vget_high_u16(av), w85_4);
+        uint32x4_t hi = vmlal_u16(r128_32, vget_high_u16(av), w85_4);
         hi = vmlal_u16(hi, vget_high_u16(bv), w171_4);
-        hi = vaddq_u32(hi, r128_32);
         /* Shift right 8 and narrow back to u16. */
         uint16x4_t lo_u16 = vshrn_n_u32(lo, 8);
         uint16x4_t hi_u16 = vshrn_n_u32(hi, 8);
@@ -570,23 +567,20 @@ static void up_h_1_5x_row_neon_u16(const uint16_t *src, int w, uint16_t *dst)
         uint16_t next_a = (next_idx < w) ? src[next_idx] : src[w - 1];
         uint16x8_t c_vec = vextq_u16(a, vdupq_n_u16(next_a), 1);
 
+        /* +128 folds into the first vmlal of each half; saves 4 vaddq_u32. */
         /* m1 = (a*85 + b*171 + 128) >> 8 */
-        uint32x4_t m1_lo = vmull_u16(vget_low_u16(a), w85_4);
+        uint32x4_t m1_lo = vmlal_u16(r128_32, vget_low_u16(a), w85_4);
         m1_lo = vmlal_u16(m1_lo, vget_low_u16(b), w171_4);
-        m1_lo = vaddq_u32(m1_lo, r128_32);
-        uint32x4_t m1_hi = vmull_u16(vget_high_u16(a), w85_4);
+        uint32x4_t m1_hi = vmlal_u16(r128_32, vget_high_u16(a), w85_4);
         m1_hi = vmlal_u16(m1_hi, vget_high_u16(b), w171_4);
-        m1_hi = vaddq_u32(m1_hi, r128_32);
         uint16x8_t m1 = vcombine_u16(vshrn_n_u32(m1_lo, 8),
                                      vshrn_n_u32(m1_hi, 8));
 
         /* m2 = (c*85 + b*171 + 128) >> 8 */
-        uint32x4_t m2_lo = vmull_u16(vget_low_u16(c_vec), w85_4);
+        uint32x4_t m2_lo = vmlal_u16(r128_32, vget_low_u16(c_vec), w85_4);
         m2_lo = vmlal_u16(m2_lo, vget_low_u16(b), w171_4);
-        m2_lo = vaddq_u32(m2_lo, r128_32);
-        uint32x4_t m2_hi = vmull_u16(vget_high_u16(c_vec), w85_4);
+        uint32x4_t m2_hi = vmlal_u16(r128_32, vget_high_u16(c_vec), w85_4);
         m2_hi = vmlal_u16(m2_hi, vget_high_u16(b), w171_4);
-        m2_hi = vaddq_u32(m2_hi, r128_32);
         uint16x8_t m2 = vcombine_u16(vshrn_n_u32(m2_lo, 8),
                                      vshrn_n_u32(m2_hi, 8));
 

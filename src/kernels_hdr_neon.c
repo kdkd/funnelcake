@@ -90,17 +90,15 @@ static inline uint16x8_t neon_blend_reg_hdr(uint16x8_t a, uint16x8_t b)
 {
     uint16x4_t w171 = vdup_n_u16(171);
     uint16x4_t w85  = vdup_n_u16(85);
+    uint32x4_t r128 = vdupq_n_u32(128);
 
-    /* Low half */
-    uint32x4_t lo = vmull_u16(vget_low_u16(a), w171);
+    /* +128 folds into the first vmlal; saves a separate vaddq_u32. */
+    uint32x4_t lo = vmlal_u16(r128, vget_low_u16(a), w171);
     lo = vmlal_u16(lo, vget_low_u16(b), w85);
-    lo = vaddq_u32(lo, vdupq_n_u32(128));
     uint16x4_t res_lo = vshrn_n_u32(lo, 8);
 
-    /* High half */
-    uint32x4_t hi = vmull_u16(vget_high_u16(a), w171);
+    uint32x4_t hi = vmlal_u16(r128, vget_high_u16(a), w171);
     hi = vmlal_u16(hi, vget_high_u16(b), w85);
-    hi = vaddq_u32(hi, vdupq_n_u32(128));
     uint16x4_t res_hi = vshrn_n_u32(hi, 8);
 
     return vcombine_u16(res_lo, res_hi);
@@ -127,29 +125,26 @@ static void h_filter_1_5x_hdr(const uint16_t *restrict src, int src_w,
     uint16x4_t w171 = vdup_n_u16(171);
     uint16x4_t w85  = vdup_n_u16(85);
 
+    uint32x4_t r128 = vdupq_n_u32(128);
     for (int c = 0; c < chunks; c++) {
         uint16x8x3_t loaded = vld3q_u16(src + c * 24);
         uint16x8_t A = loaded.val[0];
         uint16x8_t B = loaded.val[1];
         uint16x8_t C = loaded.val[2];
 
+        /* B*85 + 128 is shared between out0 and out1; compute once. */
+        uint32x4_t b85_lo = vmlal_u16(r128, vget_low_u16(B),  w85);
+        uint32x4_t b85_hi = vmlal_u16(r128, vget_high_u16(B), w85);
+
         /* Output 0: (A*171 + B*85 + 128) >> 8 */
-        uint32x4_t t0_lo = vmull_u16(vget_low_u16(A), w171);
-        t0_lo = vmlal_u16(t0_lo, vget_low_u16(B), w85);
-        t0_lo = vaddq_u32(t0_lo, vdupq_n_u32(128));
-        uint32x4_t t0_hi = vmull_u16(vget_high_u16(A), w171);
-        t0_hi = vmlal_u16(t0_hi, vget_high_u16(B), w85);
-        t0_hi = vaddq_u32(t0_hi, vdupq_n_u32(128));
+        uint32x4_t t0_lo = vmlal_u16(b85_lo, vget_low_u16(A),  w171);
+        uint32x4_t t0_hi = vmlal_u16(b85_hi, vget_high_u16(A), w171);
         uint16x8_t out0 = vcombine_u16(vshrn_n_u32(t0_lo, 8),
                                         vshrn_n_u32(t0_hi, 8));
 
         /* Output 1: (C*171 + B*85 + 128) >> 8 */
-        uint32x4_t t1_lo = vmull_u16(vget_low_u16(C), w171);
-        t1_lo = vmlal_u16(t1_lo, vget_low_u16(B), w85);
-        t1_lo = vaddq_u32(t1_lo, vdupq_n_u32(128));
-        uint32x4_t t1_hi = vmull_u16(vget_high_u16(C), w171);
-        t1_hi = vmlal_u16(t1_hi, vget_high_u16(B), w85);
-        t1_hi = vaddq_u32(t1_hi, vdupq_n_u32(128));
+        uint32x4_t t1_lo = vmlal_u16(b85_lo, vget_low_u16(C),  w171);
+        uint32x4_t t1_hi = vmlal_u16(b85_hi, vget_high_u16(C), w171);
         uint16x8_t out1 = vcombine_u16(vshrn_n_u32(t1_lo, 8),
                                         vshrn_n_u32(t1_hi, 8));
 
@@ -295,6 +290,15 @@ static void __attribute__((hot)) scale_plane_pow2_hdr_neon(
     for (int g = 0; g < num_groups; g++) {
         const uint16_t *grp_base = src + (size_t)g * (size_t)group_rows * (size_t)src_el_stride;
 
+        /* Prefetch start of the next group.  At deep levels (16x) the jump
+         * between groups is 16 rows, far enough that the HW prefetcher's
+         * per-row stream tracker has to re-lock; the prefetches bridge that. */
+        if (g + 1 < num_groups) {
+            const uint16_t *nxt = grp_base + (size_t)group_rows * (size_t)src_el_stride;
+            __builtin_prefetch(nxt);
+            __builtin_prefetch(nxt + src_el_stride);
+        }
+
         /* -- Vertical cascade (NEON) --------------------------------- */
 
         /* Level 0 (2x vertical): pairwise average source rows */
@@ -426,24 +430,21 @@ static inline void h_chunk_1_5x_hdr(uint16x8_t A, uint16x8_t B, uint16x8_t C,
 {
     uint16x4_t w171 = vdup_n_u16(171);
     uint16x4_t w85  = vdup_n_u16(85);
+    uint32x4_t r128 = vdupq_n_u32(128);
+
+    /* B*85 + 128 is shared between out0 and out1; compute once. */
+    uint32x4_t b85_lo = vmlal_u16(r128, vget_low_u16(B),  w85);
+    uint32x4_t b85_hi = vmlal_u16(r128, vget_high_u16(B), w85);
 
     /* Output 0: pixel at 1/3 position, weighted toward A */
-    uint32x4_t t0_lo = vmull_u16(vget_low_u16(A), w171);
-    t0_lo = vmlal_u16(t0_lo, vget_low_u16(B), w85);
-    t0_lo = vaddq_u32(t0_lo, vdupq_n_u32(128));
-    uint32x4_t t0_hi = vmull_u16(vget_high_u16(A), w171);
-    t0_hi = vmlal_u16(t0_hi, vget_high_u16(B), w85);
-    t0_hi = vaddq_u32(t0_hi, vdupq_n_u32(128));
+    uint32x4_t t0_lo = vmlal_u16(b85_lo, vget_low_u16(A),  w171);
+    uint32x4_t t0_hi = vmlal_u16(b85_hi, vget_high_u16(A), w171);
     uint16x8_t out0 = vcombine_u16(vshrn_n_u32(t0_lo, 8),
                                     vshrn_n_u32(t0_hi, 8));
 
     /* Output 1: pixel at 2/3 position, weighted toward C */
-    uint32x4_t t1_lo = vmull_u16(vget_low_u16(C), w171);
-    t1_lo = vmlal_u16(t1_lo, vget_low_u16(B), w85);
-    t1_lo = vaddq_u32(t1_lo, vdupq_n_u32(128));
-    uint32x4_t t1_hi = vmull_u16(vget_high_u16(C), w171);
-    t1_hi = vmlal_u16(t1_hi, vget_high_u16(B), w85);
-    t1_hi = vaddq_u32(t1_hi, vdupq_n_u32(128));
+    uint32x4_t t1_lo = vmlal_u16(b85_lo, vget_low_u16(C),  w171);
+    uint32x4_t t1_hi = vmlal_u16(b85_hi, vget_high_u16(C), w171);
     uint16x8_t out1 = vcombine_u16(vshrn_n_u32(t1_lo, 8),
                                     vshrn_n_u32(t1_hi, 8));
 
@@ -578,6 +579,19 @@ static void __attribute__((hot)) scale_plane_thirds_hdr_neon(
         const uint16_t *restrict row3 = grp + (size_t)3 * (size_t)src_el_stride;
         const uint16_t *restrict row4 = grp + (size_t)4 * (size_t)src_el_stride;
         const uint16_t *restrict row5 = grp + (size_t)5 * (size_t)src_el_stride;
+
+        /* Prefetch the first cache line of each of the next group's 6 source
+         * rows.  The HW prefetcher picks up the sequential access within each
+         * row; this bridges the per-row stream restart at the group boundary. */
+        if (g6 + 1 < base6_groups) {
+            const uint16_t *nxt = grp + (size_t)6 * (size_t)src_el_stride;
+            __builtin_prefetch(nxt);
+            __builtin_prefetch(nxt + src_el_stride);
+            __builtin_prefetch(nxt + 2 * src_el_stride);
+            __builtin_prefetch(nxt + 3 * src_el_stride);
+            __builtin_prefetch(nxt + 4 * src_el_stride);
+            __builtin_prefetch(nxt + 5 * src_el_stride);
+        }
 
         /* Compute output row base pointers (element pointers, not byte) */
         uint16_t *dst_1_5x_r0 = NULL, *dst_1_5x_r1 = NULL;

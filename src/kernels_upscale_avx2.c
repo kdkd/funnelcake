@@ -673,8 +673,15 @@ static inline uint16_t up_blend_21_u16_scalar(uint16_t a, uint16_t b)
     return (uint16_t)(((uint32_t)a * 85 + (uint32_t)b * 171 + 128) >> 8);
 }
 
-/* ---- Horizontal 2x upscale of one HDR row (128-bit SSE) ---- */
-static void up_h_2x_row_avx2_u16(const uint16_t *src, int src_w, uint16_t *dst)
+/* ---- Horizontal 2x upscale of one HDR row (128-bit SSE) ----
+ *
+ * Explicit 64-byte alignment keeps the hot loop entry out of the tail end
+ * of a 64-byte icache line.  We observed this path being very sensitive to
+ * function placement: when the HDR downscale kernel's text size changes,
+ * the unrelated HDR 2x upscale can regress by 10-60% simply because the
+ * first iteration's decode straddles an icache-line boundary. */
+static void __attribute__((aligned(64), hot))
+up_h_2x_row_avx2_u16(const uint16_t *src, int src_w, uint16_t *dst)
 {
     int x = 0;
     int full_chunks = src_w / 8;

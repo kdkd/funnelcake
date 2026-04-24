@@ -886,11 +886,6 @@ static void __attribute__((hot)) scale_plane_thirds_avx2(
          * Vertical intermediates stay in YMM registers; horizontal
          * filtering is applied immediately per chunk.
          * ============================================================ */
-#if defined(__clang__)
-        #pragma clang loop unroll_count(2)
-#elif defined(__GNUC__)
-        #pragma GCC unroll 2
-#endif
         for (int ci = 0; ci < full_chunks; ci++) {
             int cx = ci * 96;
             int out_off_1_5x = ci * 64;  /* 96 -> 64 output bytes */

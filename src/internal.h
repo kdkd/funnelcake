@@ -5,6 +5,31 @@
 #include "funnelcake.h"
 
 #include <stddef.h>
+#include <stdlib.h>
+#if defined(_WIN32)
+#include <malloc.h>
+#endif
+
+static inline int fused_aligned_alloc(void **ptr, size_t alignment, size_t size)
+{
+#if defined(_WIN32)
+    void *p = _aligned_malloc(size ? size : alignment, alignment);
+    if (!p) return -1;
+    *ptr = p;
+    return 0;
+#else
+    return posix_memalign(ptr, alignment, size);
+#endif
+}
+
+static inline void fused_aligned_free(void *ptr)
+{
+#if defined(_WIN32)
+    _aligned_free(ptr);
+#else
+    free(ptr);
+#endif
+}
 
 /* --------------------------------------------------------------------------
  * Constants

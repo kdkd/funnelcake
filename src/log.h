@@ -19,6 +19,9 @@
  *                                         call config->callback(level, buf, ctx)
  */
 void fused_log(const fused_log_config_t *config, int level, const char *fmt, ...)
-    __attribute__((format(printf, 3, 4)));
+#if defined(__GNUC__) || defined(__clang__)
+    __attribute__((format(printf, 3, 4)))
+#endif
+    ;
 
 #endif /* FUNNELCAKE_LOG_H */

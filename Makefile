@@ -15,6 +15,10 @@ TEST_OPT = -O2
 UNAME_M := $(shell uname -m)
 UNAME_S := $(shell uname -s)
 
+ifeq ($(UNAME_S),Windows_NT)
+  CFLAGS_BASE += -D__USE_MINGW_ANSI_STDIO=1
+endif
+
 # --- Tuning options ---
 
 # SCALAR_ARCH: controls -march for kernels_scalar.c only

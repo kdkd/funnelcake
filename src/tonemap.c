@@ -15,6 +15,12 @@
 #include <arm_neon.h>
 #endif
 
+#if defined(__GNUC__) || defined(__clang__)
+#define FUSED_HOT __attribute__((hot))
+#else
+#define FUSED_HOT
+#endif
+
 
 /* --------------------------------------------------------------------------
  * ST 2084 (PQ) EOTF constants
@@ -568,7 +574,7 @@ static inline void tonemap_pixel_rgb(
 }
 
 
-__attribute__((hot))
+FUSED_HOT
 void fused_tonemap_apply(
     const fused_hdr_internal_t *state,
     const uint16_t *src_y,  int src_y_stride,
@@ -698,7 +704,7 @@ void fused_tonemap_apply(
  * fused_tonemap_apply_p010 - interleaved P010 chroma
  * -------------------------------------------------------------------------- */
 
-__attribute__((hot))
+FUSED_HOT
 void fused_tonemap_apply_p010(
     const fused_hdr_internal_t *state,
     const uint16_t *src_y,  int src_y_stride,

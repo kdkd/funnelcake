@@ -125,3 +125,41 @@ Artifacts are written to `dist/` as per-architecture tarballs containing
 release archives are built with `CC=clang LTO=0` so the static library contains
 standard object files suitable for downstream linkers that do not understand
 Clang LTO bitcode.
+
+## macOS Release Artifacts
+
+To build a native macOS release archive:
+
+    ./scripts/build-macos.sh
+
+The script must be run on macOS with Xcode command line tools installed. It
+writes `dist/funnelcake-macos-<arch>.tar.gz` containing `libfunnelcake.a`,
+`include/funnelcake.h`, the README, install notes, and `BUILD_INFO`.
+
+## Windows Release Artifacts
+
+To build Windows release archives:
+
+    ./scripts/build-windows.sh
+
+By default the script builds every Windows target whose toolchain is available.
+MinGW-w64 artifacts contain `libfunnelcake.a`; MSVC artifacts contain
+`funnelcake.lib`. Both package layouts include `include/funnelcake.h`, the
+README, install notes, and `BUILD_INFO`.
+
+For MinGW-w64 only:
+
+    ./scripts/build-windows.sh --mingw
+
+For `x86_64` MinGW, install tools that provide `x86_64-w64-mingw32-gcc` and
+`x86_64-w64-mingw32-ar`. For Windows on ARM64 MinGW, install tools that provide
+`aarch64-w64-mingw32-gcc` and `aarch64-w64-mingw32-ar`.
+
+For MSVC only, run from a Visual Studio developer shell where `cl.exe` and
+`lib.exe` are in `PATH`:
+
+    ./scripts/build-windows.sh --msvc
+
+The MSVC package currently builds the portable scalar static library. The
+MinGW packages use the normal Makefile source selection, including AVX2 on
+`x86_64` and NEON on `aarch64`.

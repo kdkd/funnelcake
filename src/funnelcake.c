@@ -248,11 +248,14 @@ int fused_scaler_init(fused_scaler_ctx_t *ctx)
 #endif
 
     if (!has_simd) {
-        /* One-time stderr notice */
+        /* One-time notice routed through the configured warning logger so
+         * callers using FUSED_LOG_SUPPRESS / FUSED_LOG_CALLBACK can control
+         * it. The first init that hits this wins; subsequent inits stay
+         * silent because the CPU detection result is invariant. */
         static int g_no_simd_warned = 0;
         if (!g_no_simd_warned) {
             g_no_simd_warned = 1;
-            fprintf(stderr,
+            fused_log(&ctx->log_warnings, FUSED_LOG_WARN,
                 "funnelcake: no SIMD support detected; using scalar kernel\n");
         }
         warn_bits |= FUSED_WARN_BIT_SCALAR;
@@ -524,7 +527,7 @@ tail_done:
         fused_scaler_free(ctx);
         fused_log(&ctx->log_errors, FUSED_LOG_ERROR,
             "funnelcake: out-of-memory allocating internal state\n");
-        return FUSED_ERR_NO_STEPS;
+        return FUSED_ERR_OUT_OF_MEMORY;
     }
 
     fused_kernel_params_t *p = &state->params;
@@ -703,15 +706,14 @@ void fused_scaler_run(fused_scaler_ctx_t *ctx,
 
     /* Check source plane alignment */
     if (((uintptr_t)src_y & 31) || ((uintptr_t)src_u & 31) || ((uintptr_t)src_v & 31)) {
-        /* Warn once about misaligned source planes */
-        static int warned = 0;
-        if (!warned) {
+        /* Warn once per context about misaligned source planes */
+        if (!state->src_misaligned_warned) {
             fused_log(&ctx->log_errors, FUSED_LOG_ERROR,
                 "funnelcake: source planes are not 32-byte aligned "
                 "(Y=%p U=%p V=%p). Falling back to scalar kernel. "
-                "Performance will be significantly reduced.",
+                "Performance will be significantly reduced.\n",
                 (const void*)src_y, (const void*)src_u, (const void*)src_v);
-            warned = 1;
+            state->src_misaligned_warned = 1;
         }
         /* Fall back to scalar - pick the variant matching the configured
          * (want_down, want_up) combination. */
@@ -769,4 +771,6 @@ void fused_scaler_free(fused_scaler_ctx_t *ctx)
     ctx->rejected_flags         = 0;
     ctx->achieved_upscale_flags = 0;
     ctx->achieved_upscale_tail  = 0;
+    ctx->effective_width        = 0;
+    ctx->effective_height       = 0;
 }

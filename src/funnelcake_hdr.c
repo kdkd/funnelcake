@@ -294,10 +294,14 @@ int fused_hdr_init(fused_hdr_ctx_t *ctx)
 #endif
 
     if (!has_simd) {
+        /* One-time notice routed through the configured warning logger so
+         * callers using FUSED_LOG_SUPPRESS / FUSED_LOG_CALLBACK can control
+         * it. The first init that hits this wins; subsequent inits stay
+         * silent because the CPU detection result is invariant. */
         static int g_no_simd_warned = 0;
         if (!g_no_simd_warned) {
             g_no_simd_warned = 1;
-            fprintf(stderr,
+            fused_log(&ctx->log_warnings, FUSED_LOG_WARN,
                 "funnelcake-hdr: no SIMD support detected; using scalar kernel\n");
         }
         warn_bits |= FUSED_WARN_BIT_SCALAR;
@@ -315,13 +319,17 @@ int fused_hdr_init(fused_hdr_ctx_t *ctx)
     memset(ctx->hdr_outputs, 0, sizeof(ctx->hdr_outputs));
     memset(ctx->sdr_outputs, 0, sizeof(ctx->sdr_outputs));
 
-    /* Allocate internal state early so we can store sdr_temp pointers */
+    /* Allocate internal state early so we can store sdr_temp pointers.
+     * Attach to ctx->_internal immediately so any subsequent error path
+     * can rely on fused_hdr_free for cleanup and avoid leaking sdr_temp[]
+     * buffers populated during the per-step loop below. */
     fused_hdr_internal_t *state = calloc(1, sizeof(fused_hdr_internal_t));
     if (!state) {
         fused_log(&ctx->log_errors, FUSED_LOG_ERROR,
             "funnelcake-hdr: out-of-memory allocating internal state\n");
-        return FUSED_ERR_NO_STEPS;
+        return FUSED_ERR_OUT_OF_MEMORY;
     }
+    ctx->_internal = state;
 
     for (int i = 0; i < 8; i++) {
         const step_desc_t *sd = &k_steps[i];
@@ -626,8 +634,6 @@ hdr_tail_done:
 
     if (achieved_any == 0 && !ctx->tonemap_1x && !hdr_want_up) {
         fused_hdr_free(ctx);
-        free(state);
-        ctx->_internal = NULL;
         fused_log(&ctx->log_errors, FUSED_LOG_ERROR,
             "funnelcake-hdr: no valid output steps after validation\n");
         return FUSED_ERR_NO_STEPS;
@@ -650,11 +656,9 @@ hdr_tail_done:
             fused_aligned_alloc(&pv, 32, (size_t)uv_stride * (size_t)chroma_h) != 0) {
             fused_aligned_free(py); fused_aligned_free(pu); fused_aligned_free(pv);
             fused_hdr_free(ctx);
-            free(state);
-            ctx->_internal = NULL;
             fused_log(&ctx->log_errors, FUSED_LOG_ERROR,
                 "funnelcake-hdr: out-of-memory allocating 1:1 tonemap output\n");
-            return FUSED_ERR_NO_STEPS;
+            return FUSED_ERR_OUT_OF_MEMORY;
         }
 
         ctx->output_1x.width     = eff_w;
@@ -893,8 +897,7 @@ hdr_tail_done:
     state->sdr_flags  = achieved_sdr;
     state->tonemap_1x = ctx->tonemap_1x;
     state->is_custom_lut = (ctx->tonemap.curve == FUSED_TONEMAP_CUSTOM) ? 1 : 0;
-
-    ctx->_internal = state;
+    /* ctx->_internal already set immediately after state allocation. */
 
     return warn_bits;  /* 0 == FUSED_OK if nothing was warned */
 }
@@ -920,14 +923,13 @@ void fused_hdr_run(fused_hdr_ctx_t *ctx,
 
     if (((uintptr_t)src_y & 31) || ((uintptr_t)src_u & 31) ||
         (!is_p010 && src_v && ((uintptr_t)src_v & 31))) {
-        static int warned = 0;
-        if (!warned) {
+        if (!state->src_misaligned_warned) {
             fused_log(&ctx->log_errors, FUSED_LOG_ERROR,
                 "funnelcake-hdr: source planes are not 32-byte aligned "
                 "(Y=%p U=%p V=%p). Falling back to scalar kernel. "
-                "Performance will be significantly reduced.",
+                "Performance will be significantly reduced.\n",
                 (const void *)src_y, (const void *)src_u, (const void *)src_v);
-            warned = 1;
+            state->src_misaligned_warned = 1;
         }
         const fused_hdr_kernel_params_t *p = &state->params;
         int hdr_want_down = (p->active_outputs != 0);
@@ -1076,4 +1078,6 @@ void fused_hdr_free(fused_hdr_ctx_t *ctx)
     ctx->rejected_flags         = 0;
     ctx->achieved_upscale_flags = 0;
     ctx->achieved_upscale_tail  = 0;
+    ctx->effective_width        = 0;
+    ctx->effective_height       = 0;
 }

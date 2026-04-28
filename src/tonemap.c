@@ -351,7 +351,10 @@ void fused_tonemap_generate_luts(fused_hdr_internal_t *hdr,
         hdr->linear_to_sdr[i] = (uint8_t)clamp_i((int)(V * 255.0 + 0.5), 0, 255);
     }
 
-    fused_log(log_warn, FUSED_LOG_WARN,
+    /* One-time-per-init diagnostic: emitted at INFO level so callback-based
+     * loggers can filter it out without losing real warnings. Stderr/file
+     * targets will see it on every init. */
+    fused_log(log_warn, FUSED_LOG_INFO,
         "funnelcake: tone map LUTs generated - transfer=%s curve=%d "
         "peak=%d target=%d\n",
         (src_transfer == FUSED_TRC_HLG) ? "HLG" : "PQ",

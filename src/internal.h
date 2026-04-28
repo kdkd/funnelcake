@@ -197,6 +197,7 @@ typedef struct {
     fused_kernel_params_t params;
     fused_kernel_fn       kernel_fn;
     int                   has_simd;  /* 1 if a SIMD kernel was selected, 0 = scalar only */
+    int                   src_misaligned_warned; /* per-context one-shot flag for run() */
 } fused_internal_t;
 
 
@@ -444,6 +445,7 @@ typedef struct {
     uint32_t sdr_flags;
     int      tonemap_1x;
     int      is_custom_lut;  /* 1 if using FUSED_TONEMAP_CUSTOM (skip RGB chroma path) */
+    int      src_misaligned_warned; /* per-context one-shot flag for run() */
 } fused_hdr_internal_t;
 
 

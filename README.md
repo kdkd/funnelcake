@@ -493,8 +493,9 @@ fused_scaler_free(&scaler);
 | Other | Scalar | Portable C, no intrinsics |
 
 The scalar fallback is correct on all platforms but significantly slower.
-On hardware without AVX2 or NEON, the library logs a one-time notice to
-stderr at first init.
+On hardware without AVX2 or NEON, the library logs a one-time notice
+through the configured `log_warnings` channel at first init (default:
+stderr).
 
 
 ## HDR10 support

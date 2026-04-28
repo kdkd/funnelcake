@@ -32,6 +32,25 @@ static inline void fused_aligned_free(void *ptr)
 }
 
 /* --------------------------------------------------------------------------
+ * Portability macros
+ *
+ * GCC/Clang ship a few extensions the NEON kernels rely on; MSVC (used for
+ * the Windows ARM64 build) needs equivalents.
+ * -------------------------------------------------------------------------- */
+#if defined(__GNUC__) || defined(__clang__)
+#  define FUSED_HOT          __attribute__((hot))
+#  define FUSED_PREFETCH(p)  __builtin_prefetch(p)
+#else
+#  define FUSED_HOT
+#  if defined(_M_ARM64) || defined(_M_ARM64EC)
+#    include <intrin.h>
+#    define FUSED_PREFETCH(p) __prefetch((const void *)(p))
+#  else
+#    define FUSED_PREFETCH(p) ((void)0)
+#  endif
+#endif
+
+/* --------------------------------------------------------------------------
  * Constants
  * -------------------------------------------------------------------------- */
 
@@ -213,7 +232,7 @@ void fused_kernel_pow2_avx2(const fused_kernel_params_t *p,
                              const uint8_t *src_v);
 #endif /* __x86_64__ */
 
-#if defined(__aarch64__)
+#if defined(__aarch64__) || defined(_M_ARM64)
 /* NEON (aarch64 only) */
 void fused_kernel_thirds_neon(const fused_kernel_params_t *p,
                                const uint8_t *src_y,
@@ -270,7 +289,7 @@ void fused_kernel_pow2_up_avx2(const fused_kernel_params_t *p,
                                const uint8_t *src_v);
 #endif /* __x86_64__ */
 
-#if defined(__aarch64__)
+#if defined(__aarch64__) || defined(_M_ARM64)
 void fused_kernel_upscale_neon(const fused_kernel_params_t *p,
                                const uint8_t *src_y,
                                const uint8_t *src_u,
@@ -456,7 +475,7 @@ void fused_kernel_pow2_hdr_avx2(const fused_hdr_kernel_params_t *p,
                                  const uint16_t *src_v);
 #endif /* __x86_64__ */
 
-#if defined(__aarch64__)
+#if defined(__aarch64__) || defined(_M_ARM64)
 /* NEON (aarch64 only) */
 void fused_kernel_thirds_hdr_neon(const fused_hdr_kernel_params_t *p,
                                    const uint16_t *src_y,
@@ -506,7 +525,7 @@ void fused_kernel_pow2_up_hdr_avx2(const fused_hdr_kernel_params_t *p,
                                    const uint16_t *src_v);
 #endif /* __x86_64__ */
 
-#if defined(__aarch64__)
+#if defined(__aarch64__) || defined(_M_ARM64)
 void fused_kernel_upscale_hdr_neon(const fused_hdr_kernel_params_t *p,
                                    const uint16_t *src_y,
                                    const uint16_t *src_u,

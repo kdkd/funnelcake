@@ -30,7 +30,7 @@
  * as the AVX2 version.
  */
 
-#if defined(__aarch64__)
+#if defined(__aarch64__) || defined(_M_ARM64)
 
 #include "internal.h"
 #include <arm_neon.h>
@@ -230,7 +230,7 @@ static void h_filter_halve(const uint8_t *restrict src,
  * Horizontal: NEON vpaddlq_u8 + vrshrn_n_u16 cascade
  * ----------------------------------------------------------------------- */
 
-static void __attribute__((hot)) scale_plane_pow2_neon(
+static void FUSED_HOT scale_plane_pow2_neon(
     const uint8_t *restrict src,
     int src_w, int src_h, int src_stride,
     uint32_t active_outputs,
@@ -503,7 +503,7 @@ static inline uint8x16_t neon_blend_reg(uint8x16_t a, uint8x16_t b,
 }
 
 
-static void __attribute__((hot)) scale_plane_thirds_neon(
+static void FUSED_HOT scale_plane_thirds_neon(
     const uint8_t *restrict src,
     int src_w, int src_h, int src_stride,
     uint32_t active_outputs,
@@ -573,7 +573,7 @@ static void __attribute__((hot)) scale_plane_thirds_neon(
     int tail_cols   = src_w - tail_start;
 
     /* Deinterleave buffer (stack-allocated, 48 bytes aligned) */
-    uint8_t __attribute__((aligned(16))) chunk_buf[48];
+    _Alignas(16) uint8_t chunk_buf[48];
 
     /* Output row cursors */
     int out_row[4] = { 0, 0, 0, 0 };
@@ -902,7 +902,7 @@ static void __attribute__((hot)) scale_plane_thirds_neon(
  * and half height with the same kernel.
  * ----------------------------------------------------------------------- */
 
-void __attribute__((hot)) fused_kernel_pow2_neon(const fused_kernel_params_t *p,
+void FUSED_HOT fused_kernel_pow2_neon(const fused_kernel_params_t *p,
                             const uint8_t *src_y,
                             const uint8_t *src_u,
                             const uint8_t *src_v)
@@ -956,7 +956,7 @@ void __attribute__((hot)) fused_kernel_pow2_neon(const fused_kernel_params_t *p,
 }
 
 
-void __attribute__((hot)) fused_kernel_thirds_neon(const fused_kernel_params_t *p,
+void FUSED_HOT fused_kernel_thirds_neon(const fused_kernel_params_t *p,
                               const uint8_t *src_y,
                               const uint8_t *src_u,
                               const uint8_t *src_v)

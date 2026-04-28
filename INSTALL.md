@@ -140,7 +140,8 @@ writes `dist/funnelcake-macos-<arch>.tar.gz` containing `libfunnelcake.a`,
 
 To build Windows release archives:
 
-    ./scripts/build-windows.sh
+    ./scripts/build-windows.sh             # bash / MSYS2 / Git Bash
+    scripts\build-windows.ps1              # native PowerShell 5.1+
 
 By default the script builds every Windows target whose toolchain is available.
 MinGW-w64 artifacts contain `libfunnelcake.a`; MSVC artifacts contain
@@ -150,6 +151,7 @@ README, install notes, and `BUILD_INFO`.
 For MinGW-w64 only:
 
     ./scripts/build-windows.sh --mingw
+    scripts\build-windows.ps1 -Mingw
 
 For `x86_64` MinGW, install tools that provide `x86_64-w64-mingw32-gcc` and
 `x86_64-w64-mingw32-ar`. For Windows on ARM64 MinGW, install tools that provide
@@ -159,7 +161,23 @@ For MSVC only, run from a Visual Studio developer shell where `cl.exe` and
 `lib.exe` are in `PATH`:
 
     ./scripts/build-windows.sh --msvc
+    scripts\build-windows.ps1 -Msvc
 
-The MSVC package currently builds the portable scalar static library. The
-MinGW packages use the normal Makefile source selection, including AVX2 on
-`x86_64` and NEON on `aarch64`.
+Both MinGW and MSVC builds use the normal source selection (AVX2 on `x86_64`,
+NEON on `aarch64`/ARM64). The NEON kernels guard on `__aarch64__ || _M_ARM64`,
+so MSVC ARM64 picks up the same SIMD coverage as the MinGW cross-compile.
+
+### Windows ARM64 only
+
+For a Windows-on-ARM64 build without touching the x86_64 paths, use the
+dedicated PowerShell driver:
+
+    scripts\build-windows-arm64.ps1                # MinGW + MSVC, whichever is available
+    scripts\build-windows-arm64.ps1 -Mingw         # cross-compile via aarch64-w64-mingw32-gcc
+    scripts\build-windows-arm64.ps1 -Msvc          # native ARM64 MSVC
+
+The `-Msvc` path requires an "ARM64 Native Tools Command Prompt for VS" or
+an equivalent Developer PowerShell with `VSCMD_ARG_TGT_ARCH=arm64`; the
+script refuses to run if the shell is not configured for ARM64. Both
+artifact layouts mirror `build-windows.ps1`: a per-toolchain `dist/`
+package plus a `.zip.sha256`.

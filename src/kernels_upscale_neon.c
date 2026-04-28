@@ -38,7 +38,7 @@
  *
  */
 
-#if defined(__aarch64__)
+#if defined(__aarch64__) || defined(_M_ARM64)
 
 #include "internal.h"
 #include "upscale_chunk.h"

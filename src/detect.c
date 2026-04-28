@@ -81,20 +81,21 @@ static void detect_x86(void)
 #endif /* __x86_64__ */
 
 
-#if defined(__aarch64__)
+#if defined(__aarch64__) || defined(_M_ARM64)
 
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(_WIN32)
 
 /*
- * On aarch64 macOS (Apple Silicon), NEON is architecturally mandatory and
- * always available. No runtime detection needed.
+ * On aarch64 Apple Silicon and Windows on ARM, NEON (Advanced SIMD) is
+ * architecturally mandatory and always available. No runtime detection
+ * needed - just assert it.
  */
 static void detect_aarch64(void)
 {
     g_caps.has_neon = 1;
 }
 
-#else /* aarch64 Linux (and other non-Apple aarch64) */
+#else /* aarch64 Linux (and other non-Apple, non-Windows aarch64) */
 
 #include <stdio.h>
 #include <string.h>
@@ -126,9 +127,9 @@ static void detect_aarch64(void)
     fclose(f);
 }
 
-#endif /* __APPLE__ */
+#endif /* __APPLE__ || _WIN32 */
 
-#endif /* __aarch64__ */
+#endif /* __aarch64__ || _M_ARM64 */
 
 
 /* --------------------------------------------------------------------------
@@ -140,7 +141,7 @@ const fused_cpu_caps_t *fused_detect_cpu(void)
     if (!g_detected) {
 #if defined(__x86_64__)
         detect_x86();
-#elif defined(__aarch64__)
+#elif defined(__aarch64__) || defined(_M_ARM64)
         detect_aarch64();
 #endif
         g_detected = 1;

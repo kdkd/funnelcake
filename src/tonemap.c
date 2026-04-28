@@ -11,15 +11,11 @@
 #if defined(__x86_64__)
 #include <immintrin.h>
 #endif
-#if defined(__aarch64__)
+#if defined(__aarch64__) || defined(_M_ARM64)
 #include <arm_neon.h>
 #endif
 
-#if defined(__GNUC__) || defined(__clang__)
-#define FUSED_HOT __attribute__((hot))
-#else
-#define FUSED_HOT
-#endif
+/* FUSED_HOT and FUSED_PREFETCH are provided by internal.h. */
 
 
 /* --------------------------------------------------------------------------
@@ -443,7 +439,7 @@ static void tonemap_luma_avx2(const uint8_t *lut_y,
 #endif /* __x86_64__ */
 
 
-#if defined(__aarch64__)
+#if defined(__aarch64__) || defined(_M_ARM64)
 
 /*
  * tonemap_luma_neon - exact LUT tone mapping, 16 pixels per iteration.
@@ -465,7 +461,7 @@ static void tonemap_luma_neon(const uint8_t *lut_y,
         int x = 0;
 
         if (y + 1 < height)
-            __builtin_prefetch(sy + src_y_pitch, 0, 2);
+            FUSED_PREFETCH(sy + src_y_pitch);
 
         for (; x < simd_w; x += 16) {
             uint16x8_t v0 = vandq_u16(vld1q_u16(sy + x),     mask10);
@@ -607,7 +603,7 @@ void fused_tonemap_apply(
             tonemap_luma_avx2(lut_y, src_y, src_y_stride, dst_y, dst_y_stride,
                               width, height);
         } else
-#elif defined(__aarch64__)
+#elif defined(__aarch64__) || defined(_M_ARM64)
         if (fused_detect_cpu()->has_neon) {
             tonemap_luma_neon(lut_y, src_y, src_y_stride, dst_y, dst_y_stride,
                               width, height);
@@ -731,7 +727,7 @@ void fused_tonemap_apply_p010(
             tonemap_luma_avx2(lut_y, src_y, src_y_stride, dst_y, dst_y_stride,
                               width, height);
         } else
-#elif defined(__aarch64__)
+#elif defined(__aarch64__) || defined(_M_ARM64)
         if (fused_detect_cpu()->has_neon) {
             tonemap_luma_neon(lut_y, src_y, src_y_stride, dst_y, dst_y_stride,
                               width, height);

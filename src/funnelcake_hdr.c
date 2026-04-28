@@ -271,7 +271,7 @@ int fused_hdr_init(fused_hdr_ctx_t *ctx)
     fused_hdr_kernel_fn simd_thirds_up_fn = NULL;
     fused_hdr_kernel_fn simd_pow2_up_fn   = NULL;
 
-#if defined(__aarch64__)
+#if defined(__aarch64__) || defined(_M_ARM64)
     if (caps->has_neon) {
         has_simd = 1;
         simd_thirds_fn    = fused_kernel_thirds_hdr_neon;

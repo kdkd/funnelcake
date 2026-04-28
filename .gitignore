@@ -19,3 +19,4 @@ test/samples/
 # Internal design notes and AI planning artifacts - not for distribution
 funnelcake.md
 docs/superpowers/
+.claude/settings.local.json

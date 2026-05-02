@@ -190,6 +190,9 @@ else ifeq ($(UNAME_M),aarch64)
 else ifeq ($(UNAME_M),arm64)
   LIB_SRCS += src/kernels_neon.c src/kernels_hdr_neon.c \
               src/kernels_upscale_neon.c
+else ifeq ($(UNAME_M),riscv64)
+  LIB_SRCS += src/kernels_rvv.c src/kernels_hdr_rvv.c \
+              src/kernels_upscale_rvv.c
 endif
 
 LIB_OBJS = $(LIB_SRCS:.c=.o)
@@ -198,7 +201,8 @@ LIB_OBJS = $(LIB_SRCS:.c=.o)
 TEST_SRCS = test/test_main.c test/test_validation.c test/test_correctness.c \
             test/test_patterns.c test/test_visual.c test/test_bench.c \
             test/test_hdr_validation.c test/test_hdr_correctness.c \
-            test/test_hdr_bench.c test/test_swscale_bench.c
+            test/test_hdr_bench.c test/test_swscale_bench.c \
+            test/test_parity.c
 TEST_OBJS = $(TEST_SRCS:.c=.o)
 
 # Default target
@@ -405,6 +409,18 @@ src/kernels_upscale_avx2.o: src/kernels_upscale_avx2.c
 
 src/kernels_upscale_neon.o: src/kernels_upscale_neon.c
 	$(CC) $(LIB_CFLAGS) -c -o $@ $<
+
+# RVV kernels (riscv64). -march=rv64gcv enables full RVV 1.0 (the V
+# extension); the kernels are written vector-length-agnostic so they run on
+# any V-capable chip.
+src/kernels_rvv.o: src/kernels_rvv.c
+	$(CC) $(LIB_CFLAGS) -march=rv64gcv -c -o $@ $<
+
+src/kernels_hdr_rvv.o: src/kernels_hdr_rvv.c
+	$(CC) $(LIB_CFLAGS) -march=rv64gcv -c -o $@ $<
+
+src/kernels_upscale_rvv.o: src/kernels_upscale_rvv.c
+	$(CC) $(LIB_CFLAGS) -march=rv64gcv -c -o $@ $<
 
 # Test source files use TEST_CFLAGS (O2)
 test/%.o: test/%.c

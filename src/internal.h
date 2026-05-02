@@ -201,6 +201,19 @@ void fused_kernel_pow2_neon(const fused_kernel_params_t *p,
                              const uint8_t *src_v);
 #endif /* __aarch64__ */
 
+#if defined(__riscv) && (__riscv_xlen == 64)
+/* RVV (riscv64 only) */
+void fused_kernel_thirds_rvv(const fused_kernel_params_t *p,
+                              const uint8_t *src_y,
+                              const uint8_t *src_u,
+                              const uint8_t *src_v);
+
+void fused_kernel_pow2_rvv(const fused_kernel_params_t *p,
+                            const uint8_t *src_y,
+                            const uint8_t *src_u,
+                            const uint8_t *src_v);
+#endif /* __riscv */
+
 
 /* --------------------------------------------------------------------------
  * Upscale kernel entry points (SDR)
@@ -261,6 +274,23 @@ void fused_kernel_pow2_up_neon(const fused_kernel_params_t *p,
                                const uint8_t *src_u,
                                const uint8_t *src_v);
 #endif /* __aarch64__ */
+
+#if defined(__riscv) && (__riscv_xlen == 64)
+void fused_kernel_upscale_rvv(const fused_kernel_params_t *p,
+                               const uint8_t *src_y,
+                               const uint8_t *src_u,
+                               const uint8_t *src_v);
+
+void fused_kernel_thirds_up_rvv(const fused_kernel_params_t *p,
+                                 const uint8_t *src_y,
+                                 const uint8_t *src_u,
+                                 const uint8_t *src_v);
+
+void fused_kernel_pow2_up_rvv(const fused_kernel_params_t *p,
+                               const uint8_t *src_y,
+                               const uint8_t *src_u,
+                               const uint8_t *src_v);
+#endif /* __riscv */
 
 
 /* ==========================================================================
@@ -444,6 +474,19 @@ void fused_kernel_pow2_hdr_neon(const fused_hdr_kernel_params_t *p,
                                  const uint16_t *src_v);
 #endif /* __aarch64__ */
 
+#if defined(__riscv) && (__riscv_xlen == 64)
+/* RVV (riscv64 only) */
+void fused_kernel_thirds_hdr_rvv(const fused_hdr_kernel_params_t *p,
+                                  const uint16_t *src_y,
+                                  const uint16_t *src_u,
+                                  const uint16_t *src_v);
+
+void fused_kernel_pow2_hdr_rvv(const fused_hdr_kernel_params_t *p,
+                                const uint16_t *src_y,
+                                const uint16_t *src_u,
+                                const uint16_t *src_v);
+#endif /* __riscv */
+
 
 /* --------------------------------------------------------------------------
  * HDR upscale kernel entry points
@@ -497,6 +540,23 @@ void fused_kernel_pow2_up_hdr_neon(const fused_hdr_kernel_params_t *p,
                                    const uint16_t *src_u,
                                    const uint16_t *src_v);
 #endif /* __aarch64__ */
+
+#if defined(__riscv) && (__riscv_xlen == 64)
+void fused_kernel_upscale_hdr_rvv(const fused_hdr_kernel_params_t *p,
+                                   const uint16_t *src_y,
+                                   const uint16_t *src_u,
+                                   const uint16_t *src_v);
+
+void fused_kernel_thirds_up_hdr_rvv(const fused_hdr_kernel_params_t *p,
+                                     const uint16_t *src_y,
+                                     const uint16_t *src_u,
+                                     const uint16_t *src_v);
+
+void fused_kernel_pow2_up_hdr_rvv(const fused_hdr_kernel_params_t *p,
+                                   const uint16_t *src_y,
+                                   const uint16_t *src_u,
+                                   const uint16_t *src_v);
+#endif /* __riscv */
 
 
 #endif /* FUNNELCAKE_INTERNAL_H */

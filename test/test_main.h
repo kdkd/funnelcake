@@ -72,6 +72,7 @@ extern test_results_t g_results;
 
 void run_validation_tests(void);
 void run_correctness_tests(void);
+void run_parity_tests(void);
 void run_visual_tests(void);
 void run_bench_tests(const char *filter);
 void run_hdr_validation_tests(void);

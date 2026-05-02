@@ -118,6 +118,9 @@ int main(int argc, char *argv[])
 
         printf("\n=== HDR Correctness tests ===\n");
         run_hdr_correctness_tests();
+
+        printf("\n=== Parity tests (scalar vs SIMD) ===\n");
+        run_parity_tests();
     }
 
     if (opts.run_bench || opts.run_bench_sdr) {

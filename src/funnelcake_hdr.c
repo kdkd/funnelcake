@@ -289,13 +289,26 @@ int fused_hdr_init(fused_hdr_ctx_t *ctx)
         simd_thirds_up_fn = fused_kernel_thirds_up_hdr_avx2;
         simd_pow2_up_fn   = fused_kernel_pow2_up_hdr_avx2;
     }
+#elif defined(__riscv) && (__riscv_xlen == 64)
+    if (caps->has_rvv) {
+        has_simd = 1;
+        simd_thirds_fn    = fused_kernel_thirds_hdr_rvv;
+        simd_pow2_fn      = fused_kernel_pow2_hdr_rvv;
+        simd_upscale_fn   = fused_kernel_upscale_hdr_rvv;
+        simd_thirds_up_fn = fused_kernel_thirds_up_hdr_rvv;
+        simd_pow2_up_fn   = fused_kernel_pow2_up_hdr_rvv;
+    }
 #else
     (void)caps;
 #endif
 
     if (!has_simd) {
+        /* See matching block in funnelcake.c for why FUNNELCAKE_FORCE_SCALAR
+         * suppresses this warning. */
         static int g_no_simd_warned = 0;
-        if (!g_no_simd_warned) {
+        const char *force_scalar_env = getenv("FUNNELCAKE_FORCE_SCALAR");
+        int forced_scalar = (force_scalar_env != NULL && force_scalar_env[0] != '\0');
+        if (!g_no_simd_warned && !forced_scalar) {
             g_no_simd_warned = 1;
             fprintf(stderr,
                 "funnelcake-hdr: no SIMD support detected; using scalar kernel\n");

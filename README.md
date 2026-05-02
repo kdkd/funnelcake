@@ -2,10 +2,10 @@
 
 Funnelcake is a fused multi-resolution YUV420 scaler. A single call
 produces up to four downscaled outputs and up to six upscaled outputs
-simultaneously in one pass over the source data, using AVX2 (x86-64) or
-NEON (aarch64) SIMD kernels with a portable scalar fallback. An HDR10
-path handles 10-bit PQ and HLG input with optional built-in tone mapping
-to SDR.
+simultaneously in one pass over the source data, using AVX2 (x86-64),
+NEON (aarch64), or RVV 1.0 (RISC-V) SIMD kernels with a portable scalar
+fallback. An HDR10 path handles 10-bit PQ and HLG input with optional
+built-in tone mapping to SDR.
 
 It is designed for video pipelines that need to derive multiple
 alternate-resolution copies of each frame - thumbnail generation,
@@ -243,6 +243,33 @@ badly with the platform's memory subsystem. Whatever the exact cause,
 Graviton 4 is by a clear margin the deployment target where using
 funnelcake instead of libswscale produces the largest absolute savings
 per core for real-time multi-resolution video pipelines.
+
+### RISC-V (RVV 1.0)
+
+Tested on a SpacemiT K1 (uarch `ky,x60`, sold as the Ky X1 in the
+Orange Pi RV2): full RVV 1.0, VLEN=256, DLEN=128. Kernels are
+vector-length-agnostic, so the same binary should run on any V-capable
+RVV chip; tuning choices (LMUL=1 with manual unrolling) target the X60
+specifically.
+
+| Workload | funnelcake | vs libswscale |
+|---|---|---|
+| 1920×1080 down:1.5x,3x,6x        | 10.7 ms | 20.1× / 13.6× cascade |
+| 3840×2160 down:1.5x,3x,6x,12x    | 51.9 ms | 21.1× / 11.4× cascade |
+| 1920×1080 up:2x                  | 11.1 ms | 38.4× |
+| 1920×1080 down:2x up:2x          | 17.6 ms | 28.9× |
+| 1920×1080 down:1.5x,3x up:2x     | 21.6 ms | 27.1× |
+| 1920×1080 I010 down:1.5x,3x,6x   | 25.6 ms | (no HDR comparison) |
+| 1920×1080 I010 up:2x             | 27.3 ms | (no HDR comparison) |
+
+HDR speedups land roughly half the SDR ratio because 10-bit u16 elements
+halve the per-vector throughput on the X60's 256-bit V unit.
+
+Detection requires the V extension and a non-emulated misaligned-vector
+load path (queried via `riscv_hwprobe`); chips that report SLOW or
+EMULATED for `RISCV_HWPROBE_KEY_MISALIGNED_VECTOR_PERF`, or that
+advertise only the embedded `Zve*` subset, fall back to the scalar
+kernel.
 
 ### A note on the memory wall
 
@@ -490,11 +517,12 @@ fused_scaler_free(&scaler);
 | x86-64 with AVX2 | AVX2 | Detected at runtime via cpuid |
 | x86-64 without AVX2 | Scalar | Broadwell and later all have AVX2 |
 | aarch64 (Apple Silicon, AWS Graviton) | NEON | All aarch64 cores have NEON |
+| riscv64 with RVV 1.0 | RVV | Detected via `riscv_hwprobe`; requires the full V extension and non-emulated misaligned-vector loads |
 | Other | Scalar | Portable C, no intrinsics |
 
 The scalar fallback is correct on all platforms but significantly slower.
-On hardware without AVX2 or NEON, the library logs a one-time notice to
-stderr at first init.
+On hardware without AVX2, NEON, or RVV, the library logs a one-time notice
+to stderr at first init.
 
 
 ## HDR10 support

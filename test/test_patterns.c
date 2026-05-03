@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) 2020-2026 Kevin Day
+ *
+ * SPDX-License-Identifier: BSD-2-Clause-Patent
+ * See LICENSE.md in the project root for full license text.
+ */
+
 #include "test_patterns.h"
 #include <stdlib.h>
 #include <string.h>

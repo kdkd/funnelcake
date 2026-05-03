@@ -610,3 +610,13 @@ fused_hdr_free(&hdr);
 ```
 
 See **[docs/API.md](docs/API.md)** for the full HDR10 API reference.
+
+## License
+
+Copyright (c) 2020-2026 Kevin Day. Licensed under the BSD-2-Clause-Patent license — see [LICENSE.md](LICENSE.md) for the full text.
+
+The core kernels were based off my hand-written assembly that were converted
+to C intrinsics for easier portability and readability. AI was not used for
+the core functionality, kernels or algorithms. I did use AI agents for
+documentation, improving my terrible comments, fixing the build system,
+and writing test cases.

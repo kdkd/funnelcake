@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) 2020-2026 Kevin Day
+ *
+ * SPDX-License-Identifier: BSD-2-Clause-Patent
+ * See LICENSE.md in the project root for full license text.
+ */
+
 /* --------------------------------------------------------------------------
  * kernels_hdr_rvv.c - HDR (10-bit) downscale kernels for RISC-V (RVV 1.0).
  *

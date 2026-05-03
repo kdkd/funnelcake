@@ -16,7 +16,7 @@
  * -------------------------------------------------------------------------- */
 
 #include "internal.h"
-#include <riscv_vector.h>
+#include "kernels_rvv_compat.h"
 
 #if defined(__riscv) && (__riscv_xlen == 64)
 
@@ -37,7 +37,7 @@ static inline void vavg_row_u16(const uint16_t *a, const uint16_t *b,
         size_t vl = __riscv_vsetvl_e16m1(n - x);
         vuint16m1_t va = __riscv_vle16_v_u16m1(a + x, vl);
         vuint16m1_t vb = __riscv_vle16_v_u16m1(b + x, vl);
-        vuint16m1_t vavg = __riscv_vaaddu_vv_u16m1(va, vb, vl);
+        vuint16m1_t vavg = fused_vaaddu_vv_u16m1(va, vb, vl);
         __riscv_vse16_v_u16m1(dst + x, vavg, vl);
         x += vl;
     }
@@ -83,10 +83,8 @@ static inline void vh_filter_3x_row_u16(const uint16_t *src,
     size_t i = 0;
     while (i < dst_n) {
         size_t vl = __riscv_vsetvl_e16m1(dst_n - i);
-        size_t stride = sizeof(uint16_t) * 3;
-        vuint16m1_t a = __riscv_vlse16_v_u16m1(src + 3 * i + 0, stride, vl);
-        vuint16m1_t b = __riscv_vlse16_v_u16m1(src + 3 * i + 1, stride, vl);
-        vuint16m1_t c = __riscv_vlse16_v_u16m1(src + 3 * i + 2, stride, vl);
+        vuint16m1_t a, b, c;
+        fused_load3_u16m1(src + 3 * i, vl, &a, &b, &c);
         vuint16m1_t s = __riscv_vadd_vv_u16m1(a, b, vl);
         s = __riscv_vadd_vv_u16m1(s, c, vl);
         vuint16m1_t r = __riscv_vmulhu_vx_u16m1(s, 21846, vl);
@@ -111,11 +109,8 @@ static inline void vh_filter_1_5x_row_u16(const uint16_t *src,
     size_t i = 0;
     while (i < pairs) {
         size_t vl = __riscv_vsetvl_e16m1(pairs - i);
-        size_t stride3 = sizeof(uint16_t) * 3;
-        size_t stride2 = sizeof(uint16_t) * 2;
-        vuint16m1_t a = __riscv_vlse16_v_u16m1(src + 3 * i + 0, stride3, vl);
-        vuint16m1_t b = __riscv_vlse16_v_u16m1(src + 3 * i + 1, stride3, vl);
-        vuint16m1_t c = __riscv_vlse16_v_u16m1(src + 3 * i + 2, stride3, vl);
+        vuint16m1_t a, b, c;
+        fused_load3_u16m1(src + 3 * i, vl, &a, &b, &c);
 
         /* dst[2i]   = (171*a + 85*b + 128) >> 8 */
         vuint32m2_t s0 = __riscv_vwmulu_vx_u32m2(a, 171, vl);
@@ -129,8 +124,7 @@ static inline void vh_filter_1_5x_row_u16(const uint16_t *src,
         s1 = __riscv_vadd_vx_u32m2(s1, 128, vl);
         vuint16m1_t r1 = __riscv_vnsrl_wx_u16m1(s1, 8, vl);
 
-        __riscv_vsse16_v_u16m1(dst + 2 * i + 0, stride2, r0, vl);
-        __riscv_vsse16_v_u16m1(dst + 2 * i + 1, stride2, r1, vl);
+        fused_store2_u16m1(dst + 2 * i, vl, r0, r1);
         i += vl;
     }
 }
@@ -148,11 +142,9 @@ static inline void vhalve_row_u16(const uint16_t *src, uint16_t *dst, size_t dst
     size_t x = 0;
     while (x < dst_n) {
         size_t vl = __riscv_vsetvl_e16m1(dst_n - x);
-        vuint16m1_t even = __riscv_vlse16_v_u16m1(src + 2 * x + 0,
-                                                   sizeof(uint16_t) * 2, vl);
-        vuint16m1_t odd  = __riscv_vlse16_v_u16m1(src + 2 * x + 1,
-                                                   sizeof(uint16_t) * 2, vl);
-        vuint16m1_t avg  = __riscv_vaaddu_vv_u16m1(even, odd, vl);
+        vuint16m1_t even, odd;
+        fused_load2_u16m1(src + 2 * x, vl, &even, &odd);
+        vuint16m1_t avg = fused_vaaddu_vv_u16m1(even, odd, vl);
         __riscv_vse16_v_u16m1(dst + x, avg, vl);
         x += vl;
     }
@@ -179,11 +171,10 @@ static void p010_deinterleave_uv_rvv(const uint16_t *src_uv,
 
         size_t x = 0;
         size_t n = (size_t)chroma_w;
-        size_t stride_b = sizeof(uint16_t) * 2; /* 4 bytes between same-component samples */
         while (x < n) {
             size_t vl = __riscv_vsetvl_e16m1(n - x);
-            vuint16m1_t u = __riscv_vlse16_v_u16m1(row + 2 * x + 0, stride_b, vl);
-            vuint16m1_t v = __riscv_vlse16_v_u16m1(row + 2 * x + 1, stride_b, vl);
+            vuint16m1_t u, v;
+            fused_load2_u16m1(row + 2 * x, vl, &u, &v);
             __riscv_vse16_v_u16m1(u_row + x, u, vl);
             __riscv_vse16_v_u16m1(v_row + x, v, vl);
             x += vl;
@@ -309,7 +300,7 @@ void fused_kernel_pow2_hdr_rvv(const fused_hdr_kernel_params_t *p,
 {
     static const int bit_pos[4] = { 1, 3, 5, 7 };
 
-    vwrite_csr(RVV_VXRM, 0);
+    FUSED_RVV_SET_VXRM_RNU();
 
     uint16_t *y_planes[4], *u_planes[4], *v_planes[4];
     int y_widths[4], y_strides[4];
@@ -547,7 +538,7 @@ void fused_kernel_thirds_hdr_rvv(const fused_hdr_kernel_params_t *p,
 {
     static const int bit_pos[4] = { 0, 2, 4, 6 };
 
-    vwrite_csr(RVV_VXRM, 0);
+    FUSED_RVV_SET_VXRM_RNU();
 
     uint16_t *y_planes[4], *u_planes[4], *v_planes[4];
     int y_widths[4], y_strides[4];

@@ -70,7 +70,16 @@ LTO ?= 0
 CC_FAMILY_IS_CLANG := $(shell $(CC) --version 2>/dev/null | grep -qi clang && echo 1)
 
 ifeq ($(LTO),1)
-  ifeq ($(CC_FAMILY_IS_CLANG),1)
+  # LTO + RVV intrinsics is currently broken on every GCC we've tested:
+  # GCC 13 lacks target-builtin info during the LTO link, and GCC 14 hits
+  # an internal compiler error in riscv_vector::expand_builtin during the
+  # LTO partition pass.  Auto-disable LTO on riscv64 with a clear notice
+  # rather than letting the user hit the cryptic ICE.  Drop this guard
+  # once a fixed compiler ships and is tested.
+  ifeq ($(UNAME_M),riscv64)
+    $(warning funnelcake: LTO disabled on riscv64 (GCC LTO + RVV intrinsics ICEs in tested versions). Build will use -O3 only.)
+    LTO_CFLAGS =
+  else ifeq ($(CC_FAMILY_IS_CLANG),1)
     LTO_CFLAGS = -flto=thin
   else
     LTO_CFLAGS = -flto=auto
@@ -193,6 +202,12 @@ else ifeq ($(UNAME_M),arm64)
 else ifeq ($(UNAME_M),riscv64)
   LIB_SRCS += src/kernels_rvv.c src/kernels_hdr_rvv.c \
               src/kernels_upscale_rvv.c
+  # LTO link must re-process the RVV intrinsic IR with the V extension
+  # available; otherwise lto1 errors out with "target specific builtin
+  # not available".  Adding -march=rv64gcv to the link line satisfies it
+  # without affecting non-LTO builds (where the link step doesn't touch
+  # the IR at all).
+  LINK_MARCH = -march=rv64gcv
 endif
 
 LIB_OBJS = $(LIB_SRCS:.c=.o)
@@ -216,7 +231,7 @@ libfunnelcake.a: $(LIB_OBJS)
 	$(AR) rcs $@ $^
 
 funnelcake_test: $(TEST_OBJS) libfunnelcake.a
-	$(CC) $(TEST_CFLAGS) $(EXTRA_LDFLAGS) -o $@ $(TEST_OBJS) -L. -lfunnelcake $(LDFLAGS) $(SWSCALE_TEST_LDFLAGS)
+	$(CC) $(TEST_CFLAGS) $(LINK_MARCH) $(EXTRA_LDFLAGS) -o $@ $(TEST_OBJS) -L. -lfunnelcake $(LDFLAGS) $(SWSCALE_TEST_LDFLAGS)
 
 test: funnelcake_test
 	./funnelcake_test

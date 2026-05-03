@@ -18,7 +18,7 @@
  * -------------------------------------------------------------------------- */
 
 #include "internal.h"
-#include <riscv_vector.h>
+#include "kernels_rvv_compat.h"
 
 #if defined(__riscv) && (__riscv_xlen == 64)
 
@@ -41,7 +41,7 @@ static inline void vavg_row_u8_up(const uint8_t *a, const uint8_t *b,
         size_t vl = __riscv_vsetvl_e8m1(n - x);
         vuint8m1_t va = __riscv_vle8_v_u8m1(a + x, vl);
         vuint8m1_t vb = __riscv_vle8_v_u8m1(b + x, vl);
-        vuint8m1_t vavg = __riscv_vaaddu_vv_u8m1(va, vb, vl);
+        vuint8m1_t vavg = fused_vaaddu_vv_u8m1(va, vb, vl);
         __riscv_vse8_v_u8m1(dst + x, vavg, vl);
         x += vl;
     }
@@ -88,9 +88,8 @@ static inline void vup_h_2x_row_u8(const uint8_t *src, int w, uint8_t *dst)
         size_t vl = __riscv_vsetvl_e8m1(main_n - i);
         vuint8m1_t a = __riscv_vle8_v_u8m1(src + i, vl);
         vuint8m1_t b = __riscv_vle8_v_u8m1(src + i + 1, vl);
-        vuint8m1_t avg = __riscv_vaaddu_vv_u8m1(a, b, vl);
-        __riscv_vsse8_v_u8m1(dst + 2 * i + 0, 2, a,   vl);
-        __riscv_vsse8_v_u8m1(dst + 2 * i + 1, 2, avg, vl);
+        vuint8m1_t avg = fused_vaaddu_vv_u8m1(a, b, vl);
+        fused_store2_u8m1(dst + 2 * i, vl, a, avg);
         i += vl;
     }
     if (w > 0) {
@@ -117,8 +116,11 @@ static inline void vup_h_1_5x_row_u8(const uint8_t *src, int w, uint8_t *dst)
     int i = 0;
     while (i < main_pairs) {
         size_t vl = __riscv_vsetvl_e8m1(main_pairs - i);
-        vuint8m1_t a = __riscv_vlse8_v_u8m1(src + 2 * i + 0, 2, vl);
-        vuint8m1_t b = __riscv_vlse8_v_u8m1(src + 2 * i + 1, 2, vl);
+        /* a = src[2i, 2i+2, ...], b = src[2i+1, 2i+3, ...] - perfect vlseg2.
+         * c = src[2i+2, 2i+4, ...] is just a shifted by one pair, so it
+         * stays as a strided load (no segment-op equivalent for that one). */
+        vuint8m1_t a, b;
+        fused_load2_u8m1(src + 2 * i, vl, &a, &b);
         vuint8m1_t c = __riscv_vlse8_v_u8m1(src + 2 * i + 2, 2, vl);
 
         /* dst[3i+1] = (a*85 + b*171 + 128) >> 8 */
@@ -133,9 +135,7 @@ static inline void vup_h_1_5x_row_u8(const uint8_t *src, int w, uint8_t *dst)
         s2 = __riscv_vadd_vx_u16m2(s2, 128, vl);
         vuint8m1_t r2 = __riscv_vnsrl_wx_u8m1(s2, 8, vl);
 
-        __riscv_vsse8_v_u8m1(dst + 3 * i + 0, 3, a,  vl);
-        __riscv_vsse8_v_u8m1(dst + 3 * i + 1, 3, r1, vl);
-        __riscv_vsse8_v_u8m1(dst + 3 * i + 2, 3, r2, vl);
+        fused_store3_u8m1(dst + 3 * i, vl, a, r1, r2);
         i += vl;
     }
 
@@ -302,7 +302,7 @@ void fused_kernel_upscale_rvv(const fused_kernel_params_t *p,
                               const uint8_t *src_u,
                               const uint8_t *src_v)
 {
-    vwrite_csr(RVV_VXRM, 0);
+    FUSED_RVV_SET_VXRM_RNU();
 
     upscale_plane_rvv(p, src_y, p->src_width, p->src_height,
                       p->src_y_stride, 0);
@@ -361,7 +361,7 @@ static inline void vavg_row_u16_up(const uint16_t *a, const uint16_t *b,
         size_t vl = __riscv_vsetvl_e16m1(n - x);
         vuint16m1_t va = __riscv_vle16_v_u16m1(a + x, vl);
         vuint16m1_t vb = __riscv_vle16_v_u16m1(b + x, vl);
-        vuint16m1_t vavg = __riscv_vaaddu_vv_u16m1(va, vb, vl);
+        vuint16m1_t vavg = fused_vaaddu_vv_u16m1(va, vb, vl);
         __riscv_vse16_v_u16m1(dst + x, vavg, vl);
         x += vl;
     }
@@ -395,14 +395,12 @@ static inline void vup_h_2x_row_u16(const uint16_t *src, int w, uint16_t *dst)
 {
     int main_n = w - 1;
     int i = 0;
-    size_t stride2 = sizeof(uint16_t) * 2;
     while (i < main_n) {
         size_t vl = __riscv_vsetvl_e16m1(main_n - i);
         vuint16m1_t a = __riscv_vle16_v_u16m1(src + i, vl);
         vuint16m1_t b = __riscv_vle16_v_u16m1(src + i + 1, vl);
-        vuint16m1_t avg = __riscv_vaaddu_vv_u16m1(a, b, vl);
-        __riscv_vsse16_v_u16m1(dst + 2 * i + 0, stride2, a,   vl);
-        __riscv_vsse16_v_u16m1(dst + 2 * i + 1, stride2, avg, vl);
+        vuint16m1_t avg = fused_vaaddu_vv_u16m1(a, b, vl);
+        fused_store2_u16m1(dst + 2 * i, vl, a, avg);
         i += vl;
     }
     if (w > 0) {
@@ -423,13 +421,12 @@ static inline void vup_h_1_5x_row_u16(const uint16_t *src, int w, uint16_t *dst)
 
     int main_pairs = pairs - 1;
     int i = 0;
-    size_t stride2 = sizeof(uint16_t) * 2;
-    size_t stride3 = sizeof(uint16_t) * 3;
     while (i < main_pairs) {
         size_t vl = __riscv_vsetvl_e16m1(main_pairs - i);
-        vuint16m1_t a = __riscv_vlse16_v_u16m1(src + 2 * i + 0, stride2, vl);
-        vuint16m1_t b = __riscv_vlse16_v_u16m1(src + 2 * i + 1, stride2, vl);
-        vuint16m1_t c = __riscv_vlse16_v_u16m1(src + 2 * i + 2, stride2, vl);
+        vuint16m1_t a, b;
+        fused_load2_u16m1(src + 2 * i, vl, &a, &b);
+        vuint16m1_t c = __riscv_vlse16_v_u16m1(src + 2 * i + 2,
+                                               sizeof(uint16_t) * 2, vl);
 
         vuint32m2_t s1 = __riscv_vwmulu_vx_u32m2(a, 85, vl);
         s1 = __riscv_vwmaccu_vx_u32m2(s1, 171, b, vl);
@@ -441,9 +438,7 @@ static inline void vup_h_1_5x_row_u16(const uint16_t *src, int w, uint16_t *dst)
         s2 = __riscv_vadd_vx_u32m2(s2, 128, vl);
         vuint16m1_t r2 = __riscv_vnsrl_wx_u16m1(s2, 8, vl);
 
-        __riscv_vsse16_v_u16m1(dst + 3 * i + 0, stride3, a,  vl);
-        __riscv_vsse16_v_u16m1(dst + 3 * i + 1, stride3, r1, vl);
-        __riscv_vsse16_v_u16m1(dst + 3 * i + 2, stride3, r2, vl);
+        fused_store3_u16m1(dst + 3 * i, vl, a, r1, r2);
         i += vl;
     }
 
@@ -594,7 +589,7 @@ void fused_kernel_upscale_hdr_rvv(const fused_hdr_kernel_params_t *p,
                                   const uint16_t *src_u,
                                   const uint16_t *src_v)
 {
-    vwrite_csr(RVV_VXRM, 0);
+    FUSED_RVV_SET_VXRM_RNU();
 
     upscale_plane_hdr_rvv(p, src_y, p->src_width, p->src_height,
                           p->src_y_el_stride, 0);

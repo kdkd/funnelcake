@@ -22,7 +22,7 @@
  * -------------------------------------------------------------------------- */
 
 #include "internal.h"
-#include <riscv_vector.h>
+#include "kernels_rvv_compat.h"
 
 #if defined(__riscv) && (__riscv_xlen == 64)
 
@@ -43,7 +43,7 @@ static inline void vavg_row_u8(const uint8_t *rowA,
         size_t vl = __riscv_vsetvl_e8m1(n - x);
         vuint8m1_t va = __riscv_vle8_v_u8m1(rowA + x, vl);
         vuint8m1_t vb = __riscv_vle8_v_u8m1(rowB + x, vl);
-        vuint8m1_t vavg = __riscv_vaaddu_vv_u8m1(va, vb, vl);
+        vuint8m1_t vavg = fused_vaaddu_vv_u8m1(va, vb, vl);
         __riscv_vse8_v_u8m1(dst + x, vavg, vl);
         x += vl;
     }
@@ -69,9 +69,9 @@ static inline void vhalve_row_u8(const uint8_t *src,
     size_t x = 0;
     while (x < dst_n) {
         size_t vl = __riscv_vsetvl_e8m1(dst_n - x);
-        vuint8m1_t even = __riscv_vlse8_v_u8m1(src + 2 * x + 0, 2, vl);
-        vuint8m1_t odd  = __riscv_vlse8_v_u8m1(src + 2 * x + 1, 2, vl);
-        vuint8m1_t avg  = __riscv_vaaddu_vv_u8m1(even, odd, vl);
+        vuint8m1_t even, odd;
+        fused_load2_u8m1(src + 2 * x, vl, &even, &odd);
+        vuint8m1_t avg = fused_vaaddu_vv_u8m1(even, odd, vl);
         __riscv_vse8_v_u8m1(dst + x, avg, vl);
         x += vl;
     }
@@ -121,9 +121,8 @@ static inline void vh_filter_3x_row_u8(const uint8_t *src,
     size_t i = 0;
     while (i < dst_n) {
         size_t vl = __riscv_vsetvl_e8m1(dst_n - i);
-        vuint8m1_t a = __riscv_vlse8_v_u8m1(src + 3 * i + 0, 3, vl);
-        vuint8m1_t b = __riscv_vlse8_v_u8m1(src + 3 * i + 1, 3, vl);
-        vuint8m1_t c = __riscv_vlse8_v_u8m1(src + 3 * i + 2, 3, vl);
+        vuint8m1_t a, b, c;
+        fused_load3_u8m1(src + 3 * i, vl, &a, &b, &c);
         vuint16m2_t s = __riscv_vwaddu_vv_u16m2(a, b, vl);
         s = __riscv_vwaddu_wv_u16m2(s, c, vl);
         vuint16m2_t q = __riscv_vmulhu_vx_u16m2(s, 0x5556, vl);
@@ -153,9 +152,8 @@ static inline void vh_filter_1_5x_row_u8(const uint8_t *src,
     size_t i = 0;
     while (i < pairs) {
         size_t vl = __riscv_vsetvl_e8m1(pairs - i);
-        vuint8m1_t a = __riscv_vlse8_v_u8m1(src + 3 * i + 0, 3, vl);
-        vuint8m1_t b = __riscv_vlse8_v_u8m1(src + 3 * i + 1, 3, vl);
-        vuint8m1_t c = __riscv_vlse8_v_u8m1(src + 3 * i + 2, 3, vl);
+        vuint8m1_t a, b, c;
+        fused_load3_u8m1(src + 3 * i, vl, &a, &b, &c);
 
         /* dst[2i]   = (171*a + 85*b + 128) >> 8 */
         vuint16m2_t s0 = __riscv_vwmulu_vx_u16m2(a, 171, vl);
@@ -169,8 +167,7 @@ static inline void vh_filter_1_5x_row_u8(const uint8_t *src,
         s1 = __riscv_vadd_vx_u16m2(s1, 128, vl);
         vuint8m1_t r1 = __riscv_vnsrl_wx_u8m1(s1, 8, vl);
 
-        __riscv_vsse8_v_u8m1(dst + 2 * i + 0, 2, r0, vl);
-        __riscv_vsse8_v_u8m1(dst + 2 * i + 1, 2, r1, vl);
+        fused_store2_u8m1(dst + 2 * i, vl, r0, r1);
         i += vl;
     }
 }
@@ -303,7 +300,7 @@ void fused_kernel_pow2_rvv(const fused_kernel_params_t *p,
      * scalar avg_u8.  Set once at the top of the kernel - it persists for
      * the whole call.  GCC 13's RVV intrinsic spec puts vxrm in a global
      * CSR (the per-instruction-form arg list arrived in v1.0 / GCC 14). */
-    vwrite_csr(RVV_VXRM, 0);
+    FUSED_RVV_SET_VXRM_RNU();
 
     uint8_t *y_planes[4], *u_planes[4], *v_planes[4];
     int y_widths[4], y_strides[4];
@@ -535,7 +532,7 @@ void fused_kernel_thirds_rvv(const fused_kernel_params_t *p,
 {
     static const int bit_pos[4] = { 0, 2, 4, 6 };
 
-    vwrite_csr(RVV_VXRM, 0);
+    FUSED_RVV_SET_VXRM_RNU();
 
     uint8_t *y_planes[4], *u_planes[4], *v_planes[4];
     int y_widths[4], y_strides[4];

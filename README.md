@@ -254,22 +254,39 @@ specifically.
 
 | Workload | funnelcake | vs libswscale |
 |---|---|---|
-| 1920×1080 down:1.5x,3x,6x        | 10.7 ms | 20.1× / 13.6× cascade |
-| 3840×2160 down:1.5x,3x,6x,12x    | 51.9 ms | 21.1× / 11.4× cascade |
-| 1920×1080 up:2x                  | 11.1 ms | 38.4× |
-| 1920×1080 down:2x up:2x          | 17.6 ms | 28.9× |
-| 1920×1080 down:1.5x,3x up:2x     | 21.6 ms | 27.1× |
-| 1920×1080 I010 down:1.5x,3x,6x   | 25.6 ms | (no HDR comparison) |
-| 1920×1080 I010 up:2x             | 27.3 ms | (no HDR comparison) |
+| 1920×1080 down:1.5x,3x,6x        |  3.9 ms | 55.7× / 37.7× cascade |
+| 3840×2160 down:1.5x,3x,6x,12x    | 41.2 ms | 26.7× / 14.4× cascade |
+| 1920×1080 up:2x                  |  3.3 ms | 128.0× |
+| 1920×1080 down:2x up:2x          |  8.0 ms | 63.4× |
+| 1920×1080 down:1.5x,3x up:2x     |  9.2 ms | 63.9× |
+| 1920×1080 I010 down:1.5x,3x,6x   | 22.2 ms | (no HDR comparison) |
+| 1920×1080 I010 up:2x             |  9.8 ms | (no HDR comparison) |
 
 HDR speedups land roughly half the SDR ratio because 10-bit u16 elements
 halve the per-vector throughput on the X60's 256-bit V unit.
+
+**GCC 14 is strongly recommended on RISC-V.** It ships the v1.0 RVV
+intrinsic spec including `vlseg2`/`vsseg2`/`vlseg3`/`vsseg3` segment
+loads and stores, which the kernels use for every horizontal halve, 3:1
+box average, 1.5x bilinear, and 2x upsample path.  GCC 13 only ships
+v0.11 intrinsics and doesn't expose the segment ops, so the build falls
+back to multiple strided loads/stores per chunk - on the X60 that
+typically costs **2–4× per workload** vs the GCC 14 build.  The Makefile
+detects the older spec at compile time and prints a `#pragma message`
+recommending the upgrade; the build still works either way.  All numbers
+in the table above are GCC 14.
 
 Detection requires the V extension and a non-emulated misaligned-vector
 load path (queried via `riscv_hwprobe`); chips that report SLOW or
 EMULATED for `RISCV_HWPROBE_KEY_MISALIGNED_VECTOR_PERF`, or that
 advertise only the embedded `Zve*` subset, fall back to the scalar
 kernel.
+
+LTO (`make LTO=1`) is auto-disabled on `riscv64`: GCC 13's LTO link
+can't resolve the RVV target builtins, and GCC 14's LTO partition pass
+hits an internal compiler error in `riscv_vector::expand_builtin`.  The
+build emits a `$(warning ...)` notice and continues with `-O3` only.
+Drop the guard once a fixed compiler ships.
 
 ### A note on the memory wall
 

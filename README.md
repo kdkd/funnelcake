@@ -462,6 +462,33 @@ mind on compute-limited x86 targets.
 Each context is independent and not thread-safe. Use one context per thread.
 Concurrent reads from separate contexts on the same source data are safe.
 
+### Performance: huge-page-backed source buffers (Linux)
+
+For workloads that are bandwidth-limited rather than compute-limited (the
+straight 2× upscales on DDR5 systems and the shallow pow2 downscales on
+fast-memory platforms called out in [A note on the memory wall](#a-note-on-the-memory-wall)),
+callers can capture a small additional speedup on Linux by allocating the
+source Y/U/V planes in huge-page-backed memory:
+
+```c
+#include <sys/mman.h>
+
+void *plane = NULL;
+posix_memalign(&plane, 32, plane_size);
+if (plane_size >= 2 * 1024 * 1024) {
+    madvise(plane, plane_size, MADV_HUGEPAGE);
+}
+```
+
+This reduces TLB pressure across the streaming row-strided read pattern and
+lets the L2 hardware prefetcher (which resets at 4 KB page boundaries on
+Intel and AMD) run uninterrupted across the source plane. The library
+already applies the same hint internally to its own large output planes at
+init, so this extension covers only the caller-owned source planes that
+the library cannot allocate. The hint is a no-op on systems with
+`transparent_hugepage=never` and is unnecessary or unavailable on non-Linux
+platforms.
+
 
 ## Getting started
 

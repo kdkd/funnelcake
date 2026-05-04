@@ -411,9 +411,9 @@ int fused_hdr_init(fused_hdr_ctx_t *ctx)
             int uv_stride = stride_for_hdr(chroma_w);
 
             void *py = NULL, *pu = NULL, *pv = NULL;
-            if (posix_memalign(&py, 32, (size_t)y_stride  * (size_t)out_h)     != 0 ||
-                posix_memalign(&pu, 32, (size_t)uv_stride * (size_t)chroma_h)  != 0 ||
-                posix_memalign(&pv, 32, (size_t)uv_stride * (size_t)chroma_h)  != 0) {
+            if (fused_alloc_aligned(&py, 32, (size_t)y_stride  * (size_t)out_h)     != 0 ||
+                fused_alloc_aligned(&pu, 32, (size_t)uv_stride * (size_t)chroma_h)  != 0 ||
+                fused_alloc_aligned(&pv, 32, (size_t)uv_stride * (size_t)chroma_h)  != 0) {
                 free(py); free(pu); free(pv);
                 fused_log(&ctx->log_warnings, FUSED_LOG_WARN,
                     "funnelcake-hdr: %s rejected: out-of-memory allocating HDR output planes\n",
@@ -440,9 +440,9 @@ int fused_hdr_init(fused_hdr_ctx_t *ctx)
             int uv_stride = stride_for(chroma_w);
 
             void *py = NULL, *pu = NULL, *pv = NULL;
-            if (posix_memalign(&py, 32, (size_t)y_stride  * (size_t)out_h)     != 0 ||
-                posix_memalign(&pu, 32, (size_t)uv_stride * (size_t)chroma_h)  != 0 ||
-                posix_memalign(&pv, 32, (size_t)uv_stride * (size_t)chroma_h)  != 0) {
+            if (fused_alloc_aligned(&py, 32, (size_t)y_stride  * (size_t)out_h)     != 0 ||
+                fused_alloc_aligned(&pu, 32, (size_t)uv_stride * (size_t)chroma_h)  != 0 ||
+                fused_alloc_aligned(&pv, 32, (size_t)uv_stride * (size_t)chroma_h)  != 0) {
                 free(py); free(pu); free(pv);
                 fused_log(&ctx->log_warnings, FUSED_LOG_WARN,
                     "funnelcake-hdr: %s rejected: out-of-memory allocating SDR output planes\n",
@@ -477,9 +477,9 @@ int fused_hdr_init(fused_hdr_ctx_t *ctx)
                 int hdr_uv_stride = stride_for_hdr(chroma_w);
 
                 void *ty = NULL, *tu = NULL, *tv = NULL;
-                if (posix_memalign(&ty, 32, (size_t)hdr_y_stride  * (size_t)out_h)    != 0 ||
-                    posix_memalign(&tu, 32, (size_t)hdr_uv_stride * (size_t)chroma_h) != 0 ||
-                    posix_memalign(&tv, 32, (size_t)hdr_uv_stride * (size_t)chroma_h) != 0) {
+                if (fused_alloc_aligned(&ty, 32, (size_t)hdr_y_stride  * (size_t)out_h)    != 0 ||
+                    fused_alloc_aligned(&tu, 32, (size_t)hdr_uv_stride * (size_t)chroma_h) != 0 ||
+                    fused_alloc_aligned(&tv, 32, (size_t)hdr_uv_stride * (size_t)chroma_h) != 0) {
                     free(ty); free(tu); free(tv);
                     /* Roll back SDR allocation for this step */
                     free(ctx->sdr_outputs[i].plane_y);
@@ -537,9 +537,9 @@ int fused_hdr_init(fused_hdr_ctx_t *ctx)
         int chroma_h  = up_h / 2;
 
         void *py = NULL, *pu = NULL, *pv = NULL;
-        if (posix_memalign(&py, 32, (size_t)y_stride  * (size_t)up_h)   != 0 ||
-            posix_memalign(&pu, 32, (size_t)uv_stride * (size_t)chroma_h) != 0 ||
-            posix_memalign(&pv, 32, (size_t)uv_stride * (size_t)chroma_h) != 0) {
+        if (fused_alloc_aligned(&py, 32, (size_t)y_stride  * (size_t)up_h)   != 0 ||
+            fused_alloc_aligned(&pu, 32, (size_t)uv_stride * (size_t)chroma_h) != 0 ||
+            fused_alloc_aligned(&pv, 32, (size_t)uv_stride * (size_t)chroma_h) != 0) {
             free(py); free(pu); free(pv);
             fused_log(&ctx->log_warnings, FUSED_LOG_WARN,
                 "funnelcake-hdr: upscale level %dx rejected: out-of-memory\n",
@@ -604,9 +604,9 @@ int fused_hdr_init(fused_hdr_ctx_t *ctx)
         int chroma_h    = tail_h / 2;
 
         void *py = NULL, *pu = NULL, *pv = NULL;
-        if (posix_memalign(&py, 32, (size_t)y_stride  * (size_t)tail_h)   != 0 ||
-            posix_memalign(&pu, 32, (size_t)uv_stride * (size_t)chroma_h) != 0 ||
-            posix_memalign(&pv, 32, (size_t)uv_stride * (size_t)chroma_h) != 0) {
+        if (fused_alloc_aligned(&py, 32, (size_t)y_stride  * (size_t)tail_h)   != 0 ||
+            fused_alloc_aligned(&pu, 32, (size_t)uv_stride * (size_t)chroma_h) != 0 ||
+            fused_alloc_aligned(&pv, 32, (size_t)uv_stride * (size_t)chroma_h) != 0) {
             free(py); free(pu); free(pv);
             fused_log(&ctx->log_warnings, FUSED_LOG_WARN,
                 "funnelcake-hdr: upscale 1.5x tail rejected: out-of-memory\n");
@@ -665,9 +665,9 @@ hdr_tail_done:
         int chroma_h  = eff_h / 2;
 
         void *py = NULL, *pu = NULL, *pv = NULL;
-        if (posix_memalign(&py, 32, (size_t)y_stride  * (size_t)eff_h)    != 0 ||
-            posix_memalign(&pu, 32, (size_t)uv_stride * (size_t)chroma_h) != 0 ||
-            posix_memalign(&pv, 32, (size_t)uv_stride * (size_t)chroma_h) != 0) {
+        if (fused_alloc_aligned(&py, 32, (size_t)y_stride  * (size_t)eff_h)    != 0 ||
+            fused_alloc_aligned(&pu, 32, (size_t)uv_stride * (size_t)chroma_h) != 0 ||
+            fused_alloc_aligned(&pv, 32, (size_t)uv_stride * (size_t)chroma_h) != 0) {
             free(py); free(pu); free(pv);
             fused_hdr_free(ctx);
             free(state);

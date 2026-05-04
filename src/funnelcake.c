@@ -353,9 +353,9 @@ int fused_scaler_init(fused_scaler_ctx_t *ctx)
         int chroma_h  = out_h / 2;
 
         void *py = NULL, *pu = NULL, *pv = NULL;
-        if (posix_memalign(&py, 32, (size_t)y_stride  * (size_t)out_h)  != 0 ||
-            posix_memalign(&pu, 32, (size_t)uv_stride * (size_t)chroma_h) != 0 ||
-            posix_memalign(&pv, 32, (size_t)uv_stride * (size_t)chroma_h) != 0) {
+        if (fused_alloc_aligned(&py, 32, (size_t)y_stride  * (size_t)out_h)  != 0 ||
+            fused_alloc_aligned(&pu, 32, (size_t)uv_stride * (size_t)chroma_h) != 0 ||
+            fused_alloc_aligned(&pv, 32, (size_t)uv_stride * (size_t)chroma_h) != 0) {
             /* Allocation failure - free what we got and reject this step */
             free(py); free(pu); free(pv);
             fused_log(&ctx->log_warnings, FUSED_LOG_WARN,
@@ -418,9 +418,9 @@ int fused_scaler_init(fused_scaler_ctx_t *ctx)
         int chroma_h  = up_h / 2;
 
         void *py = NULL, *pu = NULL, *pv = NULL;
-        if (posix_memalign(&py, 32, (size_t)y_stride  * (size_t)up_h)   != 0 ||
-            posix_memalign(&pu, 32, (size_t)uv_stride * (size_t)chroma_h) != 0 ||
-            posix_memalign(&pv, 32, (size_t)uv_stride * (size_t)chroma_h) != 0) {
+        if (fused_alloc_aligned(&py, 32, (size_t)y_stride  * (size_t)up_h)   != 0 ||
+            fused_alloc_aligned(&pu, 32, (size_t)uv_stride * (size_t)chroma_h) != 0 ||
+            fused_alloc_aligned(&pv, 32, (size_t)uv_stride * (size_t)chroma_h) != 0) {
             free(py); free(pu); free(pv);
             fused_log(&ctx->log_warnings, FUSED_LOG_WARN,
                 "funnelcake: upscale level %dx rejected: out-of-memory\n",
@@ -490,9 +490,9 @@ int fused_scaler_init(fused_scaler_ctx_t *ctx)
         int chroma_h    = tail_h / 2;
 
         void *py = NULL, *pu = NULL, *pv = NULL;
-        if (posix_memalign(&py, 32, (size_t)y_stride  * (size_t)tail_h)   != 0 ||
-            posix_memalign(&pu, 32, (size_t)uv_stride * (size_t)chroma_h) != 0 ||
-            posix_memalign(&pv, 32, (size_t)uv_stride * (size_t)chroma_h) != 0) {
+        if (fused_alloc_aligned(&py, 32, (size_t)y_stride  * (size_t)tail_h)   != 0 ||
+            fused_alloc_aligned(&pu, 32, (size_t)uv_stride * (size_t)chroma_h) != 0 ||
+            fused_alloc_aligned(&pv, 32, (size_t)uv_stride * (size_t)chroma_h) != 0) {
             free(py); free(pu); free(pv);
             fused_log(&ctx->log_warnings, FUSED_LOG_WARN,
                 "funnelcake: upscale 1.5x tail rejected: out-of-memory\n");

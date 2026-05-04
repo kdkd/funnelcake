@@ -12,6 +12,10 @@
 #include "funnelcake.h"
 
 #include <stddef.h>
+#include <stdlib.h>     /* posix_memalign */
+#if defined(__linux__)
+#  include <sys/mman.h> /* madvise, MADV_HUGEPAGE */
+#endif
 
 /* --------------------------------------------------------------------------
  * Constants
@@ -19,6 +23,30 @@
 
 /* Maximum number of simultaneous output steps */
 #define FUSED_MAX_STEPS     8
+
+/* Allocations at or above this size get a transparent-huge-page hint
+ * (madvise(MADV_HUGEPAGE)) on Linux.  Output planes large enough to span
+ * the L1 dTLB and benefit from uninterrupted hardware-prefetch streams
+ * across page boundaries cross this threshold; smaller buffers (chroma
+ * planes of deep cascades, scratch pools) sit below it and would only
+ * waste memory if rounded up to a 2 MB huge page. */
+#define FUSED_THP_HINT_THRESHOLD ((size_t)(2 * 1024 * 1024))
+
+/* posix_memalign + size-gated MADV_HUGEPAGE hint.  The madvise call is
+ * a hint: kernels with transparent_hugepage=never silently ignore it,
+ * and on non-Linux platforms the call is compiled out entirely.  The
+ * underlying allocation is a normal heap pointer that free()s normally. */
+static inline int fused_alloc_aligned(void **out, size_t alignment, size_t size)
+{
+    int rc = posix_memalign(out, alignment, size);
+    if (rc != 0) return rc;
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+    if (size >= FUSED_THP_HINT_THRESHOLD) {
+        (void)madvise(*out, size, MADV_HUGEPAGE);
+    }
+#endif
+    return rc;
+}
 
 /* Scratch pool bump allocator.  Kernels that need several internal
  * scratch buffers carve them out of a single persistent pool allocated

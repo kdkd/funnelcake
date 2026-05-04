@@ -103,6 +103,26 @@ static void detect_aarch64(void)
     g_caps.has_neon = 1;
 }
 
+#elif defined(__FreeBSD__)
+
+#include <sys/auxv.h>
+#include <machine/elf.h>
+
+/*
+ * On FreeBSD aarch64, query AT_HWCAP via elf_aux_info() (analogous to
+ * Linux's getauxval). HWCAP_ASIMD indicates Advanced SIMD (NEON-equivalent).
+ */
+static void detect_aarch64(void)
+{
+    unsigned long hwcap = 0;
+    if (elf_aux_info(AT_HWCAP, &hwcap, sizeof(hwcap)) != 0) {
+        return;
+    }
+    if (hwcap & HWCAP_ASIMD) {
+        g_caps.has_neon = 1;
+    }
+}
+
 #else /* aarch64 Linux (and other non-Apple aarch64) */
 
 #include <stdio.h>

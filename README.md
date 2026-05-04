@@ -554,14 +554,69 @@ fused_scaler_free(&scaler);
 ```
 
 
+## Releases
+
+### Cutting a new release
+
+1. Update `VERSION` at the top of the [Makefile](Makefile) (single source of
+   truth — `funnelcake.pc` and the FreeBSD port pull from it).
+2. If the public ABI changed in a backward-incompatible way, also bump
+   `SOVERSION` in the Makefile. This drives the installed `libfunnelcake.so.N`
+   suffix; downstream packages will need to be rebuilt against the new
+   major.
+3. Commit the version bump, then tag:
+   ```
+   git tag -a v0.1.0 -m "Release 0.1.0"
+   git push origin v0.1.0
+   ```
+4. GitHub auto-generates a tarball at
+   `https://github.com/<owner>/funnelcake/archive/refs/tags/v0.1.0.tar.gz`
+   that the FreeBSD port consumes via `USE_GITHUB`.
+
+### Building and submitting the FreeBSD port
+
+A port skeleton lives in [scripts/freebsd/](scripts/freebsd/). To exercise
+or update the port locally:
+
+```sh
+# 1. Copy the skeleton into your ports tree.
+sudo mkdir -p /usr/ports/multimedia/funnelcake
+sudo cp scripts/freebsd/Makefile scripts/freebsd/pkg-descr \
+        scripts/freebsd/pkg-plist /usr/ports/multimedia/funnelcake/
+
+# 2. Update DISTVERSION in the port Makefile to match the upstream tag.
+
+# 3. Generate the distfile checksum:
+cd /usr/ports/multimedia/funnelcake
+sudo make makesum
+
+# 4. Lint, build, install, and verify the packaging list. BATCH=yes skips
+#    the interactive options-config dialog (which hangs over a non-TTY
+#    SSH session if you have OPTIONS_DEFINE knobs):
+sudo make BATCH=yes stage check-plist
+sudo make BATCH=yes package
+sudo pkg add work/pkg/funnelcake-*.pkg
+
+# 5. Run the official lint pass (portaudit-equivalent):
+sudo portlint -A
+```
+
+Once the port builds and lints cleanly, submit it as a bug report against
+the FreeBSD ports tree per the
+[Porter's Handbook §3.7](https://docs.freebsd.org/en/books/porters-handbook/book/#porting-submitting).
+The optional `FFMPEG` knob pulls in `multimedia/ffmpeg` for the swscale
+benchmark comparison; without it the library and headers install but
+`fetch-samples` / `bench-swscale` are unavailable at runtime.
+
+
 ## Platform support
 
 | Platform | SIMD | Notes |
 |----------|------|-------|
-| x86-64 with AVX2 | AVX2 | Detected at runtime via cpuid |
+| x86-64 with AVX2 (Linux, macOS, FreeBSD) | AVX2 | Detected at runtime via cpuid |
 | x86-64 without AVX2 | Scalar | Broadwell and later all have AVX2 |
-| aarch64 (Apple Silicon, AWS Graviton) | NEON | All aarch64 cores have NEON |
-| riscv64 with RVV 1.0 | RVV | Detected via `riscv_hwprobe`; requires the full V extension and non-emulated misaligned-vector loads |
+| aarch64 (Apple Silicon, AWS Graviton, FreeBSD/arm64) | NEON | All aarch64 cores have NEON |
+| riscv64 with RVV 1.0 (Linux) | RVV | Detected via `riscv_hwprobe`; requires the full V extension and non-emulated misaligned-vector loads |
 | Other | Scalar | Portable C, no intrinsics |
 
 The scalar fallback is correct on all platforms but significantly slower.

@@ -15,6 +15,42 @@ TEST_OPT = -O2
 UNAME_M := $(shell uname -m)
 UNAME_S := $(shell uname -s)
 
+# Normalize FreeBSD's "amd64" to "x86_64" so the SIMD-selection blocks
+# below match. FreeBSD/arm64 already reports "aarch64".
+ifeq ($(UNAME_S),FreeBSD)
+  ifeq ($(UNAME_M),amd64)
+    UNAME_M := x86_64
+  endif
+endif
+
+# --- Versioning and install layout ---
+# VERSION is the project version string used in funnelcake.pc and elsewhere.
+# Bump this whenever you cut a release (see README.md, "Release process").
+VERSION    ?= 0.1.0
+
+# SOVERSION is the shared-library major version. Bump only on ABI breaks.
+SOVERSION  ?= 1
+
+# Install destinations (overridable from the command line / port Makefile).
+PREFIX     ?= /usr/local
+LIBDIR     ?= $(PREFIX)/lib
+INCLUDEDIR ?= $(PREFIX)/include
+# FreeBSD ports use $(PREFIX)/libdata/pkgconfig; Linux distros use lib/pkgconfig.
+# Default to lib/pkgconfig; the FreeBSD port Makefile overrides it.
+PKGCONFDIR ?= $(LIBDIR)/pkgconfig
+INSTALL    ?= install
+
+# Shared-library naming and link flags differ between Darwin and ELF systems.
+ifeq ($(UNAME_S),Darwin)
+  SHLIB         = libfunnelcake.$(SOVERSION).dylib
+  SHLIB_LINK    = libfunnelcake.dylib
+  SHLIB_LDFLAGS = -dynamiclib -install_name $(LIBDIR)/$(SHLIB)
+else
+  SHLIB         = libfunnelcake.so.$(SOVERSION)
+  SHLIB_LINK    = libfunnelcake.so
+  SHLIB_LDFLAGS = -shared -Wl,-soname,$(SHLIB)
+endif
+
 # --- Tuning options ---
 
 # SCALAR_ARCH: controls -march for kernels_scalar.c only
@@ -221,7 +257,7 @@ TEST_SRCS = test/test_main.c test/test_validation.c test/test_correctness.c \
 TEST_OBJS = $(TEST_SRCS:.c=.o)
 
 # Default target
-.PHONY: all lib test bench bench-sdr bench-hdr bench-swscale visual fetch-samples clean pgo pgo-clean
+.PHONY: all lib shared test bench bench-sdr bench-hdr bench-swscale visual fetch-samples clean pgo pgo-clean install
 
 all: lib
 
@@ -229,6 +265,38 @@ lib: libfunnelcake.a
 
 libfunnelcake.a: $(LIB_OBJS)
 	$(AR) rcs $@ $^
+
+# Shared library (built on demand, e.g. for `make install`). The library
+# objects are already compiled with -fPIC, so they can be reused as-is.
+shared: $(SHLIB)
+
+$(SHLIB): $(LIB_OBJS)
+	$(CC) $(SHLIB_LDFLAGS) $(LINK_MARCH) -o $@ $^ $(LDFLAGS)
+
+# pkg-config file generated at build time so that downstream consumers
+# can do `pkg-config --cflags --libs funnelcake`.
+funnelcake.pc:
+	@echo 'prefix=$(PREFIX)'                              >  $@
+	@echo 'exec_prefix=$${prefix}'                        >> $@
+	@echo 'libdir=$(LIBDIR)'                              >> $@
+	@echo 'includedir=$(INCLUDEDIR)'                      >> $@
+	@echo ''                                              >> $@
+	@echo 'Name: funnelcake'                              >> $@
+	@echo 'Description: SIMD YUV scaler with HDR/SDR tonemapping' >> $@
+	@echo 'Version: $(VERSION)'                           >> $@
+	@echo 'Cflags: -I$${includedir}'                      >> $@
+	@echo 'Libs: -L$${libdir} -lfunnelcake'               >> $@
+	@echo 'Libs.private: -lm'                             >> $@
+
+install: lib shared funnelcake.pc
+	$(INSTALL) -d $(DESTDIR)$(LIBDIR)
+	$(INSTALL) -d $(DESTDIR)$(INCLUDEDIR)
+	$(INSTALL) -d $(DESTDIR)$(PKGCONFDIR)
+	$(INSTALL) -m 644 libfunnelcake.a $(DESTDIR)$(LIBDIR)/
+	$(INSTALL) -m 755 $(SHLIB) $(DESTDIR)$(LIBDIR)/
+	ln -sf $(SHLIB) $(DESTDIR)$(LIBDIR)/$(SHLIB_LINK)
+	$(INSTALL) -m 644 include/funnelcake.h $(DESTDIR)$(INCLUDEDIR)/
+	$(INSTALL) -m 644 funnelcake.pc $(DESTDIR)$(PKGCONFDIR)/
 
 funnelcake_test: $(TEST_OBJS) libfunnelcake.a
 	$(CC) $(TEST_CFLAGS) $(LINK_MARCH) $(EXTRA_LDFLAGS) -o $@ $(TEST_OBJS) -L. -lfunnelcake $(LDFLAGS) $(SWSCALE_TEST_LDFLAGS)
@@ -343,6 +411,8 @@ fetch-samples:
 
 clean:
 	rm -f $(LIB_OBJS) $(TEST_OBJS) libfunnelcake.a funnelcake_test
+	rm -f libfunnelcake.so libfunnelcake.so.* libfunnelcake.*.dylib libfunnelcake.dylib
+	rm -f funnelcake.pc
 	rm -f src/*.gcda test/*.gcda
 	rm -f src/*.profraw default.profdata
 	rm -rf output/*

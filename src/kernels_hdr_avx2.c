@@ -17,8 +17,7 @@
  *
  * Adapted from the 8-bit kernels_avx2.c.  Key differences:
  *   - Each YMM register holds 16 uint16_t elements (not 32 uint8_t).
- *   - There is NO _mm256_avg_epu16 intrinsic in AVX2, so pairwise
- *     averaging is implemented manually: (a + b + 1) >> 1.
+ *   - Pairwise averaging uses _mm256_avg_epu16 (AVX2): (a + b + 1) >> 1.
  *   - Bilinear blends require widening to 32-bit because 1023 * 171
  *     = 174,933 overflows uint16_t.
  *   - Deinterleave shuffle tables operate on 2-byte elements instead
@@ -41,7 +40,7 @@
  * ----------------------------------------------------------------------- */
 
 /* avg_u16: rounded average of two uint16 values, (a+b+1)>>1.
- * Matches the manual AVX2 implementation below.  For 10-bit values
+ * Matches _mm256_avg_epu16 used in the vector path.  For 10-bit values
  * (max 1023), a+b+1 max = 2047 which fits in uint16_t. */
 static inline uint16_t avg_u16(uint16_t a, uint16_t b)
 {
@@ -111,20 +110,15 @@ static void h_filter_halve_hdr(
 /* -----------------------------------------------------------------------
  * AVX2 pairwise average for uint16_t
  *
- * AVX2 provides _mm256_avg_epu8 for 8-bit pairwise averaging but has
- * NO corresponding _mm256_avg_epu16 intrinsic.  We implement the
- * equivalent manually: (a + b + 1) >> 1.
- *
- * For 10-bit values (max 1023), a + b + 1 = max 2047, which fits in
- * uint16_t without overflow, so we can use simple 16-bit add + shift
- * without widening to 32-bit.
+ * AVX2 provides _mm256_avg_epu16 directly (Haswell+); it computes
+ * (a + b + 1) >> 1 per element, which is exactly what we need for the
+ * vertical pairwise averages.  This wrapper exists only as a named
+ * shorthand to keep call sites symmetric with the 8-bit kernel.
  * ----------------------------------------------------------------------- */
 
 static inline __m256i avx2_avg_u16(__m256i a, __m256i b)
 {
-    __m256i sum = _mm256_add_epi16(a, b);
-    __m256i one = _mm256_set1_epi16(1);
-    return _mm256_srli_epi16(_mm256_add_epi16(sum, one), 1);
+    return _mm256_avg_epu16(a, b);
 }
 
 
@@ -816,8 +810,7 @@ static void __attribute__((hot)) scale_plane_thirds_hdr_avx2(
 
             /* --- VERTICAL PAIRWISE AVERAGES ---
              * Average adjacent row pairs: rows 0+1 -> v01, rows 2+3 -> v23,
-             * rows 4+5 -> v45.  Uses manual avg since _mm256_avg_epu16
-             * does not exist in AVX2. */
+             * rows 4+5 -> v45. */
             __m256i v01a = avx2_avg_u16(r0a, r1a);
             __m256i v01b = avx2_avg_u16(r0b, r1b);
             __m256i v01c = avx2_avg_u16(r0c, r1c);

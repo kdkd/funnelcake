@@ -122,13 +122,13 @@ static void scale_plane_pow2(
         vert_rows[k] = group_rows >> (k + 1);  /* 2x: group/2, 4x: group/4, etc. */
         vert_buf[k] = (uint8_t *)fused_scratch_alloc(
             &scratch, (size_t)vert_rows[k] * (size_t)src_w);
-        if (!vert_buf[k]) return;
+        if (!vert_buf[k]) { fused_scratch_exhausted_warn(); return; }
     }
 
     /* Horizontal cascade buffer: we do horizontal halving in-place using a
      * scratch buffer.  Max input width = src_w. */
     uint8_t *h_buf = (uint8_t *)fused_scratch_alloc(&scratch, (size_t)src_w);
-    if (!h_buf) return;
+    if (!h_buf) { fused_scratch_exhausted_warn(); return; }
 
     /* Output row cursor per level */
     int out_row[4] = { 0, 0, 0, 0 };
@@ -363,7 +363,9 @@ static void scale_plane_thirds(
     if (!v01 || !v23 || !v45 || !v3x_0 || !v3x_1 || !v6x ||
         !h_3x_buf || !h_6x_buf ||
         (need_12x && !v6x_prev) || (need_1_5x && !blend_tmp)) {
-        return;  /* scratch pool exhausted - shouldn't happen if init sized correctly */
+        /* scratch pool exhausted - shouldn't happen if init sized correctly */
+        fused_scratch_exhausted_warn();
+        return;
     }
 
     /* Output row cursors */

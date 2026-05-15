@@ -9,7 +9,23 @@
 #include <stdio.h>
 
 #include "log.h"
+#include "internal.h"
 #include "funnelcake.h"
+
+/* Scratch pool exhaustion is an init-time sizing invariant violation: the
+ * pool is sized from the same parameters the kernel uses, so this must never
+ * trigger in correct code. If it does, the affected frame's output is invalid;
+ * emit one loud diagnostic rather than corrupting silently. */
+void fused_scratch_exhausted_warn(void)
+{
+    static int warned = 0;
+    if (!warned) {
+        warned = 1;
+        fprintf(stderr,
+            "funnelcake: internal error: scratch pool exhausted - "
+            "output for this frame is invalid\n");
+    }
+}
 
 void fused_log(const fused_log_config_t *config, int level, const char *fmt, ...)
 {

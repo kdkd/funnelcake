@@ -78,6 +78,11 @@ static inline void *fused_scratch_alloc(fused_scratch_t *s, size_t n)
     return p;
 }
 
+/* Emit a one-time diagnostic when a scratch pool is exhausted. Defined in
+ * log.c. Called by the scalar kernels when fused_scratch_alloc fails - an
+ * init-sizing invariant violation that must never happen in correct code. */
+void fused_scratch_exhausted_warn(void);
+
 /* Kernel family identifiers */
 #define FUSED_FAMILY_THIRDS 0   /* 1.5x/3x/6x/12x - divide-by-3 cascade */
 #define FUSED_FAMILY_POW2   1   /* 2x/4x/8x/16x   - power-of-two cascade */

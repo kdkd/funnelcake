@@ -329,7 +329,10 @@ int fused_scaler_init(fused_scaler_ctx_t *ctx)
 
         /* (c) SIMD chroma width constraint */
         int chroma_w = out_w / 2;
-        int step_fallback = 0;
+        /* Scalar is used for this step if there is no SIMD at all, or if SIMD
+         * exists but the chroma width is misaligned (handled below). Either
+         * way the per-output contract requires fallback to report scalar. */
+        int step_fallback = !has_simd;
 
         if (has_simd && (chroma_w & 31)) {
             if (ctx->options & FUSED_OPT_NO_FALLBACK) {
@@ -436,7 +439,7 @@ int fused_scaler_init(fused_scaler_ctx_t *ctx)
         ctx->upscale_outputs[k].plane_y   = (uint8_t *)py;
         ctx->upscale_outputs[k].plane_u   = (uint8_t *)pu;
         ctx->upscale_outputs[k].plane_v   = (uint8_t *)pv;
-        ctx->upscale_outputs[k].fallback  = 0;
+        ctx->upscale_outputs[k].fallback  = !has_simd;
 
         up_achieved |= (1u << k);
     }
@@ -507,7 +510,7 @@ int fused_scaler_init(fused_scaler_ctx_t *ctx)
         ctx->upscale_outputs[FUSED_UP_IDX_TAIL].plane_y   = (uint8_t *)py;
         ctx->upscale_outputs[FUSED_UP_IDX_TAIL].plane_u   = (uint8_t *)pu;
         ctx->upscale_outputs[FUSED_UP_IDX_TAIL].plane_v   = (uint8_t *)pv;
-        ctx->upscale_outputs[FUSED_UP_IDX_TAIL].fallback  = 0;
+        ctx->upscale_outputs[FUSED_UP_IDX_TAIL].fallback  = !has_simd;
 
         up_achieved_tail = 1;
     }

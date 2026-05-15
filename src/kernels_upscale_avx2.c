@@ -627,6 +627,7 @@ void fused_kernel_upscale_avx2(const fused_kernel_params_t *p,
                        p->src_uv_stride, 1);
     upscale_plane_avx2(p, src_v, p->src_width / 2, p->src_height / 2,
                        p->src_uv_stride, 2);
+    _mm256_zeroupper();
 }
 
 void fused_kernel_thirds_up_avx2(const fused_kernel_params_t *p,
@@ -1113,6 +1114,7 @@ void fused_kernel_upscale_hdr_avx2(const fused_hdr_kernel_params_t *p,
                            p->src_uv_el_stride, 1);
     upscale_plane_hdr_avx2(p, src_v, p->src_width / 2, p->src_height / 2,
                            p->src_uv_el_stride, 2);
+    _mm256_zeroupper();
 }
 
 void fused_kernel_thirds_up_hdr_avx2(const fused_hdr_kernel_params_t *p,

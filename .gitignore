@@ -20,3 +20,5 @@ test/samples/
 funnelcake.md
 docs/superpowers/
 .claude/settings.local.json
+*.profdata
+*.profraw

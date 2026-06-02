@@ -257,7 +257,7 @@ TEST_SRCS = test/test_main.c test/test_validation.c test/test_correctness.c \
 TEST_OBJS = $(TEST_SRCS:.c=.o)
 
 # Default target
-.PHONY: all lib shared test bench bench-sdr bench-hdr bench-swscale visual fetch-samples clean pgo pgo-clean install
+.PHONY: all lib shared test bench bench-sdr bench-hdr bench-swscale visual asm fetch-samples clean pgo pgo-clean install
 
 all: lib
 
@@ -319,6 +319,22 @@ bench-swscale: funnelcake_test
 visual: funnelcake_test
 	@mkdir -p output
 	./funnelcake_test --visual
+
+# --- Assembly inspection ---
+# `make asm` emits annotated assembly for the AVX2 SIMD kernels next to the
+# sources so optimization experiments can inspect codegen (register spills,
+# intrinsic lowering) without rediscovering the compiler invocation. Built at
+# -O3 with the same -mavx2/-mtune flags as the real objects but WITHOUT LTO:
+# `-flto -S` emits pre-link IR, not the final per-function codegen we want to
+# read. Honors TUNE, e.g. `make asm TUNE=native`.
+ASM_CFLAGS = $(CFLAGS_BASE) $(LIB_OPT) $(TUNE_CFLAGS) -mavx2 -S -fverbose-asm
+ASM_SRCS   = src/kernels_avx2.c src/kernels_upscale_avx2.c
+ASM_OUT    = $(ASM_SRCS:.c=.S)
+
+asm: $(ASM_OUT)
+
+$(ASM_OUT): %.S: %.c
+	$(CC) $(ASM_CFLAGS) -o $@ $<
 
 # --- Sample HDR frames for visual testing ---
 # Generates synthetic PQ-encoded 10-bit test frames using ffmpeg.
@@ -415,6 +431,7 @@ clean:
 	rm -f funnelcake.pc
 	rm -f src/*.gcda test/*.gcda
 	rm -f src/*.profraw default.profdata
+	rm -f src/*.S
 	rm -rf output/*
 
 # --- Profile-Guided Optimization ---

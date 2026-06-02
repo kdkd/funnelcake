@@ -157,38 +157,39 @@ static inline void up_vblend_21_row_avx2(const uint8_t *a_row,
                                          int w, uint8_t *out)
 {
     int x = 0;
-    const __m256i w85   = _mm256_set1_epi16(85);
-    const __m256i w171  = _mm256_set1_epi16(171);
-    const __m256i r128  = _mm256_set1_epi16(128);
-    const __m256i zero  = _mm256_setzero_si256();
+    /* maddubs decomposition of out = (85*a + 171*b + 128) >> 8, proven
+     * bit-identical to the scalar up_blend_21_u8 over all 65536 (a,b) pairs.
+     *
+     * vpmaddubsw multiplies UNSIGNED bytes by SIGNED bytes and pair-sums into
+     * i16.  Direct weights {85,171} would overflow i16 (255*85 + 255*171 =
+     * 65280 > 32767), so we use {85,-85}: maddubs(interleave(a,b), {85,-85})
+     * = 85*a - 85*b, always in [-21675, 21675] (no saturation).  The missing
+     * 256*b + 128 term is built for free by interleaving b with a constant
+     * 0x80 low byte: unpack(set1_epi8(0x80), b) = 256*b + 128 per u16 lane.
+     * The sum 85*a + 171*b + 128 is always in [128, 65408] < 65536, so the
+     * mod-2^16 wrap of vpaddw is exact; >>8 then packus completes it. */
+    const __m256i wpair = _mm256_set1_epi16((short)0xAB55); /* bytes {85, -85} */
+    const __m256i half  = _mm256_set1_epi8((char)0x80);     /* builds 256*b+128 */
 
     for (; x + 32 <= w; x += 32) {
         __m256i av = _mm256_loadu_si256((const __m256i *)(a_row + x));
         __m256i bv = _mm256_loadu_si256((const __m256i *)(b_row + x));
 
-        /* Unpack to 16-bit lanes.  AVX2 unpacklo/hi_epi8 operate per
-         * 128-bit lane, so the result layout is not strictly linear; we
-         * pack back to u8 in the same per-lane order and the round trip
-         * preserves linear layout. */
-        __m256i a_lo = _mm256_unpacklo_epi8(av, zero);
-        __m256i a_hi = _mm256_unpackhi_epi8(av, zero);
-        __m256i b_lo = _mm256_unpacklo_epi8(bv, zero);
-        __m256i b_hi = _mm256_unpackhi_epi8(bv, zero);
+        /* Interleave (a,b) per 128-bit lane; maddubs pair-sums each (a_i,b_i)
+         * with {85,-85} into 85*(a_i - b_i). */
+        __m256i ab_lo = _mm256_unpacklo_epi8(av, bv);
+        __m256i ab_hi = _mm256_unpackhi_epi8(av, bv);
+        __m256i m_lo  = _mm256_maddubs_epi16(ab_lo, wpair);
+        __m256i m_hi  = _mm256_maddubs_epi16(ab_hi, wpair);
 
-        __m256i lo = _mm256_add_epi16(
-            _mm256_add_epi16(_mm256_mullo_epi16(a_lo, w85),
-                             _mm256_mullo_epi16(b_lo, w171)),
-            r128);
-        lo = _mm256_srli_epi16(lo, 8);
-        __m256i hi = _mm256_add_epi16(
-            _mm256_add_epi16(_mm256_mullo_epi16(a_hi, w85),
-                             _mm256_mullo_epi16(b_hi, w171)),
-            r128);
-        hi = _mm256_srli_epi16(hi, 8);
+        /* Add 256*b + 128 in matching lanes, then logical >>8. */
+        __m256i lo = _mm256_srli_epi16(
+            _mm256_add_epi16(m_lo, _mm256_unpacklo_epi8(half, bv)), 8);
+        __m256i hi = _mm256_srli_epi16(
+            _mm256_add_epi16(m_hi, _mm256_unpackhi_epi8(half, bv)), 8);
 
-        /* packus_epi16 is also per-lane; lo/hi were produced via
-         * unpacklo/unpackhi of the same av/bv in matching lanes, so the
-         * final pack is linear. */
+        /* packus is per-lane; lo/hi came from unpacklo/hi of the same av/bv
+         * in matching lanes, so the packed result is linear. */
         __m256i packed = _mm256_packus_epi16(lo, hi);
         _mm256_storeu_si256((__m256i *)(out + x), packed);
     }

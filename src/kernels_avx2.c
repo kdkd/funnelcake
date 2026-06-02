@@ -633,13 +633,20 @@ static inline __m256i h_chunk_3x_avx2(__m256i A, __m256i B, __m256i C,
     __m256i zero = _mm256_setzero_si256();
     __m256i magic = _mm256_set1_epi16((short)0x5556);
 
+    /* Sum each (A,B) byte pair with vpmaddubsw, which keeps the work on the
+     * multiply port and off the shuffle port.  maddubs(interleave(A,B), 1)
+     * forms A_i*1 + B_i*1 = A_i + B_i per pair, in [0,510] (well within the
+     * signed 16-bit range, so no saturation; A,B are the unsigned operand and
+     * the constant 1 is the signed operand).  The interleave places those pair
+     * sums in the same lane positions as the zero-extended C below (lane 0
+     * holds indices 0..7 and 16..23, the high half holds 8..15 and 24..31), so
+     * adding the widened C yields the exact A + B + C. */
+    __m256i one = _mm256_set1_epi8(1);
     __m256i sum_lo = _mm256_add_epi16(
-        _mm256_add_epi16(_mm256_unpacklo_epi8(A, zero),
-                         _mm256_unpacklo_epi8(B, zero)),
+        _mm256_maddubs_epi16(_mm256_unpacklo_epi8(A, B), one),
         _mm256_unpacklo_epi8(C, zero));
     __m256i sum_hi = _mm256_add_epi16(
-        _mm256_add_epi16(_mm256_unpackhi_epi8(A, zero),
-                         _mm256_unpackhi_epi8(B, zero)),
+        _mm256_maddubs_epi16(_mm256_unpackhi_epi8(A, B), one),
         _mm256_unpackhi_epi8(C, zero));
 
     __m256i div_lo = _mm256_mulhi_epu16(sum_lo, magic);

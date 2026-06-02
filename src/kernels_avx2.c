@@ -269,6 +269,7 @@ static void h_filter_1_5x(const uint8_t *restrict src, int src_w,
 
 /* Forward declaration - defined after avx2_blend_2_1 below */
 static inline __m128i avx2_halve_32_to_16(__m256i v);
+static inline __m256i avx2_halve_64_to_32(__m256i v0, __m256i v1);
 
 /* Horizontal halve filter (SSE/AVX2): pairwise average.
  * Processes 32 input -> 16 output bytes per AVX2 chunk via the
@@ -280,10 +281,18 @@ static void h_filter_halve(const uint8_t *restrict src,
     int h_chunks = src_bytes / 32;
     int out_x = 0;
 
-    for (int c = 0; c < h_chunks; c++) {
+    int c = 0;
+    #pragma GCC unroll 4
+    for (; c + 1 < h_chunks; c += 2) {
+        __m256i v0 = _mm256_loadu_si256((const __m256i *)(src + c * 32));
+        __m256i v1 = _mm256_loadu_si256((const __m256i *)(src + c * 32 + 32));
+        _mm256_storeu_si256((__m256i *)(dst + out_x),
+                            avx2_halve_64_to_32(v0, v1));
+        out_x += 32;
+    }
+    for (; c < h_chunks; c++) {
         __m256i v = _mm256_loadu_si256((const __m256i *)(src + c * 32));
-        __m128i result = avx2_halve_32_to_16(v);
-        _mm_storeu_si128((__m128i *)(dst + out_x), result);
+        _mm_storeu_si128((__m128i *)(dst + out_x), avx2_halve_32_to_16(v));
         out_x += 16;
     }
 
@@ -410,6 +419,45 @@ static inline __m128i avx2_halve_32_to_16(__m256i v)
 
     /* Use 128-bit pavgb for the average */
     return _mm_avg_epu8(even, odd);
+}
+
+/* -----------------------------------------------------------------------
+ * AVX2 horizontal halving helper (paired, 64 -> 32 bytes)
+ *
+ * Pairwise average of 64 input bytes -> 32 output bytes:
+ *   out[i] = avg(in[2i], in[2i+1]) = (in[2i] + in[2i+1] + 1) >> 1.
+ *
+ * Bit-identical to running avx2_halve_32_to_16 on each 32-byte half, but
+ * trades the shuffle-port heavy vpshufb + vpermq + vextracti128 path
+ * (6 shuffle-port ops per 32 output bytes) for a vpmaddubsw reduction
+ * (2 shuffle-port ops per 32 output bytes) plus a single 256-bit store.
+ *
+ * maddubs(v, set1_epi8(1)) sums each adjacent byte pair exactly: the
+ * products are a*1 + b*1 = a + b in [0, 510], well inside int16 range so
+ * no saturation occurs, matching the even/odd pair separation the
+ * shuffle path performs.  (a + b + 1) >> 1 is exactly vpavgb's rounded
+ * average (see avg_u8).
+ *
+ * maddubs is per-128-bit-lane, so m0 holds out[0..7] in lane 0 and
+ * out[8..15] in lane 1 (linear within itself); m1 holds out[16..23] /
+ * out[24..31].  packus(m0, m1) is also per-lane and yields
+ * [out0-7 | out16-23 | out8-15 | out24-31]; permute4x64(0xD8) restores
+ * the linear [out0-7 | out8-15 | out16-23 | out24-31] order.
+ * ----------------------------------------------------------------------- */
+
+static inline __m256i avx2_halve_64_to_32(__m256i v0, __m256i v1)
+{
+    const __m256i ones8 = _mm256_set1_epi8(1);
+    const __m256i one16 = _mm256_set1_epi16(1);
+
+    __m256i m0 = _mm256_maddubs_epi16(v0, ones8);  /* 16x (a + b), <= 510 */
+    __m256i m1 = _mm256_maddubs_epi16(v1, ones8);
+
+    m0 = _mm256_srli_epi16(_mm256_add_epi16(m0, one16), 1);  /* (a+b+1)>>1 */
+    m1 = _mm256_srli_epi16(_mm256_add_epi16(m1, one16), 1);
+
+    __m256i packed = _mm256_packus_epi16(m0, m1);
+    return _mm256_permute4x64_epi64(packed, 0xD8);
 }
 
 
@@ -640,6 +688,8 @@ static void __attribute__((hot)) scale_plane_pow2_avx2(
     size_t scratch_pool_size)
 {
     (void)dst_heights;
+    (void)dst_widths;  /* the final halving writes results straight to the
+                        * output plane, so this width is not needed here */
 
     static const int bit_pos[4] = { 1, 3, 5, 7 };
 
@@ -728,6 +778,10 @@ static void __attribute__((hot)) scale_plane_pow2_avx2(
             for (int r = 0; r < vert_rows[k]; r++) {
                 const uint8_t *restrict vert_row = vert_buf[k] + (size_t)r * (size_t)src_w;
 
+                /* Output plane row for this reduction level. */
+                uint8_t *restrict out = dst_planes[k]
+                    + (size_t)out_row[k] * (size_t)dst_strides[k];
+
                 /* Horizontal cascade: (k+1) halvings.
                  * Each halving: out[i] = avg(in[2i], in[2i+1]). */
                 int cur_w = src_w;
@@ -738,27 +792,49 @@ static void __attribute__((hot)) scale_plane_pow2_avx2(
                     int h_chunks = cur_w / 32;
                     int out_x = 0;
 
-                    for (int c = 0; c < h_chunks; c++) {
+                    /* The final halving (hstep == k) writes straight to the
+                     * output plane instead of into the h_buf scratch, so this
+                     * level needs no separate copy from scratch into the plane.
+                     * The last step produces exactly the destination width in
+                     * bytes (src_w is divisible by 2^(k+1), guaranteed by the
+                     * exact-division and chroma-alignment checks done at setup),
+                     * and the vector stores stop at h_chunks*16 <= that width,
+                     * so the row padding past the image edge is left untouched.
+                     * Earlier steps (hstep < k) still write to h_buf so they can
+                     * feed the next halving. */
+                    uint8_t *step_dst = (hstep == k) ? out : h_buf;
+
+                    /* Paired halve: 64 -> 32 bytes per iteration using the
+                     * vpmaddubsw helper, which needs fewer shuffle-port ops than
+                     * the single-vector path and does one wide 256-bit store.
+                     * It produces the same bytes as avx2_halve_32_to_16 run on
+                     * each 32-byte half.  The trailing single chunk and scalar
+                     * tail keep the exact same output layout. */
+                    int c = 0;
+                    #pragma GCC unroll 4
+                    for (; c + 1 < h_chunks; c += 2) {
+                        __m256i v0 = _mm256_loadu_si256((const __m256i *)(cur_src + c * 32));
+                        __m256i v1 = _mm256_loadu_si256((const __m256i *)(cur_src + c * 32 + 32));
+                        _mm256_storeu_si256((__m256i *)(step_dst + out_x),
+                                            avx2_halve_64_to_32(v0, v1));
+                        out_x += 32;
+                    }
+                    for (; c < h_chunks; c++) {
                         __m256i v = _mm256_loadu_si256((const __m256i *)(cur_src + c * 32));
-                        __m128i result = avx2_halve_32_to_16(v);
-                        /* Store 16 output bytes */
-                        _mm_storeu_si128((__m128i *)(h_buf + out_x), result);
+                        _mm_storeu_si128((__m128i *)(step_dst + out_x),
+                                         avx2_halve_32_to_16(v));
                         out_x += 16;
                     }
                     /* Scalar tail for remaining bytes */
                     int tail_in = h_chunks * 32;
                     for (int tx = tail_in; tx + 1 < cur_w; tx += 2) {
-                        h_buf[out_x++] = avg_u8(cur_src[tx], cur_src[tx + 1]);
+                        step_dst[out_x++] = avg_u8(cur_src[tx], cur_src[tx + 1]);
                     }
 
                     cur_w = next_w;
-                    cur_src = h_buf;
+                    cur_src = step_dst;
                 }
 
-                /* Write to output plane */
-                uint8_t *restrict out = dst_planes[k]
-                    + (size_t)out_row[k] * (size_t)dst_strides[k];
-                memcpy(out, h_buf, (size_t)dst_widths[k]);
                 out_row[k]++;
             }
         }

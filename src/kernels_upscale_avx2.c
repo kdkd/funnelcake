@@ -118,6 +118,56 @@ static void up_h_2x_row_avx2(const uint8_t *src, int src_w, uint8_t *dst)
 
 
 /* -----------------------------------------------------------------------
+ * Fused vertical 2x average + horizontal doubling for one row.
+ *
+ * Produces the bilinearly-interpolated ("odd") output row of a 2x upscale.
+ * For each 16-byte chunk it computes the vertical average of the two source
+ * rows ((a + b + 1) >> 1) in registers and feeds it straight into the
+ * horizontal doubling, so the averaged row never has to be written to a
+ * scratch buffer and read back.  The horizontal doubling matches
+ * up_h_2x_row_avx2.
+ * ----------------------------------------------------------------------- */
+static void up_h_2x_vblend_row_avx2(const uint8_t *a_row, const uint8_t *b_row,
+                                    int src_w, uint8_t *dst)
+{
+    int x = 0;
+    int full_chunks = src_w / 16;
+
+    for (int c = 0; c < full_chunks; c++) {
+        /* r = vertical average of the two source rows for this 16-byte
+         * chunk. */
+        __m128i r = _mm_avg_epu8(
+            _mm_loadu_si128((const __m128i *)(a_row + x)),
+            _mm_loadu_si128((const __m128i *)(b_row + x)));
+
+        /* Edge byte: the averaged value one column past this chunk, or the
+         * last averaged column replicated at the row end. */
+        uint8_t edge = (x + 16 < src_w)
+                          ? up_avg_u8(a_row[x + 16], b_row[x + 16])
+                          : up_avg_u8(a_row[src_w - 1], b_row[src_w - 1]);
+        __m128i edge_v = _mm_set1_epi8((char)edge);
+        __m128i r_shifted = _mm_alignr_epi8(edge_v, r, 1);
+        __m128i r_mid = _mm_avg_epu8(r, r_shifted);
+
+        __m128i out0 = _mm_unpacklo_epi8(r, r_mid);
+        __m128i out1 = _mm_unpackhi_epi8(r, r_mid);
+
+        _mm_storeu_si128((__m128i *)(dst + 2 * x +  0), out0);
+        _mm_storeu_si128((__m128i *)(dst + 2 * x + 16), out1);
+        x += 16;
+    }
+
+    /* Tail (less than 16 leftover bytes) - scalar. */
+    for (; x < src_w; x++) {
+        uint8_t a = up_avg_u8(a_row[x], b_row[x]);
+        uint8_t b = (x + 1 < src_w) ? up_avg_u8(a_row[x + 1], b_row[x + 1]) : a;
+        dst[2 * x + 0] = a;
+        dst[2 * x + 1] = up_avg_u8(a, b);
+    }
+}
+
+
+/* -----------------------------------------------------------------------
  * Vertical 2x upscale of one plane (with horizontal doubling fused)
  * ----------------------------------------------------------------------- */
 
@@ -133,18 +183,15 @@ static void up_2x_plane_avx2(const uint8_t *src, int src_w, int src_h,
                                     ? src + (size_t)(i + 1) * src_stride
                                     : row_cur;
 
-        int x = 0;
-        for (; x + 32 <= src_w; x += 32) {
-            __m256i a = _mm256_loadu_si256((const __m256i *)(row_cur + x));
-            __m256i b = _mm256_loadu_si256((const __m256i *)(row_nxt + x));
-            _mm256_storeu_si256((__m256i *)(scratch + x), _mm256_avg_epu8(a, b));
-        }
-        for (; x < src_w; x++) {
-            scratch[x] = up_avg_u8(row_cur[x], row_nxt[x]);
-        }
+        /* Even output row: horizontal doubling of the source row directly. */
+        up_h_2x_row_avx2(row_cur, src_w,
+                         dst + (size_t)(2 * i) * dst_stride);
 
-        up_h_2x_row_avx2(row_cur, src_w, dst + (size_t)(2 * i)     * dst_stride);
-        up_h_2x_row_avx2(scratch, src_w, dst + (size_t)(2 * i + 1) * dst_stride);
+        /* Odd output row: the vertical average of (row_cur, row_nxt) is
+         * computed inline and fused with the horizontal doubling, so it does
+         * not need a scratch row between the two steps. */
+        up_h_2x_vblend_row_avx2(row_cur, row_nxt, src_w,
+                                dst + (size_t)(2 * i + 1) * dst_stride);
     }
 }
 

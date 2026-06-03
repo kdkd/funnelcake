@@ -229,6 +229,42 @@ static inline __m128i avx2_halve_16_to_8_hdr(__m256i v)
 
 
 /* -----------------------------------------------------------------------
+ * AVX2 horizontal halving helper for 10-bit, paired: 32 -> 16 samples.
+ *
+ * Averages adjacent pairs from two input YMM (32 uint16_t) into one output
+ * YMM (16 uint16_t):  out[i] = (in[2i] + in[2i+1] + 1) >> 1.
+ *
+ * Separating the even- and odd-indexed samples before averaging would lean
+ * on the shuffle ports (vpshufb / vpermq / vextracti128).  vpmaddwd does the
+ * pairing for free instead: multiplying each 16-bit sample by a constant 1
+ * and summing adjacent products yields in[2i] + in[2i+1] directly, as 32-bit
+ * values.  10-bit inputs (max 1023) stay positive and the pair sum is at most
+ * 2046, so it fits a 32-bit lane with no overflow.  The rounded average
+ * (sum + 1) >> 1 is then a 32-bit add and shift.  This keeps the work off the
+ * shuffle ports and emits a single wide store per 16 outputs.
+ *
+ * vpmaddwd works within each 128-bit lane, so after packus_epi32 the 16
+ * results are grouped by lane rather than in order; permute4x64(0xD8) puts
+ * them back into linear sample order.
+ * ----------------------------------------------------------------------- */
+
+static inline __m256i avx2_halve_32_to_16_hdr(__m256i v0, __m256i v1)
+{
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    const __m256i one32  = _mm256_set1_epi32(1);
+
+    __m256i m0 = _mm256_madd_epi16(v0, ones16);  /* 8x (a + b), <= 2046 */
+    __m256i m1 = _mm256_madd_epi16(v1, ones16);
+
+    m0 = _mm256_srli_epi32(_mm256_add_epi32(m0, one32), 1);  /* (a+b+1)>>1 */
+    m1 = _mm256_srli_epi32(_mm256_add_epi32(m1, one32), 1);
+
+    __m256i packed = _mm256_packus_epi32(m0, m1);
+    return _mm256_permute4x64_epi64(packed, 0xD8);
+}
+
+
+/* -----------------------------------------------------------------------
  * SSE shuffle tables for 10-bit 3-way deinterleave
  *
  * For uint16_t elements, each element is 2 bytes.  Given 48 bytes
@@ -495,6 +531,7 @@ static void __attribute__((hot)) scale_plane_pow2_hdr_avx2(
     size_t scratch_pool_size)
 {
     (void)dst_heights;
+    (void)dst_widths;
 
     /* Convert byte stride to element stride */
     int src_el_stride = src_stride / (int)sizeof(uint16_t);
@@ -604,33 +641,59 @@ static void __attribute__((hot)) scale_plane_pow2_hdr_avx2(
                 int cur_w = src_w;
                 const uint16_t *cur_src = vert_row;
 
+                /* Output plane row this reduction level writes to. */
+                uint16_t *out = dst_planes[k]
+                    + (size_t)out_row[k] * (size_t)dst_el_stride;
+
                 for (int hstep = 0; hstep < (k + 1); hstep++) {
                     int next_w = cur_w >> 1;
-                    /* AVX2: 16 elements per YMM, halve to 8 output elements */
+                    /* Number of whole 16-sample chunks in this row. */
                     int h_chunks = cur_w / 16;
                     int out_x = 0;
 
-                    for (int c = 0; c < h_chunks; c++) {
+                    /* The last halving of the cascade writes straight into the
+                     * output plane; earlier halvings write the scratch row
+                     * h_buf that feeds the next step.  The vector stores stop
+                     * at h_chunks*8 elements, which is at most the destination
+                     * width (src_w is divisible by 2^(k+1), so every step's
+                     * width stays even), so the row padding past the image edge
+                     * is never written.  The unroll keeps enough independent
+                     * pairs in flight to hide the multiply latency of the
+                     * paired halve.  step_dst is deliberately not marked
+                     * restrict: on intermediate steps it is h_buf and overlaps
+                     * cur_src, but each load happens before the store that
+                     * trails it, so writing in place is safe. */
+                    uint16_t *step_dst = (hstep == k) ? out : h_buf;
+
+                    int c = 0;
+                    #pragma GCC unroll 4
+                    for (; c + 1 < h_chunks; c += 2) {
+                        __m256i v0 = _mm256_loadu_si256(
+                            (const __m256i *)(cur_src + c * 16));
+                        __m256i v1 = _mm256_loadu_si256(
+                            (const __m256i *)(cur_src + c * 16 + 16));
+                        _mm256_storeu_si256((__m256i *)(step_dst + out_x),
+                                            avx2_halve_32_to_16_hdr(v0, v1));
+                        out_x += 16;
+                    }
+                    /* Trailing single chunk for an odd chunk count. */
+                    for (; c < h_chunks; c++) {
                         __m256i v = _mm256_loadu_si256(
                             (const __m256i *)(cur_src + c * 16));
                         __m128i result = avx2_halve_16_to_8_hdr(v);
-                        _mm_storeu_si128((__m128i *)(h_buf + out_x), result);
+                        _mm_storeu_si128((__m128i *)(step_dst + out_x), result);
                         out_x += 8;
                     }
                     /* Scalar tail for remaining elements */
                     int tail_in = h_chunks * 16;
                     for (int tx = tail_in; tx + 1 < cur_w; tx += 2) {
-                        h_buf[out_x++] = avg_u16(cur_src[tx], cur_src[tx + 1]);
+                        step_dst[out_x++] = avg_u16(cur_src[tx], cur_src[tx + 1]);
                     }
 
                     cur_w = next_w;
-                    cur_src = h_buf;
+                    cur_src = step_dst;
                 }
 
-                /* Write to output plane */
-                uint16_t *restrict out = dst_planes[k]
-                    + (size_t)out_row[k] * (size_t)dst_el_stride;
-                memcpy(out, h_buf, (size_t)dst_widths[k] * sizeof(uint16_t));
                 out_row[k]++;
             }
         }

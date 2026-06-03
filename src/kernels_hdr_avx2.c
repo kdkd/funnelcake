@@ -134,31 +134,43 @@ static inline __m256i avx2_avg_u16(__m256i a, __m256i b)
  * the packed result is in correct order.
  * ----------------------------------------------------------------------- */
 
-static inline __m256i avx2_blend_2_1_hdr(__m256i a, __m256i b)
+/* The 171/85 vertical blend, handing back its two widened 32-bit result
+ * halves rather than the packed 16-bit value.  The blend has to widen 10-bit
+ * input to 32-bit (a * 171 overflows 16 bits), and the horizontal 1.5x blend
+ * that consumes this result needs the same widened form, so sharing the halves
+ * lets the two stages widen once between them.  avx2_blend_2_1_hdr wraps this
+ * and packs the halves for callers that want the 16-bit value; blend values are
+ * at most 1023, so the packed form and these halves carry identical numbers. */
+static inline void avx2_blend_2_1_hdr_u32(__m256i a, __m256i b,
+                                          __m256i *r_lo, __m256i *r_hi)
 {
     __m256i zero = _mm256_setzero_si256();
     __m256i w171 = _mm256_set1_epi32(171);
     __m256i w85  = _mm256_set1_epi32(85);
     __m256i rnd  = _mm256_set1_epi32(128);
 
-    /* Widen low 4 uint16_t per lane to 4 uint32_t per lane */
+    /* Widen low/high 4 uint16_t per lane to uint32 */
     __m256i a_lo = _mm256_unpacklo_epi16(a, zero);
     __m256i a_hi = _mm256_unpackhi_epi16(a, zero);
     __m256i b_lo = _mm256_unpacklo_epi16(b, zero);
     __m256i b_hi = _mm256_unpackhi_epi16(b, zero);
 
-    /* blend = (a * 171 + b * 85 + 128) >> 8 */
-    __m256i r_lo = _mm256_srli_epi32(
+    /* blend = (a * 171 + b * 85 + 128) >> 8, kept as uint32 */
+    *r_lo = _mm256_srli_epi32(
         _mm256_add_epi32(rnd, _mm256_add_epi32(
             _mm256_mullo_epi32(a_lo, w171), _mm256_mullo_epi32(b_lo, w85))), 8);
-    __m256i r_hi = _mm256_srli_epi32(
+    *r_hi = _mm256_srli_epi32(
         _mm256_add_epi32(rnd, _mm256_add_epi32(
             _mm256_mullo_epi32(a_hi, w171), _mm256_mullo_epi32(b_hi, w85))), 8);
+}
 
-    /* Pack 32-bit back to 16-bit unsigned.  _mm256_packus_epi32 packs
-     * per-lane: lane 0 gets lo.lane0 | hi.lane0, lane 1 gets lo.lane1 |
-     * hi.lane1.  This preserves correct element order because unpacklo/hi
-     * also operates per-lane. */
+static inline __m256i avx2_blend_2_1_hdr(__m256i a, __m256i b)
+{
+    __m256i r_lo, r_hi;
+    avx2_blend_2_1_hdr_u32(a, b, &r_lo, &r_hi);
+    /* Pack 32-bit back to 16-bit unsigned.  packus_epi32 packs per-lane:
+     * lane 0 = lo.lane0 | hi.lane0, lane 1 = lo.lane1 | hi.lane1, which
+     * preserves element order because unpacklo/hi also operate per-lane. */
     return _mm256_packus_epi32(r_lo, r_hi);
 }
 
@@ -460,6 +472,48 @@ static inline void h_chunk_1_5x_hdr_avx2(__m256i A, __m256i B, __m256i C,
     __m256i store0 = _mm256_permute2x128_si256(interl_lo, interl_hi, 0x20);
     __m256i store1 = _mm256_permute2x128_si256(interl_lo, interl_hi, 0x31);
 
+    _mm256_store_si256((__m256i *)(dst),      store0);
+    _mm256_store_si256((__m256i *)(dst + 16), store1);
+}
+
+
+/* -----------------------------------------------------------------------
+ * Horizontal 1.5x bilinear on components already widened to 32-bit.
+ *
+ * blend_2_1_from_u32 is the 171/85 blend taking the two 32-bit halves of each
+ * operand directly, with no widening of its own.  h_chunk_1_5x_hdr_u32_avx2
+ * takes the widened halves the vertical blend produced (via
+ * avx2_blend_2_1_hdr_u32) and runs the horizontal bilinear on them, so the two
+ * blends share a single widen.  The interleave-and-store tail matches
+ * h_chunk_1_5x_hdr_avx2.
+ * ----------------------------------------------------------------------- */
+
+static inline __m256i blend_2_1_from_u32(__m256i a_lo, __m256i a_hi,
+                                         __m256i b_lo, __m256i b_hi)
+{
+    __m256i w171 = _mm256_set1_epi32(171);
+    __m256i w85  = _mm256_set1_epi32(85);
+    __m256i rnd  = _mm256_set1_epi32(128);
+    __m256i r_lo = _mm256_srli_epi32(
+        _mm256_add_epi32(rnd, _mm256_add_epi32(
+            _mm256_mullo_epi32(a_lo, w171), _mm256_mullo_epi32(b_lo, w85))), 8);
+    __m256i r_hi = _mm256_srli_epi32(
+        _mm256_add_epi32(rnd, _mm256_add_epi32(
+            _mm256_mullo_epi32(a_hi, w171), _mm256_mullo_epi32(b_hi, w85))), 8);
+    return _mm256_packus_epi32(r_lo, r_hi);
+}
+
+static inline void h_chunk_1_5x_hdr_u32_avx2(
+    __m256i A_lo, __m256i A_hi, __m256i B_lo, __m256i B_hi,
+    __m256i C_lo, __m256i C_hi, uint16_t *restrict dst)
+{
+    __m256i out0 = blend_2_1_from_u32(A_lo, A_hi, B_lo, B_hi);
+    __m256i out1 = blend_2_1_from_u32(C_lo, C_hi, B_lo, B_hi);
+
+    __m256i interl_lo = _mm256_unpacklo_epi16(out0, out1);
+    __m256i interl_hi = _mm256_unpackhi_epi16(out0, out1);
+    __m256i store0 = _mm256_permute2x128_si256(interl_lo, interl_hi, 0x20);
+    __m256i store1 = _mm256_permute2x128_si256(interl_lo, interl_hi, 0x31);
     _mm256_store_si256((__m256i *)(dst),      store0);
     _mm256_store_si256((__m256i *)(dst + 16), store1);
 }
@@ -884,86 +938,128 @@ static void __attribute__((hot)) scale_plane_thirds_hdr_avx2(
             __m256i v45b = avx2_avg_u16(r4b, r5b);
             __m256i v45c = avx2_avg_u16(r4c, r5c);
 
-            /* --- 1.5x OUTPUT (4 rows x 32 output elements) ---
-             * 6 source rows -> 4 output rows at 1.5x vertical.
-             *   Row 0: v01
-             *   Row 1: blend_2_1(v01, v23)
-             *   Row 2: blend_2_1(v23, v45)  -- note: blend(v23,v45) means
-             *          v23 has weight 2/3, v45 has weight 1/3
-             *   Row 3: v45
-             * Each is then horizontally 1.5x-filtered. */
+            /* --- Deinterleave once, reduce in component space ---
+             * deinterleave_3x16_hdr is a pure element permutation P, and every
+             * vertical reduction here (avx2_avg_u16, avx2_blend_2_1_hdr) is
+             * pointwise, call it f; the two commute, so P(f(x,y)) ==
+             * f(P(x),P(y)).  When 1.5x is active the group emits four or more
+             * output rows that all come from the same three pair averages
+             * v01/v23/v45, so this deinterleaves those three once and computes
+             * every output level in A/B/C component space - three deinterleaves
+             * per chunk.  Deinterleaving is the most expensive (shuffle-port)
+             * step here.  When only 3x/6x is active there are at most three such
+             * rows, so the else branch deinterleaves each reduced row directly,
+             * which issues fewer shuffles.
+             *
+             * 12x needs the raw interleaved ABCABC 6x row (its h_filter_3x_hdr
+             * reads v6x_cur linearly), so the raw 6x row is produced and stored
+             * here, independent of the branch below, while the raw pair averages
+             * are still live.  avg(avg(v01,v23),avg(v23,v45)) is the 6x reduction
+             * of the three pair averages. */
+            if (need_12x) {
+                __m256i v6xa = avx2_avg_u16(avx2_avg_u16(v01a, v23a),
+                                            avx2_avg_u16(v23a, v45a));
+                __m256i v6xb = avx2_avg_u16(avx2_avg_u16(v01b, v23b),
+                                            avx2_avg_u16(v23b, v45b));
+                __m256i v6xc = avx2_avg_u16(avx2_avg_u16(v01c, v23c),
+                                            avx2_avg_u16(v23c, v45c));
+                _mm256_storeu_si256((__m256i *)(v6x_cur + cx),      v6xa);
+                _mm256_storeu_si256((__m256i *)(v6x_cur + cx + 16), v6xb);
+                _mm256_storeu_si256((__m256i *)(v6x_cur + cx + 32), v6xc);
+            }
+
             if (need_1_5x) {
-                __m256i A, B, C;
+                __m256i Av01, Bv01, Cv01, Av23, Bv23, Cv23, Av45, Bv45, Cv45;
+                deinterleave_3x16_hdr(v01a, v01b, v01c, &Av01, &Bv01, &Cv01);
+                deinterleave_3x16_hdr(v23a, v23b, v23c, &Av23, &Bv23, &Cv23);
+                deinterleave_3x16_hdr(v45a, v45b, v45c, &Av45, &Bv45, &Cv45);
 
-                /* Row 0: v01 */
-                deinterleave_3x16_hdr(v01a, v01b, v01c, &A, &B, &C);
-                h_chunk_1_5x_hdr_avx2(A, B, C, dst_1_5x_r0 + out_off_1_5x);
-
-                /* Row 1: blend(v01, v23) */
+                /* 1.5x rows.  Rows 0/3 are v01/v45 directly; rows 1/2 are the
+                 * vertical bilinear blends computed component-wise (blend
+                 * commutes with the deinterleave). */
+                h_chunk_1_5x_hdr_avx2(Av01, Bv01, Cv01, dst_1_5x_r0 + out_off_1_5x);
                 {
-                    __m256i ba = avx2_blend_2_1_hdr(v01a, v23a);
-                    __m256i bb = avx2_blend_2_1_hdr(v01b, v23b);
-                    __m256i bc = avx2_blend_2_1_hdr(v01c, v23c);
-                    deinterleave_3x16_hdr(ba, bb, bc, &A, &B, &C);
-                    h_chunk_1_5x_hdr_avx2(A, B, C, dst_1_5x_r1 + out_off_1_5x);
+                    /* The vertical blend's widened 32-bit halves feed the
+                     * horizontal 1.5x blend directly, so the two blends widen
+                     * once between them. */
+                    __m256i aL, aH, bL, bH, cL, cH;
+                    avx2_blend_2_1_hdr_u32(Av01, Av23, &aL, &aH);
+                    avx2_blend_2_1_hdr_u32(Bv01, Bv23, &bL, &bH);
+                    avx2_blend_2_1_hdr_u32(Cv01, Cv23, &cL, &cH);
+                    h_chunk_1_5x_hdr_u32_avx2(aL, aH, bL, bH, cL, cH,
+                                              dst_1_5x_r1 + out_off_1_5x);
                 }
-
-                /* Row 2: blend(v23, v45) */
                 {
-                    __m256i ba = avx2_blend_2_1_hdr(v23a, v45a);
-                    __m256i bb = avx2_blend_2_1_hdr(v23b, v45b);
-                    __m256i bc = avx2_blend_2_1_hdr(v23c, v45c);
-                    deinterleave_3x16_hdr(ba, bb, bc, &A, &B, &C);
-                    h_chunk_1_5x_hdr_avx2(A, B, C, dst_1_5x_r2 + out_off_1_5x);
+                    __m256i aL, aH, bL, bH, cL, cH;
+                    avx2_blend_2_1_hdr_u32(Av23, Av45, &aL, &aH);
+                    avx2_blend_2_1_hdr_u32(Bv23, Bv45, &bL, &bH);
+                    avx2_blend_2_1_hdr_u32(Cv23, Cv45, &cL, &cH);
+                    h_chunk_1_5x_hdr_u32_avx2(aL, aH, bL, bH, cL, cH,
+                                              dst_1_5x_r2 + out_off_1_5x);
+                }
+                h_chunk_1_5x_hdr_avx2(Av45, Bv45, Cv45, dst_1_5x_r3 + out_off_1_5x);
+
+                /* 3x vertical reduction in component space (reused by 6x). */
+                __m256i A3x0 = _mm256_setzero_si256();
+                __m256i B3x0 = _mm256_setzero_si256();
+                __m256i C3x0 = _mm256_setzero_si256();
+                __m256i A3x1 = _mm256_setzero_si256();
+                __m256i B3x1 = _mm256_setzero_si256();
+                __m256i C3x1 = _mm256_setzero_si256();
+                if (need_3x) {
+                    A3x0 = avx2_avg_u16(Av01, Av23);
+                    B3x0 = avx2_avg_u16(Bv01, Bv23);
+                    C3x0 = avx2_avg_u16(Cv01, Cv23);
+                    A3x1 = avx2_avg_u16(Av23, Av45);
+                    B3x1 = avx2_avg_u16(Bv23, Bv45);
+                    C3x1 = avx2_avg_u16(Cv23, Cv45);
+
+                    if (active_outputs & (1u << 2)) {
+                        h_chunk_3x_hdr_avx2(A3x0, B3x0, C3x0, dst_3x_r0 + out_off_3x);
+                        h_chunk_3x_hdr_avx2(A3x1, B3x1, C3x1, dst_3x_r1 + out_off_3x);
+                    }
                 }
 
-                /* Row 3: v45 */
-                deinterleave_3x16_hdr(v45a, v45b, v45c, &A, &B, &C);
-                h_chunk_1_5x_hdr_avx2(A, B, C, dst_1_5x_r3 + out_off_1_5x);
-            }
-
-            /* --- 3x VERTICAL + HORIZONTAL (2 rows x 16 output elements) ---
-             * avg(v01,v23) and avg(v23,v45) produce 3:1 vertical reduction. */
-            __m256i v3x0a = _mm256_setzero_si256();
-            __m256i v3x0b = _mm256_setzero_si256();
-            __m256i v3x0c = _mm256_setzero_si256();
-            __m256i v3x1a = _mm256_setzero_si256();
-            __m256i v3x1b = _mm256_setzero_si256();
-            __m256i v3x1c = _mm256_setzero_si256();
-            if (need_3x) {
-                v3x0a = avx2_avg_u16(v01a, v23a);
-                v3x0b = avx2_avg_u16(v01b, v23b);
-                v3x0c = avx2_avg_u16(v01c, v23c);
-                v3x1a = avx2_avg_u16(v23a, v45a);
-                v3x1b = avx2_avg_u16(v23b, v45b);
-                v3x1c = avx2_avg_u16(v23c, v45c);
-
-                if (active_outputs & (1u << 2)) {
-                    __m256i A, B, C;
-
-                    deinterleave_3x16_hdr(v3x0a, v3x0b, v3x0c, &A, &B, &C);
-                    h_chunk_3x_hdr_avx2(A, B, C, dst_3x_r0 + out_off_3x);
-
-                    deinterleave_3x16_hdr(v3x1a, v3x1b, v3x1c, &A, &B, &C);
-                    h_chunk_3x_hdr_avx2(A, B, C, dst_3x_r1 + out_off_3x);
+                /* 6x = halve(box3(avg(v3x0,v3x1))) in component space. */
+                if (need_6x && (active_outputs & (1u << 4))) {
+                    __m256i A6x = avx2_avg_u16(A3x0, A3x1);
+                    __m256i B6x = avx2_avg_u16(B3x0, B3x1);
+                    __m256i C6x = avx2_avg_u16(C3x0, C3x1);
+                    uint16_t __attribute__((aligned(32))) scratch_3x[16];
+                    __m256i r3x = h_chunk_3x_hdr_avx2(A6x, B6x, C6x, scratch_3x);
+                    h_chunk_6x_hdr_avx2(r3x, dst_6x_r0 + out_off_6x);
                 }
-            }
+            } else {
+                /* No 1.5x active: deinterleave each reduced row directly.  With
+                 * only 3x/6x there are at most three such rows, so deinterleaving
+                 * all three pair averages up front would issue more shuffles
+                 * than this does. */
+                __m256i v3x0a = _mm256_setzero_si256();
+                __m256i v3x0b = _mm256_setzero_si256();
+                __m256i v3x0c = _mm256_setzero_si256();
+                __m256i v3x1a = _mm256_setzero_si256();
+                __m256i v3x1b = _mm256_setzero_si256();
+                __m256i v3x1c = _mm256_setzero_si256();
+                if (need_3x) {
+                    v3x0a = avx2_avg_u16(v01a, v23a);
+                    v3x0b = avx2_avg_u16(v01b, v23b);
+                    v3x0c = avx2_avg_u16(v01c, v23c);
+                    v3x1a = avx2_avg_u16(v23a, v45a);
+                    v3x1b = avx2_avg_u16(v23b, v45b);
+                    v3x1c = avx2_avg_u16(v23c, v45c);
 
-            /* --- 6x VERTICAL (1 row) + save for 12x + horizontal ---
-             * avg(v3x0, v3x1) = avg(avg(v01,v23), avg(v23,v45)). */
-            if (need_6x) {
-                __m256i v6xa = avx2_avg_u16(v3x0a, v3x1a);
-                __m256i v6xb = avx2_avg_u16(v3x0b, v3x1b);
-                __m256i v6xc = avx2_avg_u16(v3x0c, v3x1c);
-
-                /* Save 6x vertical intermediate for 12x pairing */
-                if (need_12x) {
-                    _mm256_storeu_si256((__m256i *)(v6x_cur + cx),      v6xa);
-                    _mm256_storeu_si256((__m256i *)(v6x_cur + cx + 16), v6xb);
-                    _mm256_storeu_si256((__m256i *)(v6x_cur + cx + 32), v6xc);
+                    if (active_outputs & (1u << 2)) {
+                        __m256i A, B, C;
+                        deinterleave_3x16_hdr(v3x0a, v3x0b, v3x0c, &A, &B, &C);
+                        h_chunk_3x_hdr_avx2(A, B, C, dst_3x_r0 + out_off_3x);
+                        deinterleave_3x16_hdr(v3x1a, v3x1b, v3x1c, &A, &B, &C);
+                        h_chunk_3x_hdr_avx2(A, B, C, dst_3x_r1 + out_off_3x);
+                    }
                 }
-
-                if (active_outputs & (1u << 4)) {
+                if (need_6x && (active_outputs & (1u << 4))) {
+                    __m256i v6xa = avx2_avg_u16(v3x0a, v3x1a);
+                    __m256i v6xb = avx2_avg_u16(v3x0b, v3x1b);
+                    __m256i v6xc = avx2_avg_u16(v3x0c, v3x1c);
                     __m256i A, B, C;
                     deinterleave_3x16_hdr(v6xa, v6xb, v6xc, &A, &B, &C);
                     uint16_t __attribute__((aligned(32))) scratch_3x[16];

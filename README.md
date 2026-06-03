@@ -90,12 +90,12 @@ Smaller time is better; larger speedup is better.
 
 | Workload | Epyc 7302 (Zen 2) | Xeon 6132 (Skylake) | Xeon E5v4 (Broadwell) |
 |---|---|---|---|
-| 640×360 down:2x                   |   11 µs  (9.9×) |   11 µs (11.8×) |   42 µs  (3.6×) |
-| 960×540 down:1.5x,3x              |   86 µs  (6.0×) |   90 µs  (7.1×) |  269 µs  (2.7×) |
-| 1280×720 down:2x,4x               |   65 µs (10.4×) |   93 µs  (9.2×) |  187 µs  (4.6×) |
-| 1920×1080 down:1.5x,3x,6x         |  368 µs  (7.5×) |  403 µs  (8.3×) |  793 µs  (4.8×) |
-| 2560×1440 down:2x,4x,8x           |  307 µs (12.2×) |  427 µs (10.7×) |  639 µs  (8.3×) |
-| 3840×2160 down:1.5x,3x,6x,12x     | 2023 µs  (6.6×) | 1822 µs  (8.3×) | 2292 µs  (7.3×) |
+| 640×360 down:2x                   |    8 µs (14.2×) |    9 µs (13.8×) |   34 µs  (4.8×) |
+| 960×540 down:1.5x,3x              |   63 µs  (8.2×) |   77 µs  (8.5×) |  202 µs  (3.9×) |
+| 1280×720 down:2x,4x               |   51 µs (13.2×) |   81 µs (10.7×) |  190 µs  (5.4×) |
+| 1920×1080 down:1.5x,3x,6x         |  261 µs (10.6×) |  314 µs (11.0×) |  585 µs  (6.9×) |
+| 2560×1440 down:2x,4x,8x           |  249 µs (14.9×) |  385 µs (12.0×) |  501 µs (11.0×) |
+| 3840×2160 down:1.5x,3x,6x,12x     | 1575 µs  (8.4×) | 1643 µs  (9.7×) | 1959 µs  (9.8×) |
 
 **aarch64 / NEON**
 
@@ -114,14 +114,14 @@ Smaller time is better; larger speedup is better.
 
 | Workload | Epyc 7302 (Zen 2) | Xeon 6132 (Skylake) | Xeon E5v4 (Broadwell) |
 |---|---|---|---|
-| 480×270 up:2x                   |   27 µs (10.2×) |   35 µs (10.2×) |   51 µs  (9.2×) |
-| 480×270 up:2x,4x                |  128 µs  (7.1×) |  189 µs  (6.1×) |  236 µs  (6.7×) |
-| 960×540 up:2x                   |  102 µs  (9.8×) |  156 µs  (8.1×) |  184 µs  (7.5×) |
-| 960×540 up:2x,3x                |  936 µs  (2.9×) | 1125 µs  (3.1×) | 1281 µs  (3.0×) |
-| 1920×1080 up:2x                 |  679 µs  (6.0×) |  843 µs  (6.0×) |  754 µs  (7.3×) |
-| 1920×1080 up:1.5x               |  828 µs  (3.4×) |  953 µs  (3.7×) | 1100 µs  (3.7×) |
-| 240×136 up:2x,4x,8x,16x         |  933 µs  (2.5×) | 1140 µs  (2.5×) | 1011 µs  (3.0×) |
-| 120×68 up:2x,4x,8x,16x,32x      |  939 µs  (2.1×) | 1133 µs  (2.1×) | 1038 µs  (2.4×) |
+| 480×270 up:2x                   |   26 µs (10.6×) |   34 µs (10.2×) |   51 µs  (9.2×) |
+| 480×270 up:2x,4x                |  130 µs  (6.9×) |  184 µs  (6.1×) |  236 µs  (6.7×) |
+| 960×540 up:2x                   |  104 µs  (9.4×) |  150 µs  (8.1×) |  184 µs  (7.5×) |
+| 960×540 up:2x,3x                |  846 µs  (3.1×) | 1014 µs  (3.3×) | 1228 µs  (3.2×) |
+| 1920×1080 up:2x                 |  602 µs  (6.6×) |  758 µs  (6.4×) |  754 µs  (7.3×) |
+| 1920×1080 up:1.5x               |  743 µs  (3.7×) |  858 µs  (4.0×) | 1052 µs  (3.8×) |
+| 240×136 up:2x,4x,8x,16x         |  847 µs  (2.6×) | 1016 µs  (2.7×) | 1011 µs  (3.0×) |
+| 120×68 up:2x,4x,8x,16x,32x      |  852 µs  (2.2×) | 1003 µs  (2.3×) | 1038 µs  (2.4×) |
 
 **aarch64 / NEON**
 
@@ -149,9 +149,9 @@ for a longer discussion.
 
 | Workload | Epyc 7302 (Zen 2) | Xeon 6132 (Skylake) | Xeon E5v4 (Broadwell) |
 |---|---|---|---|
-| 1920×1080 down:2x up:2x             |  848 µs (5.9×) | 1050 µs (6.0×) |  924 µs (7.2×) |
-| 1920×1080 down:1.5x,3x up:2x        | 1180 µs (5.4×) | 1328 µs (5.9×) | 1217 µs (7.0×) |
-| 1280×720 down:2x,4x up:2x,4x        | 3037 µs (2.7×) | 2535 µs (3.7×) | 2527 µs (4.2×) |
+| 1920×1080 down:2x up:2x             |  730 µs (6.7×) |  976 µs (6.1×) |  924 µs (7.4×) |
+| 1920×1080 down:1.5x,3x up:2x        |  985 µs (6.1×) | 1151 µs (6.5×) | 1149 µs (7.5×) |
+| 1280×720 down:2x,4x up:2x,4x        | 2148 µs (3.5×) | 2236 µs (3.7×) | 2493 µs (4.2×) |
 
 **aarch64 / NEON**
 
@@ -172,11 +172,11 @@ aren't representative.
 
 | Workload | Epyc 7302 | Xeon 6132 | Xeon E5v4 |
 |---|---|---|---|
-| 1920×1080 I010 down:1.5x,3x,6x        |  765 µs |  865 µs |  997 µs |
-| 3840×2160 I010 down:1.5x,3x,6x,12x    | 4266 µs | 4243 µs | 5681 µs |
-| 3840×2160 P010 down:1.5x,3x,6x,12x    | 5446 µs | 5209 µs | 6734 µs |
-| 1920×1080 I010 up:2x                  | 2845 µs | 2474 µs | 2286 µs |
-| 1920×1080 I010 down:1.5x,3x up:2x     | 3840 µs | 3409 µs | 3594 µs |
+| 1920×1080 I010 down:1.5x,3x,6x        |  680 µs |  569 µs |  772 µs |
+| 3840×2160 I010 down:1.5x,3x,6x,12x    | 3340 µs | 3315 µs | 4381 µs |
+| 3840×2160 P010 down:1.5x,3x,6x,12x    | 3852 µs | 4262 µs | 6812 µs |
+| 1920×1080 I010 up:2x                  | 1929 µs | 2207 µs | 2402 µs |
+| 1920×1080 I010 down:1.5x,3x up:2x     | 2741 µs | 2875 µs | 3559 µs |
 
 **aarch64 / NEON**
 
@@ -190,7 +190,7 @@ aren't representative.
 
 The P010 row uses the Y + interleaved-UV layout that most HEVC Main10
 encoders emit natively; the P010 vs I010 gap on the matching 4K
-workload (e.g. 5446 vs 4266 µs on Epyc 7302) is the on-the-fly UV
+workload (e.g. 3852 vs 3340 µs on Epyc 7302) is the on-the-fly UV
 deinterleave cost, not a fundamental difference in scaling work.
 
 HDR kernels are roughly 2–4× slower per byte than their SDR
@@ -282,11 +282,10 @@ EMULATED for `RISCV_HWPROBE_KEY_MISALIGNED_VECTOR_PERF`, or that
 advertise only the embedded `Zve*` subset, fall back to the scalar
 kernel.
 
-LTO (`make LTO=1`) is auto-disabled on `riscv64`: GCC 13's LTO link
-can't resolve the RVV target builtins, and GCC 14's LTO partition pass
-hits an internal compiler error in `riscv_vector::expand_builtin`.  The
-build emits a `$(warning ...)` notice and continues with `-O3` only.
-Drop the guard once a fixed compiler ships.
+LTO (`make LTO=1`) is auto-disabled on `riscv64` because GCC 13's LTO link
+can't resolve the RVV target builtins, and GCC 14's LTO partition pass hits
+an internal compiler error in `riscv_vector::expand_builtin`. The build
+emits a `$(warning ...)` notice and continues with `-O3` only.
 
 ### A note on the memory wall
 
@@ -381,7 +380,7 @@ multiple of 32**. This means:
 The deepest thirds step imposes a divisibility requirement on `src_width`:
 
 | Deepest step requested | src_width must be divisible by |
-|------------------------|-------------------------------|
+|------------------------|--------------------------------|
 | 1.5× only              | 3                              |
 | 3×                     | 6                              |
 | 6×                     | 12                             |
@@ -390,7 +389,7 @@ The deepest thirds step imposes a divisibility requirement on `src_width`:
 Similarly for `src_height` (vertical period):
 
 | Deepest step requested | src_height must be divisible by |
-|------------------------|--------------------------------|
+|------------------------|---------------------------------|
 | 1.5× or 3×             | 6                               |
 | 6×                     | 12                              |
 | 12×                    | 24                              |
@@ -399,7 +398,7 @@ Similarly for `src_height` (vertical period):
 The deepest pow2 step imposes a similar requirement:
 
 | Deepest step requested | src_width and src_height must be divisible by |
-|------------------------|----------------------------------------------|
+|------------------------|-----------------------------------------------|
 | 2×                     | 4                                             |
 | 4×                     | 8                                             |
 | 8×                     | 16                                            |
@@ -418,9 +417,9 @@ silently trimming.
 
 ### Mixing families
 A single `fused_scaler_ctx_t` may only use downscale steps from **one
-family** per init. Requesting `FUSED_SCALE_3X | FUSED_SCALE_4X` (thirds
-+ pow2) returns `FUSED_ERR_INVALID_FLAGS`. Use two separate contexts if
-you need both downscale families.
+family** per init. Requesting `FUSED_SCALE_3X | FUSED_SCALE_4X` (thirds + pow2)
+returns `FUSED_ERR_INVALID_FLAGS`. Use two separate contexts if you need
+both downscale families.
 
 Upscaling is independent of the downscale family selection and may be
 combined with either thirds or pow2 downscale flags in the same init

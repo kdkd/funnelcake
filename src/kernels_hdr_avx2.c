@@ -277,6 +277,33 @@ static inline __m256i avx2_halve_32_to_16_hdr(__m256i v0, __m256i v1)
 
 
 /* -----------------------------------------------------------------------
+ * AVX2 horizontal halving helper for 10-bit: 8 -> 4 elements (XMM -> 64-bit)
+ *
+ * out[k] = avg(in[2k], in[2k+1]) = (in[2k] + in[2k+1] + 1) >> 1, for k in 0..3.
+ * Same even/odd-word separation as avx2_halve_16_to_8_hdr but on a single
+ * 128-bit lane: vpshufb gathers the 4 even-indexed words into the low 64 bits
+ * and the 4 odd-indexed words into the high 64 bits, then (sum+1)>>1.  The 4
+ * results sit in the low 64 bits, ready for _mm_storel_epi64.
+ * ----------------------------------------------------------------------- */
+
+static inline __m128i halve_8_to_4_hdr(__m128i v)
+{
+    static const uint8_t shuf_even_odd8[16] __attribute__((aligned(16))) = {
+        /* even words 0,2,4,6 -> low 64; odd words 1,3,5,7 -> high 64 */
+        0, 1, 4, 5, 8, 9, 12, 13,    2, 3, 6, 7, 10, 11, 14, 15
+    };
+    __m128i mask = _mm_load_si128((const __m128i *)shuf_even_odd8);
+    __m128i s = _mm_shuffle_epi8(v, mask);
+    __m128i even = s;
+    __m128i odd  = _mm_srli_si128(s, 8);
+    /* 10-bit values: max sum = 2046 fits in uint16. */
+    __m128i sum = _mm_add_epi16(even, odd);
+    __m128i one = _mm_set1_epi16(1);
+    return _mm_srli_epi16(_mm_add_epi16(sum, one), 1);
+}
+
+
+/* -----------------------------------------------------------------------
  * SSE shuffle tables for 10-bit 3-way deinterleave
  *
  * For uint16_t elements, each element is 2 bytes.  Given 48 bytes
@@ -532,17 +559,23 @@ static inline void h_chunk_1_5x_hdr_u32_avx2(
  * in 16 bits.
  * ----------------------------------------------------------------------- */
 
+/* Box-of-3 divide: average a deinterleaved triplet (A, B, C) by adding the
+ * three and dividing by 3 via (sum * 0x5556) >> 16.  For 10-bit values the
+ * sum is at most 3069, which fits in 16 bits, so this magic-constant divide
+ * is exact.  Returning the result in a register lets the 12x pipeline chain
+ * straight into the next step; h_chunk_3x_hdr_avx2 wraps this and also writes
+ * the 3x row out. */
+static inline __m256i box3_div_hdr(__m256i A, __m256i B, __m256i C)
+{
+    __m256i magic = _mm256_set1_epi16((short)0x5556);
+    __m256i sum = _mm256_add_epi16(_mm256_add_epi16(A, B), C);
+    return _mm256_mulhi_epu16(sum, magic);
+}
+
 static inline __m256i h_chunk_3x_hdr_avx2(__m256i A, __m256i B, __m256i C,
                                             uint16_t *restrict dst)
 {
-    __m256i magic = _mm256_set1_epi16((short)0x5556);
-
-    /* Sum: for 10-bit values, A+B+C max = 3069 which fits in uint16_t */
-    __m256i sum = _mm256_add_epi16(_mm256_add_epi16(A, B), C);
-
-    /* Divide by 3: (sum * 0x5556) >> 16 via mulhi_epu16 */
-    __m256i result = _mm256_mulhi_epu16(sum, magic);
-
+    __m256i result = box3_div_hdr(A, B, C);
     _mm256_store_si256((__m256i *)dst, result);
     return result;
 }
@@ -1186,13 +1219,45 @@ static void __attribute__((hot)) scale_plane_thirds_hdr_avx2(
                     int dw = dst_widths[3];
                     int ds_el = dst_strides[3] / (int)sizeof(uint16_t);
 
-                    /* Horizontal: 3x box avg -> halve -> halve = 12:1 */
-                    h_filter_3x_hdr(v6x_prev, src_w, h_3x_buf, w_3x);
-                    h_filter_halve_hdr(h_3x_buf, h_6x_buf, w_6x);
-                    h_filter_halve_hdr(h_6x_buf,
-                                       dst_planes[3]
-                                           + (size_t)out_row[3] * (size_t)ds_el,
-                                       dw);
+                    uint16_t *restrict out12 = dst_planes[3]
+                        + (size_t)out_row[3] * (size_t)ds_el;
+
+                    /* Fused register-resident 12:1 horizontal reduction when
+                     * src_w is a multiple of 48 samples (96 bytes = the
+                     * deinterleave chunk).  Per chunk: 48 source samples ->
+                     * deinterleave_3x16_hdr -> box3_div_hdr (16 3x samples) ->
+                     * avx2_halve_16_to_8_hdr (8 6x) -> halve_8_to_4_hdr (4 12x)
+                     * -> 64-bit store, with the 3x and 6x stages staying in
+                     * registers.  This is chunk-local: 48 = 3*16, 16 = 2*8,
+                     * 8 = 2*4, so every triplet and halving-pair boundary sits
+                     * inside the chunk and each 12x output is the exact 12:1
+                     * average, matching the buffered path in the else branch.
+                     * It writes exactly src_w/12 == dst_widths[3] samples
+                     * (src_w = 48m gives 4m), so nothing past the row edge is
+                     * touched.  Widths that are not a multiple of 48 take the
+                     * buffered path. */
+                    if (src_w % 48 == 0) {
+                        int fc12 = src_w / 48;
+                        for (int c = 0; c < fc12; c++) {
+                            const uint16_t *cs = v6x_prev + (size_t)c * 48;
+                            __m256i ra = _mm256_loadu_si256((const __m256i *)cs);
+                            __m256i rb = _mm256_loadu_si256(
+                                (const __m256i *)(cs + 16));
+                            __m256i rc = _mm256_loadu_si256(
+                                (const __m256i *)(cs + 32));
+                            __m256i A, B, C;
+                            deinterleave_3x16_hdr(ra, rb, rc, &A, &B, &C);
+                            __m256i box = box3_div_hdr(A, B, C);
+                            __m128i six = avx2_halve_16_to_8_hdr(box);
+                            __m128i twl = halve_8_to_4_hdr(six);
+                            _mm_storel_epi64(
+                                (__m128i *)(out12 + (size_t)c * 4), twl);
+                        }
+                    } else {
+                        h_filter_3x_hdr(v6x_prev, src_w, h_3x_buf, w_3x);
+                        h_filter_halve_hdr(h_3x_buf, h_6x_buf, w_6x);
+                        h_filter_halve_hdr(h_6x_buf, out12, dw);
+                    }
                     out_row[3]++;
                 }
             }

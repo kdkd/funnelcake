@@ -766,6 +766,58 @@ up_h_2x_row_avx2_u16(const uint16_t *src, int src_w, uint16_t *dst)
     }
 }
 
+/* -----------------------------------------------------------------------
+ * Fused vertical 2x average + horizontal doubling for one HDR row.
+ *
+ * Produces the bilinearly-interpolated ("odd") output row of a 2x HDR
+ * upscale.  For each 8-element chunk it computes the vertical average of
+ * the two source rows ((a + b + 1) >> 1) in registers and feeds it straight
+ * into the horizontal doubling, so the averaged row never has to be written
+ * to a scratch buffer and read back.  The horizontal doubling is byte-for-byte
+ * identical to up_h_2x_row_avx2_u16 (same alignr/avg/unpack on the same
+ * per-column averages).  aligned(64) mirrors up_h_2x_row_avx2_u16: this HDR
+ * 2x path is icache-placement sensitive.
+ * ----------------------------------------------------------------------- */
+static void __attribute__((aligned(64), hot))
+up_h_2x_vblend_row_avx2_u16(const uint16_t *a_row, const uint16_t *b_row,
+                            int src_w, uint16_t *dst)
+{
+    int x = 0;
+    int full_chunks = src_w / 8;
+
+    for (int c = 0; c < full_chunks; c++) {
+        /* r = vertical average of the two source rows for this 8-element chunk. */
+        __m128i r = _mm_avg_epu16(
+            _mm_loadu_si128((const __m128i *)(a_row + x)),
+            _mm_loadu_si128((const __m128i *)(b_row + x)));
+
+        /* Edge: the averaged value one column past this chunk, or the last
+         * averaged column replicated at the row end. */
+        uint16_t edge = (x + 8 < src_w)
+                          ? up_avg_u16_scalar(a_row[x + 8], b_row[x + 8])
+                          : up_avg_u16_scalar(a_row[src_w - 1], b_row[src_w - 1]);
+        __m128i edge_v = _mm_set1_epi16((short)edge);
+        __m128i r_shifted = _mm_alignr_epi8(edge_v, r, 2);
+        __m128i r_mid = _mm_avg_epu16(r, r_shifted);
+
+        __m128i out0 = _mm_unpacklo_epi16(r, r_mid);
+        __m128i out1 = _mm_unpackhi_epi16(r, r_mid);
+
+        _mm_storeu_si128((__m128i *)(dst + 2 * x + 0), out0);
+        _mm_storeu_si128((__m128i *)(dst + 2 * x + 8), out1);
+        x += 8;
+    }
+
+    /* Scalar tail */
+    for (; x < src_w; x++) {
+        uint16_t a = up_avg_u16_scalar(a_row[x], b_row[x]);
+        uint16_t b = (x + 1 < src_w) ? up_avg_u16_scalar(a_row[x + 1], b_row[x + 1])
+                                     : a;
+        dst[2 * x + 0] = a;
+        dst[2 * x + 1] = up_avg_u16_scalar(a, b);
+    }
+}
+
 /* ---- Vertical 2x upscale of one HDR plane ---- */
 static void up_2x_plane_avx2_u16(const uint16_t *src, int src_w, int src_h,
                                  int src_el_stride, uint16_t *dst,
@@ -779,21 +831,15 @@ static void up_2x_plane_avx2_u16(const uint16_t *src, int src_w, int src_h,
                                     ? src + (size_t)(i + 1) * src_el_stride
                                     : row_cur;
 
-        /* Vertical midpoint via _mm256_avg_epu16. */
-        int x = 0;
-        for (; x + 16 <= src_w; x += 16) {
-            __m256i a = _mm256_loadu_si256((const __m256i *)(row_cur + x));
-            __m256i b = _mm256_loadu_si256((const __m256i *)(row_nxt + x));
-            _mm256_storeu_si256((__m256i *)(scratch + x), _mm256_avg_epu16(a, b));
-        }
-        for (; x < src_w; x++) {
-            scratch[x] = up_avg_u16_scalar(row_cur[x], row_nxt[x]);
-        }
-
+        /* Even output row: horizontal doubling of the source row directly. */
         up_h_2x_row_avx2_u16(row_cur, src_w,
                              dst + (size_t)(2 * i)     * dst_el_stride);
-        up_h_2x_row_avx2_u16(scratch, src_w,
-                             dst + (size_t)(2 * i + 1) * dst_el_stride);
+
+        /* Odd output row: the vertical average of (row_cur, row_nxt) is
+         * computed inline and fused with the horizontal doubling, so it does
+         * not need a scratch row between the two steps. */
+        up_h_2x_vblend_row_avx2_u16(row_cur, row_nxt, src_w,
+                                    dst + (size_t)(2 * i + 1) * dst_el_stride);
     }
 }
 

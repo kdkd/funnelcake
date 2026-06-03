@@ -126,52 +126,31 @@ static inline __m256i avx2_avg_u16(__m256i a, __m256i b)
  * AVX2 vertical blend helper for 10-bit
  *
  * Computes (a * 171 + b * 85 + 128) >> 8 across 16 uint16_t elements.
- * Must widen to 32-bit because 1023 * 171 = 174,933 overflows uint16_t.
- *
- * _mm256_unpacklo/hi_epi16 with zero widens 16->32 per lane.
- * _mm256_packus_epi32 narrows 32->16 per lane.  Since both unpack and
- * pack operate within 128-bit lanes, lane affiliation is preserved and
- * the packed result is in correct order.
+ * 1023 * 171 = 174,933 overflows 16 bits, so the weighted sum is built in
+ * 32-bit.  Interleaving a and b into (a_i, b_i) pairs and running one
+ * vpmaddwd against the weight pair {171, 85} gives 171*a_i + 85*b_i for each
+ * pair directly, a single multiply-add in place of two multiplies and an add.
+ * 10-bit inputs keep every product and the sum well inside a signed 32-bit
+ * lane.  unpacklo/hi feed the low and high element groups and packus_epi32
+ * narrows back to 16-bit; both work within 128-bit lanes, so the packed
+ * result stays in element order.
  * ----------------------------------------------------------------------- */
-
-/* The 171/85 vertical blend, handing back its two widened 32-bit result
- * halves rather than the packed 16-bit value.  The blend has to widen 10-bit
- * input to 32-bit (a * 171 overflows 16 bits), and the horizontal 1.5x blend
- * that consumes this result needs the same widened form, so sharing the halves
- * lets the two stages widen once between them.  avx2_blend_2_1_hdr wraps this
- * and packs the halves for callers that want the 16-bit value; blend values are
- * at most 1023, so the packed form and these halves carry identical numbers. */
-static inline void avx2_blend_2_1_hdr_u32(__m256i a, __m256i b,
-                                          __m256i *r_lo, __m256i *r_hi)
-{
-    __m256i zero = _mm256_setzero_si256();
-    __m256i w171 = _mm256_set1_epi32(171);
-    __m256i w85  = _mm256_set1_epi32(85);
-    __m256i rnd  = _mm256_set1_epi32(128);
-
-    /* Widen low/high 4 uint16_t per lane to uint32 */
-    __m256i a_lo = _mm256_unpacklo_epi16(a, zero);
-    __m256i a_hi = _mm256_unpackhi_epi16(a, zero);
-    __m256i b_lo = _mm256_unpacklo_epi16(b, zero);
-    __m256i b_hi = _mm256_unpackhi_epi16(b, zero);
-
-    /* blend = (a * 171 + b * 85 + 128) >> 8, kept as uint32 */
-    *r_lo = _mm256_srli_epi32(
-        _mm256_add_epi32(rnd, _mm256_add_epi32(
-            _mm256_mullo_epi32(a_lo, w171), _mm256_mullo_epi32(b_lo, w85))), 8);
-    *r_hi = _mm256_srli_epi32(
-        _mm256_add_epi32(rnd, _mm256_add_epi32(
-            _mm256_mullo_epi32(a_hi, w171), _mm256_mullo_epi32(b_hi, w85))), 8);
-}
 
 static inline __m256i avx2_blend_2_1_hdr(__m256i a, __m256i b)
 {
-    __m256i r_lo, r_hi;
-    avx2_blend_2_1_hdr_u32(a, b, &r_lo, &r_hi);
-    /* Pack 32-bit back to 16-bit unsigned.  packus_epi32 packs per-lane:
-     * lane 0 = lo.lane0 | hi.lane0, lane 1 = lo.lane1 | hi.lane1, which
-     * preserves element order because unpacklo/hi also operate per-lane. */
-    return _mm256_packus_epi32(r_lo, r_hi);
+    /* Weight pair: the low 16 bits multiply a, the high 16 bits multiply b. */
+    const __m256i w   = _mm256_set1_epi32((85 << 16) | 171);
+    const __m256i rnd = _mm256_set1_epi32(128);
+
+    __m256i ab_lo = _mm256_unpacklo_epi16(a, b);
+    __m256i ab_hi = _mm256_unpackhi_epi16(a, b);
+
+    __m256i lo = _mm256_srli_epi32(
+        _mm256_add_epi32(_mm256_madd_epi16(ab_lo, w), rnd), 8);
+    __m256i hi = _mm256_srli_epi32(
+        _mm256_add_epi32(_mm256_madd_epi16(ab_hi, w), rnd), 8);
+
+    return _mm256_packus_epi32(lo, hi);
 }
 
 
@@ -499,48 +478,6 @@ static inline void h_chunk_1_5x_hdr_avx2(__m256i A, __m256i B, __m256i C,
     __m256i store0 = _mm256_permute2x128_si256(interl_lo, interl_hi, 0x20);
     __m256i store1 = _mm256_permute2x128_si256(interl_lo, interl_hi, 0x31);
 
-    _mm256_store_si256((__m256i *)(dst),      store0);
-    _mm256_store_si256((__m256i *)(dst + 16), store1);
-}
-
-
-/* -----------------------------------------------------------------------
- * Horizontal 1.5x bilinear on components already widened to 32-bit.
- *
- * blend_2_1_from_u32 is the 171/85 blend taking the two 32-bit halves of each
- * operand directly, with no widening of its own.  h_chunk_1_5x_hdr_u32_avx2
- * takes the widened halves the vertical blend produced (via
- * avx2_blend_2_1_hdr_u32) and runs the horizontal bilinear on them, so the two
- * blends share a single widen.  The interleave-and-store tail matches
- * h_chunk_1_5x_hdr_avx2.
- * ----------------------------------------------------------------------- */
-
-static inline __m256i blend_2_1_from_u32(__m256i a_lo, __m256i a_hi,
-                                         __m256i b_lo, __m256i b_hi)
-{
-    __m256i w171 = _mm256_set1_epi32(171);
-    __m256i w85  = _mm256_set1_epi32(85);
-    __m256i rnd  = _mm256_set1_epi32(128);
-    __m256i r_lo = _mm256_srli_epi32(
-        _mm256_add_epi32(rnd, _mm256_add_epi32(
-            _mm256_mullo_epi32(a_lo, w171), _mm256_mullo_epi32(b_lo, w85))), 8);
-    __m256i r_hi = _mm256_srli_epi32(
-        _mm256_add_epi32(rnd, _mm256_add_epi32(
-            _mm256_mullo_epi32(a_hi, w171), _mm256_mullo_epi32(b_hi, w85))), 8);
-    return _mm256_packus_epi32(r_lo, r_hi);
-}
-
-static inline void h_chunk_1_5x_hdr_u32_avx2(
-    __m256i A_lo, __m256i A_hi, __m256i B_lo, __m256i B_hi,
-    __m256i C_lo, __m256i C_hi, uint16_t *restrict dst)
-{
-    __m256i out0 = blend_2_1_from_u32(A_lo, A_hi, B_lo, B_hi);
-    __m256i out1 = blend_2_1_from_u32(C_lo, C_hi, B_lo, B_hi);
-
-    __m256i interl_lo = _mm256_unpacklo_epi16(out0, out1);
-    __m256i interl_hi = _mm256_unpackhi_epi16(out0, out1);
-    __m256i store0 = _mm256_permute2x128_si256(interl_lo, interl_hi, 0x20);
-    __m256i store1 = _mm256_permute2x128_si256(interl_lo, interl_hi, 0x31);
     _mm256_store_si256((__m256i *)(dst),      store0);
     _mm256_store_si256((__m256i *)(dst + 16), store1);
 }
@@ -1012,23 +949,18 @@ static void __attribute__((hot)) scale_plane_thirds_hdr_avx2(
                  * commutes with the deinterleave). */
                 h_chunk_1_5x_hdr_avx2(Av01, Bv01, Cv01, dst_1_5x_r0 + out_off_1_5x);
                 {
-                    /* The vertical blend's widened 32-bit halves feed the
-                     * horizontal 1.5x blend directly, so the two blends widen
-                     * once between them. */
-                    __m256i aL, aH, bL, bH, cL, cH;
-                    avx2_blend_2_1_hdr_u32(Av01, Av23, &aL, &aH);
-                    avx2_blend_2_1_hdr_u32(Bv01, Bv23, &bL, &bH);
-                    avx2_blend_2_1_hdr_u32(Cv01, Cv23, &cL, &cH);
-                    h_chunk_1_5x_hdr_u32_avx2(aL, aH, bL, bH, cL, cH,
-                                              dst_1_5x_r1 + out_off_1_5x);
+                    __m256i bA = avx2_blend_2_1_hdr(Av01, Av23);
+                    __m256i bB = avx2_blend_2_1_hdr(Bv01, Bv23);
+                    __m256i bC = avx2_blend_2_1_hdr(Cv01, Cv23);
+                    h_chunk_1_5x_hdr_avx2(bA, bB, bC,
+                                          dst_1_5x_r1 + out_off_1_5x);
                 }
                 {
-                    __m256i aL, aH, bL, bH, cL, cH;
-                    avx2_blend_2_1_hdr_u32(Av23, Av45, &aL, &aH);
-                    avx2_blend_2_1_hdr_u32(Bv23, Bv45, &bL, &bH);
-                    avx2_blend_2_1_hdr_u32(Cv23, Cv45, &cL, &cH);
-                    h_chunk_1_5x_hdr_u32_avx2(aL, aH, bL, bH, cL, cH,
-                                              dst_1_5x_r2 + out_off_1_5x);
+                    __m256i bA = avx2_blend_2_1_hdr(Av23, Av45);
+                    __m256i bB = avx2_blend_2_1_hdr(Bv23, Bv45);
+                    __m256i bC = avx2_blend_2_1_hdr(Cv23, Cv45);
+                    h_chunk_1_5x_hdr_avx2(bA, bB, bC,
+                                          dst_1_5x_r2 + out_off_1_5x);
                 }
                 h_chunk_1_5x_hdr_avx2(Av45, Bv45, Cv45, dst_1_5x_r3 + out_off_1_5x);
 

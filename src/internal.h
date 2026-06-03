@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) 2020-2026 Kevin Day
+ *
+ * SPDX-License-Identifier: BSD-2-Clause-Patent
+ * See LICENSE.md in the project root for full license text.
+ */
+
 #ifndef FUNNELCAKE_INTERNAL_H
 #define FUNNELCAKE_INTERNAL_H
 
@@ -5,9 +12,12 @@
 #include "funnelcake.h"
 
 #include <stddef.h>
-#include <stdlib.h>
+#include <stdlib.h>     /* posix_memalign */
 #if defined(_WIN32)
 #include <malloc.h>
+#endif
+#if defined(__linux__)
+#  include <sys/mman.h> /* madvise, MADV_HUGEPAGE */
 #endif
 
 static inline int fused_aligned_alloc(void **ptr, size_t alignment, size_t size)
@@ -57,6 +67,30 @@ static inline void fused_aligned_free(void *ptr)
 /* Maximum number of simultaneous output steps */
 #define FUSED_MAX_STEPS     8
 
+/* Allocations at or above this size get a transparent-huge-page hint
+ * (madvise(MADV_HUGEPAGE)) on Linux.  Output planes large enough to span
+ * the L1 dTLB and benefit from uninterrupted hardware-prefetch streams
+ * across page boundaries cross this threshold; smaller buffers (chroma
+ * planes of deep cascades, scratch pools) sit below it and would only
+ * waste memory if rounded up to a 2 MB huge page. */
+#define FUSED_THP_HINT_THRESHOLD ((size_t)(2 * 1024 * 1024))
+
+/* posix_memalign + size-gated MADV_HUGEPAGE hint.  The madvise call is
+ * a hint: kernels with transparent_hugepage=never silently ignore it,
+ * and on non-Linux platforms the call is compiled out entirely.  The
+ * underlying allocation is a normal heap pointer that free()s normally. */
+static inline int fused_alloc_aligned(void **out, size_t alignment, size_t size)
+{
+    int rc = posix_memalign(out, alignment, size);
+    if (rc != 0) return rc;
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+    if (size >= FUSED_THP_HINT_THRESHOLD) {
+        (void)madvise(*out, size, MADV_HUGEPAGE);
+    }
+#endif
+    return rc;
+}
+
 /* Scratch pool bump allocator.  Kernels that need several internal
  * scratch buffers carve them out of a single persistent pool allocated
  * in init, avoiding per-frame malloc/free which causes first-touch
@@ -86,6 +120,11 @@ static inline void *fused_scratch_alloc(fused_scratch_t *s, size_t n)
     s->used = aligned + n;
     return p;
 }
+
+/* Emit a one-time diagnostic when a scratch pool is exhausted. Defined in
+ * log.c. Called by the scalar kernels when fused_scratch_alloc fails - an
+ * init-sizing invariant violation that must never happen in correct code. */
+void fused_scratch_exhausted_warn(void);
 
 /* Kernel family identifiers */
 #define FUSED_FAMILY_THIRDS 0   /* 1.5x/3x/6x/12x - divide-by-3 cascade */
@@ -246,6 +285,19 @@ void fused_kernel_pow2_neon(const fused_kernel_params_t *p,
                              const uint8_t *src_v);
 #endif /* __aarch64__ */
 
+#if defined(__riscv) && (__riscv_xlen == 64)
+/* RVV (riscv64 only) */
+void fused_kernel_thirds_rvv(const fused_kernel_params_t *p,
+                              const uint8_t *src_y,
+                              const uint8_t *src_u,
+                              const uint8_t *src_v);
+
+void fused_kernel_pow2_rvv(const fused_kernel_params_t *p,
+                            const uint8_t *src_y,
+                            const uint8_t *src_u,
+                            const uint8_t *src_v);
+#endif /* __riscv */
+
 
 /* --------------------------------------------------------------------------
  * Upscale kernel entry points (SDR)
@@ -306,6 +358,23 @@ void fused_kernel_pow2_up_neon(const fused_kernel_params_t *p,
                                const uint8_t *src_u,
                                const uint8_t *src_v);
 #endif /* __aarch64__ */
+
+#if defined(__riscv) && (__riscv_xlen == 64)
+void fused_kernel_upscale_rvv(const fused_kernel_params_t *p,
+                               const uint8_t *src_y,
+                               const uint8_t *src_u,
+                               const uint8_t *src_v);
+
+void fused_kernel_thirds_up_rvv(const fused_kernel_params_t *p,
+                                 const uint8_t *src_y,
+                                 const uint8_t *src_u,
+                                 const uint8_t *src_v);
+
+void fused_kernel_pow2_up_rvv(const fused_kernel_params_t *p,
+                               const uint8_t *src_y,
+                               const uint8_t *src_u,
+                               const uint8_t *src_v);
+#endif /* __riscv */
 
 
 /* ==========================================================================
@@ -490,6 +559,19 @@ void fused_kernel_pow2_hdr_neon(const fused_hdr_kernel_params_t *p,
                                  const uint16_t *src_v);
 #endif /* __aarch64__ */
 
+#if defined(__riscv) && (__riscv_xlen == 64)
+/* RVV (riscv64 only) */
+void fused_kernel_thirds_hdr_rvv(const fused_hdr_kernel_params_t *p,
+                                  const uint16_t *src_y,
+                                  const uint16_t *src_u,
+                                  const uint16_t *src_v);
+
+void fused_kernel_pow2_hdr_rvv(const fused_hdr_kernel_params_t *p,
+                                const uint16_t *src_y,
+                                const uint16_t *src_u,
+                                const uint16_t *src_v);
+#endif /* __riscv */
+
 
 /* --------------------------------------------------------------------------
  * HDR upscale kernel entry points
@@ -543,6 +625,23 @@ void fused_kernel_pow2_up_hdr_neon(const fused_hdr_kernel_params_t *p,
                                    const uint16_t *src_u,
                                    const uint16_t *src_v);
 #endif /* __aarch64__ */
+
+#if defined(__riscv) && (__riscv_xlen == 64)
+void fused_kernel_upscale_hdr_rvv(const fused_hdr_kernel_params_t *p,
+                                   const uint16_t *src_y,
+                                   const uint16_t *src_u,
+                                   const uint16_t *src_v);
+
+void fused_kernel_thirds_up_hdr_rvv(const fused_hdr_kernel_params_t *p,
+                                     const uint16_t *src_y,
+                                     const uint16_t *src_u,
+                                     const uint16_t *src_v);
+
+void fused_kernel_pow2_up_hdr_rvv(const fused_hdr_kernel_params_t *p,
+                                   const uint16_t *src_y,
+                                   const uint16_t *src_u,
+                                   const uint16_t *src_v);
+#endif /* __riscv */
 
 
 #endif /* FUNNELCAKE_INTERNAL_H */

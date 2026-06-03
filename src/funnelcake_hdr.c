@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) 2020-2026 Kevin Day
+ *
+ * SPDX-License-Identifier: BSD-2-Clause-Patent
+ * See LICENSE.md in the project root for full license text.
+ */
+
 /* --------------------------------------------------------------------------
  * funnelcake_hdr.c - HDR10 dispatch and initialization logic
  *
@@ -289,6 +296,15 @@ int fused_hdr_init(fused_hdr_ctx_t *ctx)
         simd_thirds_up_fn = fused_kernel_thirds_up_hdr_avx2;
         simd_pow2_up_fn   = fused_kernel_pow2_up_hdr_avx2;
     }
+#elif defined(__riscv) && (__riscv_xlen == 64)
+    if (caps->has_rvv) {
+        has_simd = 1;
+        simd_thirds_fn    = fused_kernel_thirds_hdr_rvv;
+        simd_pow2_fn      = fused_kernel_pow2_hdr_rvv;
+        simd_upscale_fn   = fused_kernel_upscale_hdr_rvv;
+        simd_thirds_up_fn = fused_kernel_thirds_up_hdr_rvv;
+        simd_pow2_up_fn   = fused_kernel_pow2_up_hdr_rvv;
+    }
 #else
     (void)caps;
 #endif
@@ -296,10 +312,12 @@ int fused_hdr_init(fused_hdr_ctx_t *ctx)
     if (!has_simd) {
         /* One-time notice routed through the configured warning logger so
          * callers using FUSED_LOG_SUPPRESS / FUSED_LOG_CALLBACK can control
-         * it. The first init that hits this wins; subsequent inits stay
-         * silent because the CPU detection result is invariant. */
+         * it. See matching block in funnelcake.c for why
+         * FUNNELCAKE_FORCE_SCALAR suppresses this warning. */
         static int g_no_simd_warned = 0;
-        if (!g_no_simd_warned) {
+        const char *force_scalar_env = getenv("FUNNELCAKE_FORCE_SCALAR");
+        int forced_scalar = (force_scalar_env != NULL && force_scalar_env[0] != '\0');
+        if (!g_no_simd_warned && !forced_scalar) {
             g_no_simd_warned = 1;
             fused_log(&ctx->log_warnings, FUSED_LOG_WARN,
                 "funnelcake-hdr: no SIMD support detected; using scalar kernel\n");

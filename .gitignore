@@ -2,9 +2,15 @@
 *.o
 *.a
 *.d
+*.S
 build/
 dist/
 funnelcake_test
+
+# PGO profile data (not used in this environment; never commit)
+*.profraw
+*.profdata
+*.gcda
 
 # Test output
 output/

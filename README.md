@@ -2,10 +2,10 @@
 
 Funnelcake is a fused multi-resolution YUV420 scaler. A single call
 produces up to four downscaled outputs and up to six upscaled outputs
-simultaneously in one pass over the source data, using AVX2 (x86-64) or
-NEON (aarch64) SIMD kernels with a portable scalar fallback. An HDR10
-path handles 10-bit PQ and HLG input with optional built-in tone mapping
-to SDR.
+simultaneously in one pass over the source data, using AVX2 (x86-64),
+NEON (aarch64), or RVV 1.0 (RISC-V) SIMD kernels with a portable scalar
+fallback. An HDR10 path handles 10-bit PQ and HLG input with optional
+built-in tone mapping to SDR.
 
 It is designed for video pipelines that need to derive multiple
 alternate-resolution copies of each frame - thumbnail generation,
@@ -90,12 +90,12 @@ Smaller time is better; larger speedup is better.
 
 | Workload | Epyc 7302 (Zen 2) | Xeon 6132 (Skylake) | Xeon E5v4 (Broadwell) |
 |---|---|---|---|
-| 640×360 down:2x                   |   11 µs  (9.9×) |   12 µs (11.8×) |   43 µs  (3.6×) |
-| 960×540 down:1.5x,3x              |   86 µs  (6.0×) |   96 µs  (7.1×) |  274 µs  (2.7×) |
-| 1280×720 down:2x,4x               |   68 µs (10.0×) |   96 µs  (9.2×) |  252 µs  (3.8×) |
-| 1920×1080 down:1.5x,3x,6x         |  372 µs  (7.4×) |  424 µs  (8.3×) |  816 µs  (4.8×) |
-| 2560×1440 down:2x,4x,8x           |  315 µs (11.8×) |  449 µs (10.7×) |  640 µs  (8.3×) |
-| 3840×2160 down:1.5x,3x,6x,12x     | 2023 µs  (6.6×) | 2046 µs  (8.3×) | 2615 µs  (7.1×) |
+| 640×360 down:2x                   |    8 µs (14.2×) |    9 µs (13.8×) |   34 µs  (4.8×) |
+| 960×540 down:1.5x,3x              |   63 µs  (8.2×) |   77 µs  (8.5×) |  202 µs  (3.9×) |
+| 1280×720 down:2x,4x               |   51 µs (13.2×) |   81 µs (10.7×) |  190 µs  (5.4×) |
+| 1920×1080 down:1.5x,3x,6x         |  261 µs (10.6×) |  314 µs (11.0×) |  585 µs  (6.9×) |
+| 2560×1440 down:2x,4x,8x           |  249 µs (14.9×) |  385 µs (12.0×) |  501 µs (11.0×) |
+| 3840×2160 down:1.5x,3x,6x,12x     | 1575 µs  (8.4×) | 1643 µs  (9.7×) | 1959 µs  (9.8×) |
 
 **aarch64 / NEON**
 
@@ -114,14 +114,14 @@ Smaller time is better; larger speedup is better.
 
 | Workload | Epyc 7302 (Zen 2) | Xeon 6132 (Skylake) | Xeon E5v4 (Broadwell) |
 |---|---|---|---|
-| 480×270 up:2x                   |   27 µs (10.2×) |   35 µs (10.2×) |   54 µs  (7.0×) |
-| 480×270 up:2x,4x                |  128 µs  (7.1×) |  189 µs  (6.1×) |  251 µs  (5.1×) |
-| 960×540 up:2x                   |  102 µs  (9.8×) |  156 µs  (8.1×) |  200 µs  (7.0×) |
-| 960×540 up:2x,3x                |  936 µs  (2.9×) | 1125 µs  (3.1×) | 1281 µs  (3.0×) |
-| 1920×1080 up:2x                 |  679 µs  (6.0×) |  843 µs  (6.0×) |  754 µs  (7.3×) |
-| 1920×1080 up:1.5x               |  828 µs  (3.4×) |  953 µs  (3.7×) | 1100 µs  (3.7×) |
-| 240×136 up:2x,4x,8x,16x         |  933 µs  (2.5×) | 1140 µs  (2.5×) | 1011 µs  (3.0×) |
-| 120×68 up:2x,4x,8x,16x,32x      |  939 µs  (2.1×) | 1133 µs  (2.1×) | 1038 µs  (2.4×) |
+| 480×270 up:2x                   |   26 µs (10.6×) |   34 µs (10.2×) |   51 µs  (9.2×) |
+| 480×270 up:2x,4x                |  130 µs  (6.9×) |  184 µs  (6.1×) |  236 µs  (6.7×) |
+| 960×540 up:2x                   |  104 µs  (9.4×) |  150 µs  (8.1×) |  184 µs  (7.5×) |
+| 960×540 up:2x,3x                |  846 µs  (3.1×) | 1014 µs  (3.3×) | 1228 µs  (3.2×) |
+| 1920×1080 up:2x                 |  602 µs  (6.6×) |  758 µs  (6.4×) |  754 µs  (7.3×) |
+| 1920×1080 up:1.5x               |  743 µs  (3.7×) |  858 µs  (4.0×) | 1052 µs  (3.8×) |
+| 240×136 up:2x,4x,8x,16x         |  847 µs  (2.6×) | 1016 µs  (2.7×) | 1011 µs  (3.0×) |
+| 120×68 up:2x,4x,8x,16x,32x      |  852 µs  (2.2×) | 1003 µs  (2.3×) | 1038 µs  (2.4×) |
 
 **aarch64 / NEON**
 
@@ -149,9 +149,9 @@ for a longer discussion.
 
 | Workload | Epyc 7302 (Zen 2) | Xeon 6132 (Skylake) | Xeon E5v4 (Broadwell) |
 |---|---|---|---|
-| 1920×1080 down:2x up:2x             |  848 µs (5.9×) | 1050 µs (6.0×) |  924 µs (7.2×) |
-| 1920×1080 down:1.5x,3x up:2x        | 1180 µs (5.4×) | 1328 µs (5.9×) | 1217 µs (7.0×) |
-| 1280×720 down:2x,4x up:2x,4x        | 3037 µs (2.7×) | 2535 µs (3.7×) | 2527 µs (4.2×) |
+| 1920×1080 down:2x up:2x             |  730 µs (6.7×) |  976 µs (6.1×) |  924 µs (7.4×) |
+| 1920×1080 down:1.5x,3x up:2x        |  985 µs (6.1×) | 1151 µs (6.5×) | 1149 µs (7.5×) |
+| 1280×720 down:2x,4x up:2x,4x        | 2148 µs (3.5×) | 2236 µs (3.7×) | 2493 µs (4.2×) |
 
 **aarch64 / NEON**
 
@@ -172,11 +172,11 @@ aren't representative.
 
 | Workload | Epyc 7302 | Xeon 6132 | Xeon E5v4 |
 |---|---|---|---|
-| 1920×1080 I010 down:1.5x,3x,6x        |  765 µs |  865 µs |  997 µs |
-| 3840×2160 I010 down:1.5x,3x,6x,12x    | 4266 µs | 4243 µs | 5681 µs |
-| 3840×2160 P010 down:1.5x,3x,6x,12x    | 5446 µs | 5209 µs | 6734 µs |
-| 1920×1080 I010 up:2x                  | 2845 µs | 2474 µs | 2286 µs |
-| 1920×1080 I010 down:1.5x,3x up:2x     | 3840 µs | 3409 µs | 3594 µs |
+| 1920×1080 I010 down:1.5x,3x,6x        |  414 µs |  490 µs |  517 µs |
+| 3840×2160 I010 down:1.5x,3x,6x,12x    | 3029 µs | 3120 µs | 3114 µs |
+| 3840×2160 P010 down:1.5x,3x,6x,12x    | 3517 µs | 4106 µs | 5399 µs |
+| 1920×1080 I010 up:2x                  | 1929 µs | 2207 µs | 2402 µs |
+| 1920×1080 I010 down:1.5x,3x up:2x     | 2661 µs | 2774 µs | 2991 µs |
 
 **aarch64 / NEON**
 
@@ -190,7 +190,7 @@ aren't representative.
 
 The P010 row uses the Y + interleaved-UV layout that most HEVC Main10
 encoders emit natively; the P010 vs I010 gap on the matching 4K
-workload (e.g. 5446 vs 4266 µs on Epyc 7302) is the on-the-fly UV
+workload (e.g. 3852 vs 3340 µs on Epyc 7302) is the on-the-fly UV
 deinterleave cost, not a fundamental difference in scaling work.
 
 HDR kernels are roughly 2–4× slower per byte than their SDR
@@ -243,6 +243,49 @@ badly with the platform's memory subsystem. Whatever the exact cause,
 Graviton 4 is by a clear margin the deployment target where using
 funnelcake instead of libswscale produces the largest absolute savings
 per core for real-time multi-resolution video pipelines.
+
+### RISC-V (RVV 1.0)
+
+Tested on a SpacemiT K1 (uarch `ky,x60`, sold as the Ky X1 in the
+Orange Pi RV2): full RVV 1.0, VLEN=256, DLEN=128. Kernels are
+vector-length-agnostic, so the same binary should run on any V-capable
+RVV chip; tuning choices (LMUL=1 with manual unrolling) target the X60
+specifically.
+
+| Workload | funnelcake | vs libswscale |
+|---|---|---|
+| 1920×1080 down:1.5x,3x,6x        |  3.9 ms | 55.7× / 37.7× cascade |
+| 3840×2160 down:1.5x,3x,6x,12x    | 41.2 ms | 26.7× / 14.4× cascade |
+| 1920×1080 up:2x                  |  3.3 ms | 128.0× |
+| 1920×1080 down:2x up:2x          |  8.0 ms | 63.4× |
+| 1920×1080 down:1.5x,3x up:2x     |  9.2 ms | 63.9× |
+| 1920×1080 I010 down:1.5x,3x,6x   | 22.2 ms | (no HDR comparison) |
+| 1920×1080 I010 up:2x             |  9.8 ms | (no HDR comparison) |
+
+HDR speedups land roughly half the SDR ratio because 10-bit u16 elements
+halve the per-vector throughput on the X60's 256-bit V unit.
+
+**GCC 14 is strongly recommended on RISC-V.** It ships the v1.0 RVV
+intrinsic spec including `vlseg2`/`vsseg2`/`vlseg3`/`vsseg3` segment
+loads and stores, which the kernels use for every horizontal halve, 3:1
+box average, 1.5x bilinear, and 2x upsample path.  GCC 13 only ships
+v0.11 intrinsics and doesn't expose the segment ops, so the build falls
+back to multiple strided loads/stores per chunk - on the X60 that
+typically costs **2–4× per workload** vs the GCC 14 build.  The Makefile
+detects the older spec at compile time and prints a `#pragma message`
+recommending the upgrade; the build still works either way.  All numbers
+in the table above are GCC 14.
+
+Detection requires the V extension and a non-emulated misaligned-vector
+load path (queried via `riscv_hwprobe`); chips that report SLOW or
+EMULATED for `RISCV_HWPROBE_KEY_MISALIGNED_VECTOR_PERF`, or that
+advertise only the embedded `Zve*` subset, fall back to the scalar
+kernel.
+
+LTO (`make LTO=1`) is auto-disabled on `riscv64` because GCC 13's LTO link
+can't resolve the RVV target builtins, and GCC 14's LTO partition pass hits
+an internal compiler error in `riscv_vector::expand_builtin`. The build
+emits a `$(warning ...)` notice and continues with `-O3` only.
 
 ### A note on the memory wall
 
@@ -337,7 +380,7 @@ multiple of 32**. This means:
 The deepest thirds step imposes a divisibility requirement on `src_width`:
 
 | Deepest step requested | src_width must be divisible by |
-|------------------------|-------------------------------|
+|------------------------|--------------------------------|
 | 1.5× only              | 3                              |
 | 3×                     | 6                              |
 | 6×                     | 12                             |
@@ -346,7 +389,7 @@ The deepest thirds step imposes a divisibility requirement on `src_width`:
 Similarly for `src_height` (vertical period):
 
 | Deepest step requested | src_height must be divisible by |
-|------------------------|--------------------------------|
+|------------------------|---------------------------------|
 | 1.5× or 3×             | 6                               |
 | 6×                     | 12                              |
 | 12×                    | 24                              |
@@ -355,7 +398,7 @@ Similarly for `src_height` (vertical period):
 The deepest pow2 step imposes a similar requirement:
 
 | Deepest step requested | src_width and src_height must be divisible by |
-|------------------------|----------------------------------------------|
+|------------------------|-----------------------------------------------|
 | 2×                     | 4                                             |
 | 4×                     | 8                                             |
 | 8×                     | 16                                            |
@@ -374,9 +417,9 @@ silently trimming.
 
 ### Mixing families
 A single `fused_scaler_ctx_t` may only use downscale steps from **one
-family** per init. Requesting `FUSED_SCALE_3X | FUSED_SCALE_4X` (thirds
-+ pow2) returns `FUSED_ERR_INVALID_FLAGS`. Use two separate contexts if
-you need both downscale families.
+family** per init. Requesting `FUSED_SCALE_3X | FUSED_SCALE_4X` (thirds + pow2)
+returns `FUSED_ERR_INVALID_FLAGS`. Use two separate contexts if you need
+both downscale families.
 
 Upscaling is independent of the downscale family selection and may be
 combined with either thirds or pow2 downscale flags in the same init
@@ -417,6 +460,33 @@ mind on compute-limited x86 targets.
 ### Thread safety
 Each context is independent and not thread-safe. Use one context per thread.
 Concurrent reads from separate contexts on the same source data are safe.
+
+### Performance: huge-page-backed source buffers (Linux)
+
+For workloads that are bandwidth-limited rather than compute-limited (the
+straight 2× upscales on DDR5 systems and the shallow pow2 downscales on
+fast-memory platforms called out in [A note on the memory wall](#a-note-on-the-memory-wall)),
+callers can capture a small additional speedup on Linux by allocating the
+source Y/U/V planes in huge-page-backed memory:
+
+```c
+#include <sys/mman.h>
+
+void *plane = NULL;
+posix_memalign(&plane, 32, plane_size);
+if (plane_size >= 2 * 1024 * 1024) {
+    madvise(plane, plane_size, MADV_HUGEPAGE);
+}
+```
+
+This reduces TLB pressure across the streaming row-strided read pattern and
+lets the L2 hardware prefetcher (which resets at 4 KB page boundaries on
+Intel and AMD) run uninterrupted across the source plane. The library
+already applies the same hint internally to its own large output planes at
+init, so this extension covers only the caller-owned source planes that
+the library cannot allocate. The hint is a no-op on systems with
+`transparent_hugepage=never` and is unnecessary or unavailable on non-Linux
+platforms.
 
 
 ## Getting started
@@ -483,17 +553,73 @@ fused_scaler_free(&scaler);
 ```
 
 
+## Releases
+
+### Cutting a new release
+
+1. Update `VERSION` at the top of the [Makefile](Makefile) (single source of
+   truth — `funnelcake.pc` and the FreeBSD port pull from it).
+2. If the public ABI changed in a backward-incompatible way, also bump
+   `SOVERSION` in the Makefile. This drives the installed `libfunnelcake.so.N`
+   suffix; downstream packages will need to be rebuilt against the new
+   major.
+3. Commit the version bump, then tag:
+   ```
+   git tag -a v0.1.0 -m "Release 0.1.0"
+   git push origin v0.1.0
+   ```
+4. GitHub auto-generates a tarball at
+   `https://github.com/<owner>/funnelcake/archive/refs/tags/v0.1.0.tar.gz`
+   that the FreeBSD port consumes via `USE_GITHUB`.
+
+### Building and submitting the FreeBSD port
+
+A port skeleton lives in [scripts/freebsd/](scripts/freebsd/). To exercise
+or update the port locally:
+
+```sh
+# 1. Copy the skeleton into your ports tree.
+sudo mkdir -p /usr/ports/multimedia/funnelcake
+sudo cp scripts/freebsd/Makefile scripts/freebsd/pkg-descr \
+        scripts/freebsd/pkg-plist /usr/ports/multimedia/funnelcake/
+
+# 2. Update DISTVERSION in the port Makefile to match the upstream tag.
+
+# 3. Generate the distfile checksum:
+cd /usr/ports/multimedia/funnelcake
+sudo make makesum
+
+# 4. Lint, build, install, and verify the packaging list. BATCH=yes skips
+#    the interactive options-config dialog (which hangs over a non-TTY
+#    SSH session if you have OPTIONS_DEFINE knobs):
+sudo make BATCH=yes stage check-plist
+sudo make BATCH=yes package
+sudo pkg add work/pkg/funnelcake-*.pkg
+
+# 5. Run the official lint pass (portaudit-equivalent):
+sudo portlint -A
+```
+
+Once the port builds and lints cleanly, submit it as a bug report against
+the FreeBSD ports tree per the
+[Porter's Handbook §3.7](https://docs.freebsd.org/en/books/porters-handbook/book/#porting-submitting).
+The optional `FFMPEG` knob pulls in `multimedia/ffmpeg` for the swscale
+benchmark comparison; without it the library and headers install but
+`fetch-samples` / `bench-swscale` are unavailable at runtime.
+
+
 ## Platform support
 
 | Platform | SIMD | Notes |
 |----------|------|-------|
-| x86-64 with AVX2 | AVX2 | Detected at runtime via cpuid |
+| x86-64 with AVX2 (Linux, macOS, FreeBSD) | AVX2 | Detected at runtime via cpuid |
 | x86-64 without AVX2 | Scalar | Broadwell and later all have AVX2 |
-| aarch64 (Apple Silicon, AWS Graviton) | NEON | All aarch64 cores have NEON |
+| aarch64 (Apple Silicon, AWS Graviton, FreeBSD/arm64) | NEON | All aarch64 cores have NEON |
+| riscv64 with RVV 1.0 (Linux) | RVV | Detected via `riscv_hwprobe`; requires the full V extension and non-emulated misaligned-vector loads |
 | Other | Scalar | Portable C, no intrinsics |
 
 The scalar fallback is correct on all platforms but significantly slower.
-On hardware without AVX2 or NEON, the library logs a one-time notice
+On hardware without AVX2, NEON, or RVV, the library logs a one-time notice
 through the configured `log_warnings` channel at first init (default:
 stderr).
 
@@ -566,3 +692,13 @@ fused_hdr_free(&hdr);
 ```
 
 See **[docs/API.md](docs/API.md)** for the full HDR10 API reference.
+
+## License
+
+Copyright (c) 2020-2026 Kevin Day. Licensed under the BSD-2-Clause-Patent license — see [LICENSE.md](LICENSE.md) for the full text.
+
+The core kernels were based off my hand-written assembly that were converted
+to C intrinsics for easier portability and readability. AI was not used for
+the core functionality, kernels or algorithms. I did use AI agents for
+documentation, improving my terrible comments, fixing the build system,
+and writing test cases.

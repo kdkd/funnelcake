@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) 2020-2026 Kevin Day
+ *
+ * SPDX-License-Identifier: BSD-2-Clause-Patent
+ * See LICENSE.md in the project root for full license text.
+ */
+
 #include "test_main.h"
 #include <stdio.h>
 #include <string.h>
@@ -118,6 +125,9 @@ int main(int argc, char *argv[])
 
         printf("\n=== HDR Correctness tests ===\n");
         run_hdr_correctness_tests();
+
+        printf("\n=== Parity tests (scalar vs SIMD) ===\n");
+        run_parity_tests();
     }
 
     if (opts.run_bench || opts.run_bench_sdr) {

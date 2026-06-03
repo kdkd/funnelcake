@@ -1,8 +1,17 @@
+/*
+ * Copyright (c) 2020-2026 Kevin Day
+ *
+ * SPDX-License-Identifier: BSD-2-Clause-Patent
+ * See LICENSE.md in the project root for full license text.
+ */
+
 #include "detect.h"
 #include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
 
 /* Static cache - zero-initialised at startup */
-static fused_cpu_caps_t g_caps = {0, 0};
+static fused_cpu_caps_t g_caps = {0, 0, 0};
 static int              g_detected = 0;
 
 
@@ -95,10 +104,29 @@ static void detect_aarch64(void)
     g_caps.has_neon = 1;
 }
 
+#elif defined(__FreeBSD__)
+
+#include <sys/auxv.h>
+#include <machine/elf.h>
+
+/*
+ * On FreeBSD aarch64, query AT_HWCAP via elf_aux_info() (analogous to
+ * Linux's getauxval). HWCAP_ASIMD indicates Advanced SIMD (NEON-equivalent).
+ */
+static void detect_aarch64(void)
+{
+    unsigned long hwcap = 0;
+    if (elf_aux_info(AT_HWCAP, &hwcap, sizeof(hwcap)) != 0) {
+        return;
+    }
+    if (hwcap & HWCAP_ASIMD) {
+        g_caps.has_neon = 1;
+    }
+}
+
 #else /* aarch64 Linux (and other non-Apple, non-Windows aarch64) */
 
 #include <stdio.h>
-#include <string.h>
 
 /*
  * On Linux aarch64, check /proc/cpuinfo for "neon" or "asimd" in the
@@ -132,6 +160,138 @@ static void detect_aarch64(void)
 #endif /* __aarch64__ || _M_ARM64 */
 
 
+#if defined(__riscv) && (__riscv_xlen == 64)
+
+#include <stdio.h>
+#include <sys/syscall.h>
+
+/* syscall(2) is not declared under _POSIX_C_SOURCE=200112L (it's gated
+ * behind _GNU_SOURCE / _DEFAULT_SOURCE).  Declare it locally rather than
+ * widening the feature-test macros for the whole TU. */
+extern long syscall(long number, ...);
+
+/*
+ * Detect RVV 1.0 (the "V" extension) on riscv64 Linux.
+ *
+ * Two-tier fallback:
+ *   1. riscv_hwprobe() syscall (kernel 6.5+) - the canonical interface,
+ *      reports both "is V supported" and a perf hint for misaligned vector
+ *      access.  We require V supported AND - when the kernel reports a
+ *      definite perf class - misaligned vector access NOT marked SLOW or
+ *      EMULATED.  Chips that emulate misaligned vector loads via kernel
+ *      trap are slower with vectors than without.
+ *   2. Parse /proc/cpuinfo "isa:" line for the V extension.  Last resort.
+ *      Reject zve* (embedded vector subset) - the kernels assume full V.
+ *
+ * Does not depend on <asm/hwprobe.h> being installed: the syscall numbers
+ * and struct layout are stable kernel ABI, so we declare them inline.
+ */
+
+/* SYS_riscv_hwprobe = 258 has been the riscv64 syscall number since Linux
+ * 6.5 (the kernel that introduced the syscall); the values below mirror
+ * the upstream uapi definition. */
+#ifndef SYS_riscv_hwprobe
+# define SYS_riscv_hwprobe 258
+#endif
+
+struct fused_riscv_hwprobe {
+    int64_t  key;
+    uint64_t value;
+};
+
+#define FUSED_HWPROBE_KEY_IMA_EXT_0               4
+#define FUSED_HWPROBE_KEY_MISALIGNED_VECTOR_PERF  11
+#define FUSED_HWPROBE_IMA_V                       (1ULL << 2)
+/* Misaligned-vector-perf return classes (from upstream uapi):
+ *   0 = UNKNOWN, 2 = SLOW, 3 = FAST, 4 = EMULATED.
+ * SLOW and EMULATED disqualify; UNKNOWN and FAST allow RVV. */
+#define FUSED_HWPROBE_MISALIGNED_VECTOR_SLOW      2
+#define FUSED_HWPROBE_MISALIGNED_VECTOR_EMULATED  4
+
+static int detect_rvv_via_hwprobe(int *out_present, int *out_misaligned_ok)
+{
+    struct fused_riscv_hwprobe pairs[2] = {
+        { FUSED_HWPROBE_KEY_IMA_EXT_0,              0 },
+        { FUSED_HWPROBE_KEY_MISALIGNED_VECTOR_PERF, 0 },
+    };
+
+    /* args: pairs, pair_count, cpu_set_size, cpu_set, flags */
+    long rc = syscall(SYS_riscv_hwprobe, pairs, (long)2, (long)0,
+                      (void *)0, (long)0);
+    if (rc < 0) {
+        return -1; /* syscall not available - fall through to /proc/cpuinfo */
+    }
+
+    *out_present = (pairs[0].value & FUSED_HWPROBE_IMA_V) ? 1 : 0;
+
+    uint64_t mv = pairs[1].value;
+    *out_misaligned_ok = (mv != FUSED_HWPROBE_MISALIGNED_VECTOR_SLOW &&
+                          mv != FUSED_HWPROBE_MISALIGNED_VECTOR_EMULATED);
+    return 0;
+}
+
+static int detect_rvv_via_cpuinfo(void)
+{
+    FILE *f = fopen("/proc/cpuinfo", "r");
+    if (f == NULL) {
+        return 0;
+    }
+
+    int found = 0;
+    char line[2048];
+    while (fgets(line, sizeof(line), f) != NULL) {
+        if (strncmp(line, "isa", 3) != 0) {
+            continue;
+        }
+        const char *colon = strchr(line, ':');
+        if (colon == NULL) {
+            continue;
+        }
+        const char *isa = colon + 1;
+
+        /* The base ISA spelling packs extension letters together
+         * (e.g. "rv64imafdcv"), and named extensions are appended with
+         * underscores (e.g. "_zicsr_zifencei").  Walk the inline letters
+         * looking for a standalone 'v', then also check for "_v_"/"_v "
+         * tokens.  Reject zve*-only chips: an embedded vector subset is
+         * not enough for these kernels. */
+        const char *rv = strstr(isa, "rv64");
+        if (rv != NULL) {
+            const char *p = rv + 4;
+            while (*p && *p != '_' && *p != ' ' && *p != '\t' && *p != '\n') {
+                if (*p == 'v') { found = 1; break; }
+                p++;
+            }
+        }
+        if (!found && (strstr(isa, "_v_") != NULL ||
+                       strstr(isa, "_v\n") != NULL ||
+                       strstr(isa, "_v ")  != NULL)) {
+            found = 1;
+        }
+        break;
+    }
+
+    fclose(f);
+    return found;
+}
+
+static void detect_riscv(void)
+{
+    int present = 0, misaligned_ok = 0;
+    if (detect_rvv_via_hwprobe(&present, &misaligned_ok) == 0) {
+        g_caps.has_rvv = (present && misaligned_ok) ? 1 : 0;
+        return;
+    }
+
+    /* hwprobe unavailable - fall through to /proc/cpuinfo parsing. */
+    if (detect_rvv_via_cpuinfo()) {
+        g_caps.has_rvv = 1;
+    }
+}
+
+#endif /* __riscv && __riscv_xlen == 64 */
+
+
 /* --------------------------------------------------------------------------
  * Public API
  * -------------------------------------------------------------------------- */
@@ -139,13 +299,28 @@ static void detect_aarch64(void)
 const fused_cpu_caps_t *fused_detect_cpu(void)
 {
     if (!g_detected) {
+        /* Test/diagnostic override: setting FUNNELCAKE_FORCE_SCALAR=<non-empty>
+         * skips every per-arch SIMD probe, leaving caps zeroed.  Used by the
+         * parity test to compare scalar output against SIMD output without
+         * running two separate processes. */
+        const char *force_scalar = getenv("FUNNELCAKE_FORCE_SCALAR");
+        if (force_scalar == NULL || force_scalar[0] == '\0') {
 #if defined(__x86_64__)
-        detect_x86();
+            detect_x86();
 #elif defined(__aarch64__) || defined(_M_ARM64)
-        detect_aarch64();
+            detect_aarch64();
+#elif defined(__riscv) && (__riscv_xlen == 64)
+            detect_riscv();
 #endif
+        }
         g_detected = 1;
     }
 
     return &g_caps;
+}
+
+void fused_detect_cpu_reset(void)
+{
+    memset(&g_caps, 0, sizeof(g_caps));
+    g_detected = 0;
 }

@@ -19,6 +19,42 @@ ifeq ($(UNAME_S),Windows_NT)
   CFLAGS_BASE += -D__USE_MINGW_ANSI_STDIO=1
 endif
 
+# Normalize FreeBSD's "amd64" to "x86_64" so the SIMD-selection blocks
+# below match. FreeBSD/arm64 already reports "aarch64".
+ifeq ($(UNAME_S),FreeBSD)
+  ifeq ($(UNAME_M),amd64)
+    UNAME_M := x86_64
+  endif
+endif
+
+# --- Versioning and install layout ---
+# VERSION is the project version string used in funnelcake.pc and elsewhere.
+# Bump this whenever you cut a release (see README.md, "Release process").
+VERSION    ?= 0.1.0
+
+# SOVERSION is the shared-library major version. Bump only on ABI breaks.
+SOVERSION  ?= 1
+
+# Install destinations (overridable from the command line / port Makefile).
+PREFIX     ?= /usr/local
+LIBDIR     ?= $(PREFIX)/lib
+INCLUDEDIR ?= $(PREFIX)/include
+# FreeBSD ports use $(PREFIX)/libdata/pkgconfig; Linux distros use lib/pkgconfig.
+# Default to lib/pkgconfig; the FreeBSD port Makefile overrides it.
+PKGCONFDIR ?= $(LIBDIR)/pkgconfig
+INSTALL    ?= install
+
+# Shared-library naming and link flags differ between Darwin and ELF systems.
+ifeq ($(UNAME_S),Darwin)
+  SHLIB         = libfunnelcake.$(SOVERSION).dylib
+  SHLIB_LINK    = libfunnelcake.dylib
+  SHLIB_LDFLAGS = -dynamiclib -install_name $(LIBDIR)/$(SHLIB)
+else
+  SHLIB         = libfunnelcake.so.$(SOVERSION)
+  SHLIB_LINK    = libfunnelcake.so
+  SHLIB_LDFLAGS = -shared -Wl,-soname,$(SHLIB)
+endif
+
 # --- Tuning options ---
 
 # SCALAR_ARCH: controls -march for kernels_scalar.c only
@@ -74,7 +110,16 @@ LTO ?= 0
 CC_FAMILY_IS_CLANG := $(shell $(CC) --version 2>/dev/null | grep -qi clang && echo 1)
 
 ifeq ($(LTO),1)
-  ifeq ($(CC_FAMILY_IS_CLANG),1)
+  # LTO + RVV intrinsics is currently broken on every GCC we've tested:
+  # GCC 13 lacks target-builtin info during the LTO link, and GCC 14 hits
+  # an internal compiler error in riscv_vector::expand_builtin during the
+  # LTO partition pass.  Auto-disable LTO on riscv64 with a clear notice
+  # rather than letting the user hit the cryptic ICE.  Drop this guard
+  # once a fixed compiler ships and is tested.
+  ifeq ($(UNAME_M),riscv64)
+    $(warning funnelcake: LTO disabled on riscv64 (GCC LTO + RVV intrinsics ICEs in tested versions). Build will use -O3 only.)
+    LTO_CFLAGS =
+  else ifeq ($(CC_FAMILY_IS_CLANG),1)
     LTO_CFLAGS = -flto=thin
   else
     LTO_CFLAGS = -flto=auto
@@ -194,6 +239,15 @@ else ifeq ($(UNAME_M),aarch64)
 else ifeq ($(UNAME_M),arm64)
   LIB_SRCS += src/kernels_neon.c src/kernels_hdr_neon.c \
               src/kernels_upscale_neon.c
+else ifeq ($(UNAME_M),riscv64)
+  LIB_SRCS += src/kernels_rvv.c src/kernels_hdr_rvv.c \
+              src/kernels_upscale_rvv.c
+  # LTO link must re-process the RVV intrinsic IR with the V extension
+  # available; otherwise lto1 errors out with "target specific builtin
+  # not available".  Adding -march=rv64gcv to the link line satisfies it
+  # without affecting non-LTO builds (where the link step doesn't touch
+  # the IR at all).
+  LINK_MARCH = -march=rv64gcv
 endif
 
 LIB_OBJS = $(LIB_SRCS:.c=.o)
@@ -202,11 +256,12 @@ LIB_OBJS = $(LIB_SRCS:.c=.o)
 TEST_SRCS = test/test_main.c test/test_validation.c test/test_correctness.c \
             test/test_patterns.c test/test_visual.c test/test_bench.c \
             test/test_hdr_validation.c test/test_hdr_correctness.c \
-            test/test_hdr_bench.c test/test_swscale_bench.c
+            test/test_hdr_bench.c test/test_swscale_bench.c \
+            test/test_parity.c
 TEST_OBJS = $(TEST_SRCS:.c=.o)
 
 # Default target
-.PHONY: all lib test bench bench-sdr bench-hdr bench-swscale visual fetch-samples clean pgo pgo-clean
+.PHONY: all lib shared test bench bench-sdr bench-hdr bench-swscale visual asm fetch-samples clean pgo pgo-clean install
 
 all: lib
 
@@ -215,8 +270,40 @@ lib: libfunnelcake.a
 libfunnelcake.a: $(LIB_OBJS)
 	$(AR) rcs $@ $^
 
+# Shared library (built on demand, e.g. for `make install`). The library
+# objects are already compiled with -fPIC, so they can be reused as-is.
+shared: $(SHLIB)
+
+$(SHLIB): $(LIB_OBJS)
+	$(CC) $(SHLIB_LDFLAGS) $(LINK_MARCH) -o $@ $^ $(LDFLAGS)
+
+# pkg-config file generated at build time so that downstream consumers
+# can do `pkg-config --cflags --libs funnelcake`.
+funnelcake.pc:
+	@echo 'prefix=$(PREFIX)'                              >  $@
+	@echo 'exec_prefix=$${prefix}'                        >> $@
+	@echo 'libdir=$(LIBDIR)'                              >> $@
+	@echo 'includedir=$(INCLUDEDIR)'                      >> $@
+	@echo ''                                              >> $@
+	@echo 'Name: funnelcake'                              >> $@
+	@echo 'Description: SIMD YUV scaler with HDR/SDR tonemapping' >> $@
+	@echo 'Version: $(VERSION)'                           >> $@
+	@echo 'Cflags: -I$${includedir}'                      >> $@
+	@echo 'Libs: -L$${libdir} -lfunnelcake'               >> $@
+	@echo 'Libs.private: -lm'                             >> $@
+
+install: lib shared funnelcake.pc
+	$(INSTALL) -d $(DESTDIR)$(LIBDIR)
+	$(INSTALL) -d $(DESTDIR)$(INCLUDEDIR)
+	$(INSTALL) -d $(DESTDIR)$(PKGCONFDIR)
+	$(INSTALL) -m 644 libfunnelcake.a $(DESTDIR)$(LIBDIR)/
+	$(INSTALL) -m 755 $(SHLIB) $(DESTDIR)$(LIBDIR)/
+	ln -sf $(SHLIB) $(DESTDIR)$(LIBDIR)/$(SHLIB_LINK)
+	$(INSTALL) -m 644 include/funnelcake.h $(DESTDIR)$(INCLUDEDIR)/
+	$(INSTALL) -m 644 funnelcake.pc $(DESTDIR)$(PKGCONFDIR)/
+
 funnelcake_test: $(TEST_OBJS) libfunnelcake.a
-	$(CC) $(TEST_CFLAGS) $(EXTRA_LDFLAGS) -o $@ $(TEST_OBJS) -L. -lfunnelcake $(LDFLAGS) $(SWSCALE_TEST_LDFLAGS)
+	$(CC) $(TEST_CFLAGS) $(LINK_MARCH) $(EXTRA_LDFLAGS) -o $@ $(TEST_OBJS) -L. -lfunnelcake $(LDFLAGS) $(SWSCALE_TEST_LDFLAGS)
 
 test: funnelcake_test
 	./funnelcake_test
@@ -236,6 +323,22 @@ bench-swscale: funnelcake_test
 visual: funnelcake_test
 	@mkdir -p output
 	./funnelcake_test --visual
+
+# --- Assembly inspection ---
+# `make asm` emits annotated assembly for the AVX2 SIMD kernels next to the
+# sources so optimization experiments can inspect codegen (register spills,
+# intrinsic lowering) without rediscovering the compiler invocation. Built at
+# -O3 with the same -mavx2/-mtune flags as the real objects but WITHOUT LTO:
+# `-flto -S` emits pre-link IR, not the final per-function codegen we want to
+# read. Honors TUNE, e.g. `make asm TUNE=native`.
+ASM_CFLAGS = $(CFLAGS_BASE) $(LIB_OPT) $(TUNE_CFLAGS) -mavx2 -S -fverbose-asm
+ASM_SRCS   = src/kernels_avx2.c src/kernels_upscale_avx2.c
+ASM_OUT    = $(ASM_SRCS:.c=.S)
+
+asm: $(ASM_OUT)
+
+$(ASM_OUT): %.S: %.c
+	$(CC) $(ASM_CFLAGS) -o $@ $<
 
 # --- Sample HDR frames for visual testing ---
 # Generates synthetic PQ-encoded 10-bit test frames using ffmpeg.
@@ -328,8 +431,11 @@ fetch-samples:
 
 clean:
 	rm -f $(LIB_OBJS) $(TEST_OBJS) libfunnelcake.a funnelcake_test
+	rm -f libfunnelcake.so libfunnelcake.so.* libfunnelcake.*.dylib libfunnelcake.dylib
+	rm -f funnelcake.pc
 	rm -f src/*.gcda test/*.gcda
 	rm -f src/*.profraw default.profdata
+	rm -f src/*.S
 	rm -rf output/*
 
 # --- Profile-Guided Optimization ---
@@ -409,6 +515,18 @@ src/kernels_upscale_avx2.o: src/kernels_upscale_avx2.c
 
 src/kernels_upscale_neon.o: src/kernels_upscale_neon.c
 	$(CC) $(LIB_CFLAGS) -c -o $@ $<
+
+# RVV kernels (riscv64). -march=rv64gcv enables full RVV 1.0 (the V
+# extension); the kernels are written vector-length-agnostic so they run on
+# any V-capable chip.
+src/kernels_rvv.o: src/kernels_rvv.c
+	$(CC) $(LIB_CFLAGS) -march=rv64gcv -c -o $@ $<
+
+src/kernels_hdr_rvv.o: src/kernels_hdr_rvv.c
+	$(CC) $(LIB_CFLAGS) -march=rv64gcv -c -o $@ $<
+
+src/kernels_upscale_rvv.o: src/kernels_upscale_rvv.c
+	$(CC) $(LIB_CFLAGS) -march=rv64gcv -c -o $@ $<
 
 # Test source files use TEST_CFLAGS (O2)
 test/%.o: test/%.c

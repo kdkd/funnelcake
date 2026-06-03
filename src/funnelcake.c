@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) 2020-2026 Kevin Day
+ *
+ * SPDX-License-Identifier: BSD-2-Clause-Patent
+ * See LICENSE.md in the project root for full license text.
+ */
+
 #include "funnelcake.h"
 #include "internal.h"
 #include "detect.h"
@@ -243,6 +250,15 @@ int fused_scaler_init(fused_scaler_ctx_t *ctx)
         simd_thirds_up_fn = fused_kernel_thirds_up_avx2;
         simd_pow2_up_fn   = fused_kernel_pow2_up_avx2;
     }
+#elif defined(__riscv) && (__riscv_xlen == 64)
+    if (caps->has_rvv) {
+        has_simd = 1;
+        simd_thirds_fn    = fused_kernel_thirds_rvv;
+        simd_pow2_fn      = fused_kernel_pow2_rvv;
+        simd_upscale_fn   = fused_kernel_upscale_rvv;
+        simd_thirds_up_fn = fused_kernel_thirds_up_rvv;
+        simd_pow2_up_fn   = fused_kernel_pow2_up_rvv;
+    }
 #else
     (void)caps;
 #endif
@@ -250,10 +266,14 @@ int fused_scaler_init(fused_scaler_ctx_t *ctx)
     if (!has_simd) {
         /* One-time notice routed through the configured warning logger so
          * callers using FUSED_LOG_SUPPRESS / FUSED_LOG_CALLBACK can control
-         * it. The first init that hits this wins; subsequent inits stay
-         * silent because the CPU detection result is invariant. */
+         * it. Suppressed when scalar was explicitly requested via
+         * FUNNELCAKE_FORCE_SCALAR (the parity test toggles this on and off;
+         * printing the warning on every flip would flood the test output and
+         * confuse readers into thinking SIMD is broken). */
         static int g_no_simd_warned = 0;
-        if (!g_no_simd_warned) {
+        const char *force_scalar_env = getenv("FUNNELCAKE_FORCE_SCALAR");
+        int forced_scalar = (force_scalar_env != NULL && force_scalar_env[0] != '\0');
+        if (!g_no_simd_warned && !forced_scalar) {
             g_no_simd_warned = 1;
             fused_log(&ctx->log_warnings, FUSED_LOG_WARN,
                 "funnelcake: no SIMD support detected; using scalar kernel\n");
@@ -311,7 +331,10 @@ int fused_scaler_init(fused_scaler_ctx_t *ctx)
 
         /* (c) SIMD chroma width constraint */
         int chroma_w = out_w / 2;
-        int step_fallback = 0;
+        /* Scalar is used for this step if there is no SIMD at all, or if SIMD
+         * exists but the chroma width is misaligned (handled below). Either
+         * way the per-output contract requires fallback to report scalar. */
+        int step_fallback = !has_simd;
 
         if (has_simd && (chroma_w & 31)) {
             if (ctx->options & FUSED_OPT_NO_FALLBACK) {
@@ -418,7 +441,7 @@ int fused_scaler_init(fused_scaler_ctx_t *ctx)
         ctx->upscale_outputs[k].plane_y   = (uint8_t *)py;
         ctx->upscale_outputs[k].plane_u   = (uint8_t *)pu;
         ctx->upscale_outputs[k].plane_v   = (uint8_t *)pv;
-        ctx->upscale_outputs[k].fallback  = 0;
+        ctx->upscale_outputs[k].fallback  = !has_simd;
 
         up_achieved |= (1u << k);
     }
@@ -489,7 +512,7 @@ int fused_scaler_init(fused_scaler_ctx_t *ctx)
         ctx->upscale_outputs[FUSED_UP_IDX_TAIL].plane_y   = (uint8_t *)py;
         ctx->upscale_outputs[FUSED_UP_IDX_TAIL].plane_u   = (uint8_t *)pu;
         ctx->upscale_outputs[FUSED_UP_IDX_TAIL].plane_v   = (uint8_t *)pv;
-        ctx->upscale_outputs[FUSED_UP_IDX_TAIL].fallback  = 0;
+        ctx->upscale_outputs[FUSED_UP_IDX_TAIL].fallback  = !has_simd;
 
         up_achieved_tail = 1;
     }

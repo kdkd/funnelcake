@@ -56,6 +56,37 @@ static const double HABLE_F = 0.30;
 
 
 /* --------------------------------------------------------------------------
+ * Chroma reconstruction constants
+ *
+ * The current HDR tone-map path models the source as:
+ *   Y' = transfer(0.2627*R + 0.6780*G + 0.0593*B)
+ *   Cb = (PQ(B) - Y') / 1.8814
+ *   Cr = (PQ(R) - Y') / 1.4746
+ *
+ * That matches the generated PQ color-bar fixtures and the existing inverse
+ * transform below.  It is not the same as reconstructing G' directly from
+ * strict BT.2020 non-constant-luminance Y' = Kr*R' + Kg*G' + Kb*B'.
+ *
+ * To recover linear R, G, B for correct per-channel tone mapping:
+ *   PQ(R) = Y' + 1.4746 * Cr
+ *   PQ(B) = Y' + 1.8814 * Cb
+ *   R_lin = EOTF(PQ(R)),  B_lin = EOTF(PQ(B)),  Y_lin = EOTF(Y')
+ *   G_lin = (Y_lin - 0.2627*R_lin - 0.0593*B_lin) / 0.6780
+ * -------------------------------------------------------------------------- */
+
+#define NCL_CR_SCALE  1.4746   /* (1 - Kr) * 2 where Kr = 0.2627 */
+#define NCL_CB_SCALE  1.8814   /* (1 - Kb) * 2 where Kb = 0.0593 */
+#define BT2020_KR     0.2627
+#define BT2020_KG     0.6780
+#define BT2020_KB     0.0593
+
+/* BT.709 YCbCr encoding constants (full range) */
+#define BT709_KR      0.2126
+#define BT709_KG      0.7152
+#define BT709_KB      0.0722
+
+
+/* --------------------------------------------------------------------------
  * BT.2020 -> BT.709 chroma scale factors (fixed-point 8.8)
  *
  * Approximate YCbCr-domain gamut mapping derived from the BT.2020->BT.709
@@ -299,6 +330,9 @@ void fused_tonemap_generate_luts(fused_hdr_internal_t *hdr,
             hdr->pq_to_linear[i] = (float)eotf_hlg(N);
         else
             hdr->pq_to_linear[i] = (float)eotf_pq(N);
+
+        hdr->pq_r_delta[i] = (int16_t)floor(NCL_CR_SCALE * (double)(i - 512) + 0.5);
+        hdr->pq_b_delta[i] = (int16_t)floor(NCL_CB_SCALE * (double)(i - 512) + 0.5);
     }
 
     /* ------------------------------------------------------------------ */
@@ -354,6 +388,14 @@ void fused_tonemap_generate_luts(fused_hdr_internal_t *hdr,
 
         double V = bt709_oetf(mapped);
         hdr->linear_to_sdr[i] = (uint8_t)clamp_i((int)(V * 255.0 + 0.5), 0, 255);
+    }
+
+    for (int i = 0; i < 1024; i++) {
+        float lin = hdr->pq_to_linear[i];
+        int idx = (int)(lin * 4095.0f + 0.5f);
+        if (idx > 4095) idx = 4095;
+
+        hdr->pq_to_sdr[i] = hdr->linear_to_sdr[idx];
     }
 
     fused_log(log_warn, FUSED_LOG_WARN,
@@ -502,36 +544,7 @@ static void tonemap_luma_neon(const uint8_t *lut_y,
 
 
 /* --------------------------------------------------------------------------
- * NCL chroma reconstruction helpers
- *
- * HDR10 uses non-constant-luminance (NCL) YCbCr encoding:
- *   Y' = PQ(0.2627*R + 0.6780*G + 0.0593*B)   <- PQ of linear luma
- *   Cb = (PQ(B) - Y') / 1.8814
- *   Cr = (PQ(R) - Y') / 1.4746
- *
- * To recover linear R, G, B for correct per-channel tone mapping:
- *   PQ(R) = Y' + 1.4746 * Cr
- *   PQ(B) = Y' + 1.8814 * Cb
- *   R_lin = EOTF(PQ(R)),  B_lin = EOTF(PQ(B)),  Y_lin = EOTF(Y')
- *   G_lin = (Y_lin - 0.2627*R_lin - 0.0593*B_lin) / 0.6780
- *
- * BT.2020 NCL coefficients for chroma reconstruction:
- * -------------------------------------------------------------------------- */
-
-#define NCL_CR_SCALE  1.4746   /* (1 - Kr) * 2 where Kr = 0.2627 */
-#define NCL_CB_SCALE  1.8814   /* (1 - Kb) * 2 where Kb = 0.0593 */
-#define BT2020_KR     0.2627
-#define BT2020_KG     0.6780
-#define BT2020_KB     0.0593
-
-/* BT.709 YCbCr encoding constants (full range) */
-#define BT709_KR      0.2126
-#define BT709_KG      0.7152
-#define BT709_KB      0.0722
-
-
-/* --------------------------------------------------------------------------
- * fused_tonemap_apply - planar I010 chroma
+ * Chroma reconstruction helpers
  * -------------------------------------------------------------------------- */
 
 /* --------------------------------------------------------------------------
@@ -542,36 +555,52 @@ static void tonemap_luma_neon(const uint8_t *lut_y,
  * -------------------------------------------------------------------------- */
 
 static inline void tonemap_pixel_rgb(
-    const float *pq_to_linear, const uint8_t *linear_to_sdr,
+    const fused_hdr_internal_t *state,
     int y_pq, int cb_10, int cr_10,
     int *r_out, int *g_out, int *b_out)
 {
-    double y_norm  = (double)y_pq / 1023.0;
-    double cb_norm = (double)(cb_10 - 512) / 1023.0;
-    double cr_norm = (double)(cr_10 - 512) / 1023.0;
-
-    int pq_r = (int)((y_norm + NCL_CR_SCALE * cr_norm) * 1023.0 + 0.5);
-    int pq_b = (int)((y_norm + NCL_CB_SCALE * cb_norm) * 1023.0 + 0.5);
+    int pq_r = y_pq + state->pq_r_delta[cr_10];
+    int pq_b = y_pq + state->pq_b_delta[cb_10];
     if (pq_r < 0) pq_r = 0;
     if (pq_r > 1023) pq_r = 1023;
     if (pq_b < 0) pq_b = 0;
     if (pq_b > 1023) pq_b = 1023;
 
-    float y_lin = pq_to_linear[y_pq];
-    float r_lin = pq_to_linear[pq_r];
-    float b_lin = pq_to_linear[pq_b];
+    float y_lin = state->pq_to_linear[y_pq];
+    float r_lin = state->pq_to_linear[pq_r];
+    float b_lin = state->pq_to_linear[pq_b];
 
     float g_lin = (y_lin - (float)BT2020_KR * r_lin
                          - (float)BT2020_KB * b_lin) / (float)BT2020_KG;
     if (g_lin < 0.0f) g_lin = 0.0f;
 
-    int r_idx = (int)(r_lin * 4095.0f + 0.5f); if (r_idx > 4095) r_idx = 4095;
     int g_idx = (int)(g_lin * 4095.0f + 0.5f); if (g_idx > 4095) g_idx = 4095;
-    int b_idx = (int)(b_lin * 4095.0f + 0.5f); if (b_idx > 4095) b_idx = 4095;
 
-    *r_out = linear_to_sdr[r_idx];
-    *g_out = linear_to_sdr[g_idx];
-    *b_out = linear_to_sdr[b_idx];
+    *r_out = state->pq_to_sdr[pq_r];
+    *g_out = state->linear_to_sdr[g_idx];
+    *b_out = state->pq_to_sdr[pq_b];
+}
+
+
+/* --------------------------------------------------------------------------
+ * fused_tonemap_apply - planar I010 chroma
+ * -------------------------------------------------------------------------- */
+
+static inline int tonemap_rgb_to_y_sdr(int r_sdr, int g_sdr, int b_sdr)
+{
+    return (int)(BT709_KR * r_sdr + BT709_KG * g_sdr
+               + BT709_KB * b_sdr + 0.5);
+}
+
+static inline void tonemap_rgb_to_chroma_sdr(
+    int r_sdr, int y_sdr, int b_sdr,
+    uint8_t *u_out, uint8_t *v_out)
+{
+    int cb_sdr = (int)((b_sdr - y_sdr) / (2.0 * (1.0 - BT709_KB)) + 128.5);
+    int cr_sdr = (int)((r_sdr - y_sdr) / (2.0 * (1.0 - BT709_KR)) + 128.5);
+
+    *u_out = (uint8_t)clamp_i(cb_sdr, 0, 255);
+    *v_out = (uint8_t)clamp_i(cr_sdr, 0, 255);
 }
 
 
@@ -587,8 +616,6 @@ void fused_tonemap_apply(
     int width, int height)
 {
     const uint8_t *lut_y          = state->lut_y;
-    const float   *pq_to_linear   = state->pq_to_linear;
-    const uint8_t *linear_to_sdr  = state->linear_to_sdr;
 
     int chroma_w = width  / 2;
     int chroma_h = height / 2;
@@ -637,65 +664,61 @@ void fused_tonemap_apply(
     }
 
     /* ------------------------------------------------------------------ */
-    /* Built-in curves: full per-pixel RGB reconstruction at luma          */
-    /* resolution.  For each pixel, recover linear R, G, B from the NCL   */
-    /* YCbCr encoding, tone-map each channel individually, and encode     */
-    /* as BT.709 YCbCr.  Chroma is upsampled to luma resolution           */
-    /* (nearest-neighbor: each chroma sample covers a 2×2 luma block).    */
-    /*                                                                     */
-    /* This produces consistent Y, Cb, Cr with no washout or banding,     */
-    /* at the cost of processing every luma pixel through the RGB          */
-    /* reconstruction (~6 LUT reads + float arithmetic per pixel).         */
+    /* Built-in curves: RGB reconstruction and tone mapping per luma       */
+    /* pixel, then BT.709 YCbCr re-encode.  Chroma is nearest-neighbor     */
+    /* shared across each 2x2 luma block, and U/V are written from the     */
+    /* block's top-left reconstructed RGB, matching the previous sampling  */
+    /* position while avoiding a second reconstruction pass.                */
     /* ------------------------------------------------------------------ */
 
-    for (int y = 0; y < height; y++) {
-        const uint16_t *sy = src_y + y * src_y_pitch;
-        const uint16_t *su = src_u + (y / 2) * src_uv_pitch;
-        const uint16_t *sv = src_v + (y / 2) * src_uv_pitch;
-        uint8_t        *dy = dst_y + y * dst_y_stride;
-
-        for (int x = 0; x < width; x++) {
-            int y_pq  = sy[x] & 0x3FF;
-            int cb_10 = su[x / 2] & 0x3FF;
-            int cr_10 = sv[x / 2] & 0x3FF;
-
-            int r_sdr, g_sdr, b_sdr;
-            tonemap_pixel_rgb(pq_to_linear, linear_to_sdr,
-                              y_pq, cb_10, cr_10,
-                              &r_sdr, &g_sdr, &b_sdr);
-
-            /* BT.709 luma from tone-mapped RGB */
-            dy[x] = (uint8_t)clamp_i(
-                (int)(BT709_KR * r_sdr + BT709_KG * g_sdr
-                    + BT709_KB * b_sdr + 0.5), 0, 255);
-        }
-    }
-
-    /* Chroma at chroma resolution - compute from tone-mapped RGB */
+    /* Process one 4:2:0 block at a time.  The previous implementation did
+     * a full luma-resolution RGB reconstruction pass, then revisited the
+     * top-left pixel of each 2x2 block for chroma.  Doing chroma while that
+     * top-left reconstruction is already hot removes one expensive
+     * tonemap_pixel_rgb() call per chroma sample without changing the
+     * sampling position used for U/V. */
     for (int cy = 0; cy < chroma_h; cy++) {
         const uint16_t *su = src_u + cy * src_uv_pitch;
         const uint16_t *sv = src_v + cy * src_uv_pitch;
-        const uint16_t *sy = src_y + (cy * 2) * src_y_pitch;
+        const uint16_t *sy0 = src_y + (cy * 2) * src_y_pitch;
+        const uint16_t *sy1 = sy0 + src_y_pitch;
+        uint8_t        *dy0 = dst_y + (cy * 2) * dst_y_stride;
+        uint8_t        *dy1 = dy0 + dst_y_stride;
         uint8_t        *du = dst_u + cy * dst_uv_stride;
         uint8_t        *dv = dst_v + cy * dst_uv_stride;
 
         for (int cx = 0; cx < chroma_w; cx++) {
-            int y_pq  = sy[cx * 2] & 0x3FF;
             int cb_10 = su[cx] & 0x3FF;
             int cr_10 = sv[cx] & 0x3FF;
+            int x = cx * 2;
 
             int r_sdr, g_sdr, b_sdr;
-            tonemap_pixel_rgb(pq_to_linear, linear_to_sdr,
-                              y_pq, cb_10, cr_10,
+
+            int y_pq = sy0[x] & 0x3FF;
+            tonemap_pixel_rgb(state, y_pq, cb_10, cr_10,
                               &r_sdr, &g_sdr, &b_sdr);
+            int y_sdr = tonemap_rgb_to_y_sdr(r_sdr, g_sdr, b_sdr);
+            dy0[x] = (uint8_t)clamp_i(y_sdr, 0, 255);
+            tonemap_rgb_to_chroma_sdr(r_sdr, y_sdr, b_sdr,
+                                      &du[cx], &dv[cx]);
 
-            int y_sdr = (int)(BT709_KR * r_sdr + BT709_KG * g_sdr
-                            + BT709_KB * b_sdr + 0.5);
-            int cb_sdr = (int)((b_sdr - y_sdr) / (2.0 * (1.0 - BT709_KB)) + 128.5);
-            int cr_sdr = (int)((r_sdr - y_sdr) / (2.0 * (1.0 - BT709_KR)) + 128.5);
+            y_pq = sy0[x + 1] & 0x3FF;
+            tonemap_pixel_rgb(state, y_pq, cb_10, cr_10,
+                              &r_sdr, &g_sdr, &b_sdr);
+            dy0[x + 1] = (uint8_t)clamp_i(
+                tonemap_rgb_to_y_sdr(r_sdr, g_sdr, b_sdr), 0, 255);
 
-            du[cx] = (uint8_t)clamp_i(cb_sdr, 0, 255);
-            dv[cx] = (uint8_t)clamp_i(cr_sdr, 0, 255);
+            y_pq = sy1[x] & 0x3FF;
+            tonemap_pixel_rgb(state, y_pq, cb_10, cr_10,
+                              &r_sdr, &g_sdr, &b_sdr);
+            dy1[x] = (uint8_t)clamp_i(
+                tonemap_rgb_to_y_sdr(r_sdr, g_sdr, b_sdr), 0, 255);
+
+            y_pq = sy1[x + 1] & 0x3FF;
+            tonemap_pixel_rgb(state, y_pq, cb_10, cr_10,
+                              &r_sdr, &g_sdr, &b_sdr);
+            dy1[x + 1] = (uint8_t)clamp_i(
+                tonemap_rgb_to_y_sdr(r_sdr, g_sdr, b_sdr), 0, 255);
         }
     }
 }
@@ -716,8 +739,6 @@ void fused_tonemap_apply_p010(
     int width, int height)
 {
     const uint8_t *lut_y          = state->lut_y;
-    const float   *pq_to_linear   = state->pq_to_linear;
-    const uint8_t *linear_to_sdr  = state->linear_to_sdr;
 
     int chroma_w = width  / 2;
     int chroma_h = height / 2;
@@ -758,52 +779,47 @@ void fused_tonemap_apply_p010(
         return;
     }
 
-    /* Full per-pixel RGB reconstruction at luma resolution */
-    for (int y = 0; y < height; y++) {
-        const uint16_t *sy  = src_y  + y * src_y_pitch;
-        const uint16_t *suv = src_uv + (y / 2) * src_uv_pitch;
-        uint8_t        *dy  = dst_y  + y * dst_y_stride;
-
-        for (int x = 0; x < width; x++) {
-            int y_pq  = sy[x] & 0x3FF;
-            int cb_10 = suv[(x / 2) * 2]     & 0x3FF;
-            int cr_10 = suv[(x / 2) * 2 + 1] & 0x3FF;
-
-            int r_sdr, g_sdr, b_sdr;
-            tonemap_pixel_rgb(pq_to_linear, linear_to_sdr,
-                              y_pq, cb_10, cr_10,
-                              &r_sdr, &g_sdr, &b_sdr);
-
-            dy[x] = (uint8_t)clamp_i(
-                (int)(BT709_KR * r_sdr + BT709_KG * g_sdr
-                    + BT709_KB * b_sdr + 0.5), 0, 255);
-        }
-    }
-
-    /* Chroma at chroma resolution */
     for (int cy = 0; cy < chroma_h; cy++) {
         const uint16_t *suv = src_uv + cy * src_uv_pitch;
-        const uint16_t *sy  = src_y  + (cy * 2) * src_y_pitch;
+        const uint16_t *sy0 = src_y  + (cy * 2) * src_y_pitch;
+        const uint16_t *sy1 = sy0 + src_y_pitch;
+        uint8_t        *dy0 = dst_y  + (cy * 2) * dst_y_stride;
+        uint8_t        *dy1 = dy0 + dst_y_stride;
         uint8_t        *du  = dst_u  + cy * dst_uv_stride;
         uint8_t        *dv  = dst_v  + cy * dst_uv_stride;
 
         for (int cx = 0; cx < chroma_w; cx++) {
-            int y_pq  = sy[cx * 2] & 0x3FF;
             int cb_10 = suv[cx * 2]     & 0x3FF;
             int cr_10 = suv[cx * 2 + 1] & 0x3FF;
+            int x = cx * 2;
 
             int r_sdr, g_sdr, b_sdr;
-            tonemap_pixel_rgb(pq_to_linear, linear_to_sdr,
-                              y_pq, cb_10, cr_10,
+
+            int y_pq = sy0[x] & 0x3FF;
+            tonemap_pixel_rgb(state, y_pq, cb_10, cr_10,
                               &r_sdr, &g_sdr, &b_sdr);
+            int y_sdr = tonemap_rgb_to_y_sdr(r_sdr, g_sdr, b_sdr);
+            dy0[x] = (uint8_t)clamp_i(y_sdr, 0, 255);
+            tonemap_rgb_to_chroma_sdr(r_sdr, y_sdr, b_sdr,
+                                      &du[cx], &dv[cx]);
 
-            int y_sdr = (int)(BT709_KR * r_sdr + BT709_KG * g_sdr
-                            + BT709_KB * b_sdr + 0.5);
-            int cb_sdr = (int)((b_sdr - y_sdr) / (2.0 * (1.0 - BT709_KB)) + 128.5);
-            int cr_sdr = (int)((r_sdr - y_sdr) / (2.0 * (1.0 - BT709_KR)) + 128.5);
+            y_pq = sy0[x + 1] & 0x3FF;
+            tonemap_pixel_rgb(state, y_pq, cb_10, cr_10,
+                              &r_sdr, &g_sdr, &b_sdr);
+            dy0[x + 1] = (uint8_t)clamp_i(
+                tonemap_rgb_to_y_sdr(r_sdr, g_sdr, b_sdr), 0, 255);
 
-            du[cx] = (uint8_t)clamp_i(cb_sdr, 0, 255);
-            dv[cx] = (uint8_t)clamp_i(cr_sdr, 0, 255);
+            y_pq = sy1[x] & 0x3FF;
+            tonemap_pixel_rgb(state, y_pq, cb_10, cr_10,
+                              &r_sdr, &g_sdr, &b_sdr);
+            dy1[x] = (uint8_t)clamp_i(
+                tonemap_rgb_to_y_sdr(r_sdr, g_sdr, b_sdr), 0, 255);
+
+            y_pq = sy1[x + 1] & 0x3FF;
+            tonemap_pixel_rgb(state, y_pq, cb_10, cr_10,
+                              &r_sdr, &g_sdr, &b_sdr);
+            dy1[x + 1] = (uint8_t)clamp_i(
+                tonemap_rgb_to_y_sdr(r_sdr, g_sdr, b_sdr), 0, 255);
         }
     }
 }

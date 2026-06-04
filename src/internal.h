@@ -469,10 +469,19 @@ typedef struct {
      *   SDR gamma output.  Incorporates tone curve + BT.709 OETF.
      *   Indexed by (linear_value * 4095).  Used by the chroma pass to
      *   tone-map the reconstructed R, G, B channels individually.
+     *
+     * pq_to_sdr / pq_*_delta:
+     *   Small derived LUTs for the built-in RGB reconstruction path.  They
+     *   avoid redoing affine chroma index math and R/B tone-map indexing for
+     *   every luma pixel while preserving the same quantization steps as
+     *   pq_to_linear + linear_to_sdr.
      */
     uint8_t  lut_y[1024];
     float    pq_to_linear[1024];    /* PQ code -> linear [0,1] */
     uint8_t  linear_to_sdr[4096];   /* linear 12-bit -> 8-bit SDR gamma */
+    uint8_t  pq_to_sdr[1024];       /* PQ code -> SDR via pq_to_linear */
+    int16_t  pq_r_delta[1024];      /* Cr code -> PQ(R) offset from Y */
+    int16_t  pq_b_delta[1024];      /* Cb code -> PQ(B) offset from Y */
 
     /* Temp 10-bit buffers for SDR-only outputs (no HDR output requested
      * at that step, but we need a 10-bit intermediate to tone map from).

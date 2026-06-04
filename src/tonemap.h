@@ -37,12 +37,11 @@ void fused_tonemap_generate_luts(fused_hdr_internal_t *hdr,
  * Applies the precomputed LUTs to 10-bit YUV420 planes, producing 8-bit
  * SDR output planes.
  *
- * Luma pass:   fast LUT lookup: dst_y[x] = lut_y[src_y[x] & 0x3FF]
- * Chroma pass: reconstructs linear-light R, G, B from YCbCr using the
- *   pq_to_linear LUT, tone-maps each channel individually through the
- *   linear_to_sdr LUT, then recomputes BT.709 YCbCr from the results.
- *   Also overwrites the luma output at chroma resolution (2×2 blocks)
- *   to keep Y consistent with the per-channel tone mapping.
+ * Custom LUT: fast luma lookup plus simple chroma scaling.
+ * Built-in curves: reconstructs linear-light R, G, B from YCbCr for each
+ *   luma pixel, tone-maps each channel through the LUTs, then recomputes
+ *   BT.709 Y.  Chroma is written once per 2x2 block from the top-left
+ *   reconstructed RGB sample, matching the previous sampling position.
  *
  * Width and height are luma dimensions (chroma is width/2 x height/2).
  * Strides are in bytes.

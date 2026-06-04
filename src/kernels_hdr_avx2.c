@@ -595,10 +595,6 @@ static void __attribute__((hot)) scale_plane_pow2_hdr_avx2(
     if (!h_buf) return;
 
     int out_row[4] = { 0, 0, 0, 0 };
-    int emit_2x_inline = (active_outputs & (1u << bit_pos[0])) != 0;
-    int dst_2x_el_stride = emit_2x_inline
-        ? dst_strides[0] / (int)sizeof(uint16_t)
-        : 0;
 
     /* AVX2 chunk count: 16 uint16_t elements = 32 bytes per YMM */
     int avx2_chunks = src_w / 16;
@@ -617,48 +613,16 @@ static void __attribute__((hot)) scale_plane_pow2_hdr_avx2(
                 + (size_t)(2 * r + 1) * (size_t)src_el_stride;
             uint16_t *restrict dst_row = vert_buf[0]
                 + (size_t)r * (size_t)src_w;
-            uint16_t *restrict out_2x = emit_2x_inline
-                ? dst_planes[0] + (size_t)out_row[0] * (size_t)dst_2x_el_stride
-                : NULL;
 
             int x = 0;
-            int out_x = 0;
-            int c = 0;
-            for (; emit_2x_inline && c + 1 < avx2_chunks; c += 2, x += 32) {
+            for (int c = 0; c < avx2_chunks; c++, x += 16) {
                 __m256i va = _mm256_loadu_si256((const __m256i *)(ra + x));
                 __m256i vb = _mm256_loadu_si256((const __m256i *)(rb + x));
-                __m256i avg0 = avx2_avg_u16(va, vb);
-
-                va = _mm256_loadu_si256((const __m256i *)(ra + x + 16));
-                vb = _mm256_loadu_si256((const __m256i *)(rb + x + 16));
-                __m256i avg1 = avx2_avg_u16(va, vb);
-
-                _mm256_storeu_si256((__m256i *)(dst_row + x), avg0);
-                _mm256_storeu_si256((__m256i *)(dst_row + x + 16), avg1);
-                _mm256_storeu_si256((__m256i *)(out_2x + out_x),
-                                    avx2_halve_32_to_16_hdr(avg0, avg1));
-                out_x += 16;
-            }
-            for (; c < avx2_chunks; c++, x += 16) {
-                __m256i va = _mm256_loadu_si256((const __m256i *)(ra + x));
-                __m256i vb = _mm256_loadu_si256((const __m256i *)(rb + x));
-                __m256i avg = avx2_avg_u16(va, vb);
-                _mm256_storeu_si256((__m256i *)(dst_row + x), avg);
-                if (emit_2x_inline) {
-                    __m128i half = avx2_halve_16_to_8_hdr(avg);
-                    _mm_storeu_si128((__m128i *)(out_2x + out_x), half);
-                    out_x += 8;
-                }
+                _mm256_storeu_si256((__m256i *)(dst_row + x),
+                                    avx2_avg_u16(va, vb));
             }
             for (; x < src_w; x++) {
                 dst_row[x] = avg_u16(ra[x], rb[x]);
-            }
-            if (emit_2x_inline) {
-                int tail_in = avx2_chunks * 16;
-                for (int tx = tail_in; tx + 1 < src_w; tx += 2) {
-                    out_2x[out_x++] = avg_u16(dst_row[tx], dst_row[tx + 1]);
-                }
-                out_row[0]++;
             }
         }
 
@@ -689,7 +653,6 @@ static void __attribute__((hot)) scale_plane_pow2_hdr_avx2(
 
         for (int k = 0; k <= deepest; k++) {
             if (!(active_outputs & (1u << bit_pos[k]))) continue;
-            if (k == 0 && emit_2x_inline) continue;
 
             /* Convert destination byte stride to element stride */
             int dst_el_stride = dst_strides[k] / (int)sizeof(uint16_t);
@@ -1238,6 +1201,73 @@ static void __attribute__((hot)) scale_plane_thirds_hdr_avx2(
 
 
 /* -----------------------------------------------------------------------
+ * P010 chroma deinterleave
+ *
+ * Converts interleaved UVUV... uint16_t chroma into temporary planar U/V
+ * buffers.  The main path handles 16 chroma pairs per iteration by running
+ * the existing 8-pair shuffle twice and coalescing each pair of half rows into
+ * one 256-bit U store and one 256-bit V store.
+ * ----------------------------------------------------------------------- */
+
+static void deinterleave_p010_chroma_avx2(
+    const uint16_t *src_uv,
+    int chroma_w, int chroma_h, int uv_el_stride,
+    uint16_t *tmp_u, uint16_t *tmp_v, int planar_el_stride)
+{
+    static const uint8_t deint_shuf[32] __attribute__((aligned(32))) = {
+        0, 1, 4, 5, 8, 9, 12, 13,    2, 3, 6, 7, 10, 11, 14, 15,
+        0, 1, 4, 5, 8, 9, 12, 13,    2, 3, 6, 7, 10, 11, 14, 15
+    };
+    const __m256i shuf_mask = _mm256_load_si256((const __m256i *)deint_shuf);
+
+    for (int y = 0; y < chroma_h; y++) {
+        const uint16_t *row = src_uv + (size_t)y * (size_t)uv_el_stride;
+        uint16_t *u_row = tmp_u + (size_t)y * (size_t)planar_el_stride;
+        uint16_t *v_row = tmp_v + (size_t)y * (size_t)planar_el_stride;
+
+        int x = 0;
+        int avx2_pairs_16 = chroma_w / 16;
+        for (int c = 0; c < avx2_pairs_16; c++, x += 16) {
+            __m256i uv0 = _mm256_load_si256((const __m256i *)(row + 2 * x));
+            __m256i uv1 = _mm256_load_si256((const __m256i *)(row + 2 * x + 16));
+
+            __m256i de0 = _mm256_permute4x64_epi64(
+                _mm256_shuffle_epi8(uv0, shuf_mask), 0xD8);
+            __m256i de1 = _mm256_permute4x64_epi64(
+                _mm256_shuffle_epi8(uv1, shuf_mask), 0xD8);
+
+            __m256i u = _mm256_inserti128_si256(
+                _mm256_castsi128_si256(_mm256_castsi256_si128(de0)),
+                _mm256_castsi256_si128(de1), 1);
+            __m256i v = _mm256_inserti128_si256(
+                _mm256_castsi128_si256(_mm256_extracti128_si256(de0, 1)),
+                _mm256_extracti128_si256(de1, 1), 1);
+
+            _mm256_store_si256((__m256i *)(u_row + x), u);
+            _mm256_store_si256((__m256i *)(v_row + x), v);
+        }
+
+        int avx2_pairs_8 = (chroma_w - x) / 8;
+        for (int c = 0; c < avx2_pairs_8; c++, x += 8) {
+            __m256i interleaved = _mm256_load_si256(
+                (const __m256i *)(row + 2 * x));
+            __m256i shuffled = _mm256_shuffle_epi8(interleaved, shuf_mask);
+            __m256i permuted = _mm256_permute4x64_epi64(shuffled, 0xD8);
+            _mm_store_si128((__m128i *)(u_row + x),
+                            _mm256_castsi256_si128(permuted));
+            _mm_store_si128((__m128i *)(v_row + x),
+                            _mm256_extracti128_si256(permuted, 1));
+        }
+
+        for (; x < chroma_w; x++) {
+            u_row[x] = row[2 * x];
+            v_row[x] = row[2 * x + 1];
+        }
+    }
+}
+
+
+/* -----------------------------------------------------------------------
  * Public entry points
  *
  * For I010 (planar): call scale_plane_*_hdr_avx2() three times (Y, U, V).
@@ -1295,34 +1325,9 @@ void __attribute__((hot)) fused_kernel_pow2_hdr_avx2(
         int uv_el_stride = p->src_uv_el_stride;
         int planar_el_stride = p->p010_tmp_stride / (int)sizeof(uint16_t);
 
-        static const uint8_t deint_shuf[32] __attribute__((aligned(32))) = {
-            0, 1, 4, 5, 8, 9, 12, 13,    2, 3, 6, 7, 10, 11, 14, 15,
-            0, 1, 4, 5, 8, 9, 12, 13,    2, 3, 6, 7, 10, 11, 14, 15
-        };
-        __m256i shuf_mask = _mm256_load_si256((const __m256i *)deint_shuf);
-
-        for (int y = 0; y < chroma_h; y++) {
-            const uint16_t *row = src_u + (size_t)y * (size_t)uv_el_stride;
-            uint16_t *u_row = p->p010_tmp_u + (size_t)y * (size_t)planar_el_stride;
-            uint16_t *v_row = p->p010_tmp_v + (size_t)y * (size_t)planar_el_stride;
-
-            int x = 0;
-            int avx2_pairs = chroma_w / 8;
-            for (int c = 0; c < avx2_pairs; c++, x += 8) {
-                __m256i interleaved = _mm256_loadu_si256(
-                    (const __m256i *)(row + c * 16));
-                __m256i shuffled = _mm256_shuffle_epi8(interleaved, shuf_mask);
-                __m256i permuted = _mm256_permute4x64_epi64(shuffled, 0xD8);
-                _mm_storeu_si128((__m128i *)(u_row + x),
-                                 _mm256_castsi256_si128(permuted));
-                _mm_storeu_si128((__m128i *)(v_row + x),
-                                 _mm256_extracti128_si256(permuted, 1));
-            }
-            for (; x < chroma_w; x++) {
-                u_row[x] = row[2 * x];
-                v_row[x] = row[2 * x + 1];
-            }
-        }
+        deinterleave_p010_chroma_avx2(src_u, chroma_w, chroma_h,
+                                      uv_el_stride, p->p010_tmp_u, p->p010_tmp_v,
+                                      planar_el_stride);
 
         scale_plane_pow2_hdr_avx2(p->p010_tmp_u,
                                    chroma_w, chroma_h, p->p010_tmp_stride,
@@ -1401,34 +1406,9 @@ void __attribute__((hot)) fused_kernel_thirds_hdr_avx2(
         int uv_el_stride = p->src_uv_el_stride;
         int planar_el_stride = p->p010_tmp_stride / (int)sizeof(uint16_t);
 
-        static const uint8_t deint_shuf[32] __attribute__((aligned(32))) = {
-            0, 1, 4, 5, 8, 9, 12, 13,    2, 3, 6, 7, 10, 11, 14, 15,
-            0, 1, 4, 5, 8, 9, 12, 13,    2, 3, 6, 7, 10, 11, 14, 15
-        };
-        __m256i shuf_mask = _mm256_load_si256((const __m256i *)deint_shuf);
-
-        for (int y = 0; y < chroma_h; y++) {
-            const uint16_t *row = src_u + (size_t)y * (size_t)uv_el_stride;
-            uint16_t *u_row = p->p010_tmp_u + (size_t)y * (size_t)planar_el_stride;
-            uint16_t *v_row = p->p010_tmp_v + (size_t)y * (size_t)planar_el_stride;
-
-            int x = 0;
-            int avx2_pairs = chroma_w / 8;
-            for (int c = 0; c < avx2_pairs; c++, x += 8) {
-                __m256i interleaved = _mm256_loadu_si256(
-                    (const __m256i *)(row + c * 16));
-                __m256i shuffled = _mm256_shuffle_epi8(interleaved, shuf_mask);
-                __m256i permuted = _mm256_permute4x64_epi64(shuffled, 0xD8);
-                _mm_storeu_si128((__m128i *)(u_row + x),
-                                 _mm256_castsi256_si128(permuted));
-                _mm_storeu_si128((__m128i *)(v_row + x),
-                                 _mm256_extracti128_si256(permuted, 1));
-            }
-            for (; x < chroma_w; x++) {
-                u_row[x] = row[2 * x];
-                v_row[x] = row[2 * x + 1];
-            }
-        }
+        deinterleave_p010_chroma_avx2(src_u, chroma_w, chroma_h,
+                                      uv_el_stride, p->p010_tmp_u, p->p010_tmp_v,
+                                      planar_el_stride);
 
         scale_plane_thirds_hdr_avx2(p->p010_tmp_u,
                                      chroma_w, chroma_h, p->p010_tmp_stride,

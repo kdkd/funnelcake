@@ -157,6 +157,14 @@ typedef struct {
      * sequentially.  NULL if no upscale is active. */
     uint8_t *upscale_scratch;
 
+    /* Second persistent scratch row, the same width as upscale_scratch and
+     * carved from the same allocation (points one aligned row past it).  The
+     * scalar 2x upscale expands each row in two auto-vectorizable passes -
+     * one writes horizontal midpoints here, the other interleaves them with
+     * the source row - which needs a temp distinct from upscale_scratch (the
+     * vertical-blend row).  NULL if no upscale is active. */
+    uint8_t *upscale_scratch2;
+
     /* Scratch pool for downscale kernels.  Allocated once at init and
      * sized to the max bytes the selected kernel family needs for its
      * internal vertical-cascade / horizontal-cascade buffers.  Kernels
@@ -410,6 +418,11 @@ typedef struct {
     /* Persistent scratch row buffer for HDR upscale helpers (uint16_t).
      * Same semantics as the SDR upscale_scratch above. */
     uint16_t *upscale_scratch_hdr;
+
+    /* Second HDR scratch row carved from the same allocation as
+     * upscale_scratch_hdr.  See upscale_scratch2 in fused_kernel_params_t
+     * for rationale (two-pass 2x interleave). NULL if no upscale active. */
+    uint16_t *upscale_scratch_hdr2;
 
     /* Scratch pool for HDR downscale kernels.  See fused_kernel_params_t
      * for rationale.  Sized in bytes; kernels cast to uint16_t* and use

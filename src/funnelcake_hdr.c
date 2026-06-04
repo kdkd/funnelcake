@@ -829,7 +829,8 @@ hdr_tail_done:
 
     /* Upscale scratch row buffer (HDR, u16).  One-time allocation to
      * keep the per-frame hot path free of malloc/free. */
-    p->upscale_scratch_hdr = NULL;
+    p->upscale_scratch_hdr  = NULL;
+    p->upscale_scratch_hdr2 = NULL;
     if (want_up) {
         int max_scratch_w = 0;
         if (up_N >= 1) {
@@ -841,10 +842,14 @@ hdr_tail_done:
             if (tv > max_scratch_w) max_scratch_w = tv;
         }
         if (max_scratch_w > 0) {
-            size_t bytes = (size_t)((max_scratch_w + 63) & ~63) * sizeof(uint16_t);
+            /* Two aligned u16 rows from one allocation (see the SDR path /
+             * upscale_scratch2): row 0 = vertical-blend buffer, row 1 =
+             * two-pass interleave temp. */
+            size_t row = (size_t)((max_scratch_w + 63) & ~63) * sizeof(uint16_t);
             void *sp = NULL;
-            if (posix_memalign(&sp, 64, bytes) == 0) {
-                p->upscale_scratch_hdr = (uint16_t *)sp;
+            if (posix_memalign(&sp, 64, row * 2) == 0) {
+                p->upscale_scratch_hdr  = (uint16_t *)sp;
+                p->upscale_scratch_hdr2 = (uint16_t *)((uint8_t *)sp + row);
             } else {
                 fused_log(&ctx->log_warnings, FUSED_LOG_WARN,
                     "funnelcake-hdr: failed to allocate upscale scratch buffer\n");
@@ -1072,6 +1077,8 @@ void fused_hdr_free(fused_hdr_ctx_t *ctx)
         free(state->params.p010_tmp_u);
         free(state->params.p010_tmp_v);
         free(state->params.upscale_scratch_hdr);
+        /* upscale_scratch_hdr2 aliases into the same allocation - do not
+         * free it separately. */
         free(state->params.scratch_pool);
         free(state);
     }

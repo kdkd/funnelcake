@@ -105,6 +105,10 @@ LTO ?= 0
 # To keep the Makefile readable we resolve it here using the same probe.
 CC_FAMILY_IS_CLANG := $(shell $(CC) --version 2>/dev/null | grep -qi clang && echo 1)
 
+# Clang major version (e.g. 18), used to locate the matching versioned LLVM
+# tools that Debian/Ubuntu install (llvm-profdata-18, etc.).  Empty for GCC.
+CLANG_MAJOR := $(shell $(CC) --version 2>/dev/null | sed -n 's/.*clang version \([0-9][0-9]*\).*/\1/p' | head -1)
+
 ifeq ($(LTO),1)
   # LTO + RVV intrinsics is currently broken on every GCC we've tested:
   # GCC 13 lacks target-builtin info during the LTO link, and GCC 14 hits
@@ -155,21 +159,43 @@ DETECT_CFLAGS = $(CFLAGS_BASE) -O2 $(TUNE_CFLAGS)
 
 # llvm-profdata lookup: on macOS the Xcode toolchain ships it alongside
 # clang but not always in PATH, so prefer `xcrun` there. On Linux the
-# tool is typically in PATH as `llvm-profdata`; if the user installed
-# a versioned package (e.g. llvm-profdata-17) they can override via
-# `make LLVM_PROFDATA=llvm-profdata-17 pgo`.
-ifeq ($(UNAME_S),Darwin)
-  LLVM_PROFDATA ?= xcrun llvm-profdata
+# tool is usually in PATH as `llvm-profdata`, but Debian/Ubuntu ship it
+# only as a versioned binary (e.g. llvm-profdata-18) unless the unversioned
+# `llvm` meta-package is installed - so fall back to the version matching
+# the active clang. Override explicitly with `make LLVM_PROFDATA=... pgo`.
+ifndef LLVM_PROFDATA
+  ifeq ($(UNAME_S),Darwin)
+    LLVM_PROFDATA := xcrun llvm-profdata
+  else
+    LLVM_PROFDATA := $(shell command -v llvm-profdata 2>/dev/null \
+                       || command -v llvm-profdata-$(CLANG_MAJOR) 2>/dev/null \
+                       || echo llvm-profdata)
+  endif
+endif
+
+# Package-name suffix for the install hints below: "-18" when the clang
+# version is known, empty otherwise (so the hint reads "llvm" not "llvm-").
+ifeq ($(CLANG_MAJOR),)
+  LLVM_PKG_SUFFIX :=
 else
-  LLVM_PROFDATA ?= llvm-profdata
+  LLVM_PKG_SUFFIX := -$(CLANG_MAJOR)
 endif
 
 # Suppress the "no profile data for this TU" warning that both compilers
 # emit for files that weren't exercised by the PGO training run (e.g. the
 # test harness, cold-path code, detect.c which is deliberately excluded).
 # GCC and clang spell the flag differently.
+#
+# clang also emits "Function X is annotated as a hot function but the
+# profile is cold" (-Wbackend-plugin) for the SIMD kernels that carry
+# __attribute__((hot)) but never ran during training - which is exactly
+# what happens when PGO is trained on a CPU whose SIMD path isn't the
+# native one (e.g. collecting a profile on an AVX2-less host leaves the
+# AVX2 kernels cold, and vice versa). That mismatch is expected for a
+# multi-arch library, so downgrade it from error to a (still visible)
+# warning rather than failing the build.
 ifeq ($(CC_FAMILY_IS_CLANG),1)
-  PGO_USE_FLAGS = -fprofile-use -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date
+  PGO_USE_FLAGS = -fprofile-use -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date -Wno-error=backend-plugin
 else
   PGO_USE_FLAGS = -fprofile-use -Wno-missing-profile
 endif
@@ -445,6 +471,25 @@ clean:
 # `default.profraw` would be truncated by the second run, discarding the
 # bench data which is what we actually want to optimize for).
 pgo: pgo-clean
+ifeq ($(CC_FAMILY_IS_CLANG),1)
+	@command -v $(firstword $(LLVM_PROFDATA)) >/dev/null 2>&1 || { \
+	  echo ""; \
+	  echo "ERROR: clang PGO needs 'llvm-profdata' to merge profile data, but"; \
+	  echo "       '$(firstword $(LLVM_PROFDATA))' was not found in PATH."; \
+	  echo ""; \
+	  echo "  llvm-profdata ships in a separate package from clang on most distros:"; \
+	  echo "    Debian/Ubuntu : sudo apt install llvm$(LLVM_PKG_SUFFIX)   (or: llvm)"; \
+	  echo "    Fedora/RHEL   : sudo dnf install llvm"; \
+	  echo "    Arch          : sudo pacman -S llvm"; \
+	  echo "    openSUSE      : sudo zypper install llvm"; \
+	  echo "    macOS         : xcode-select --install   (or: brew install llvm)"; \
+	  echo ""; \
+	  echo "  Already installed under a versioned name? Point make at it:"; \
+	  echo "    make pgo LLVM_PROFDATA=llvm-profdata$(LLVM_PKG_SUFFIX)"; \
+	  echo ""; \
+	  exit 1; \
+	}
+endif
 	@echo "=== PGO Step 1: Compile with instrumentation ==="
 	$(MAKE) clean
 	$(MAKE) funnelcake_test LIB_OPT="-O3 -fprofile-generate" EXTRA_LDFLAGS="-fprofile-generate"
@@ -457,6 +502,14 @@ ifeq ($(CC_FAMILY_IS_CLANG),1)
 	    pgo-bench.profraw pgo-tests.profraw
 endif
 	@echo "=== PGO Step 3: Recompile library with profile data ==="
+ifeq ($(CC_FAMILY_IS_CLANG),1)
+	@echo "    NOTE: any \"annotated as a hot function but the profile is cold\""
+	@echo "    warnings below are expected and harmless.  They mean a SIMD kernel"
+	@echo "    for an instruction set this machine does not run (e.g. AVX2 on a"
+	@echo "    non-AVX2 CPU, or the scalar kernels on a machine that always uses"
+	@echo "    SIMD) was never exercised during profiling, so it has no profile"
+	@echo "    data.  Those kernels are still built correctly."
+endif
 	rm -f $(LIB_OBJS) libfunnelcake.a funnelcake_test
 	$(MAKE) funnelcake_test LIB_OPT="-O3 $(PGO_USE_FLAGS)"
 	@echo "=== PGO complete. Run 'make bench' to see results. ==="

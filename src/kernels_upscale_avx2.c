@@ -85,12 +85,25 @@ static void up_h_2x_row_avx2(const uint8_t *src, int src_w, uint8_t *dst)
     int x = 0;
     int full_chunks = src_w / 16;
 
-    for (int c = 0; c < full_chunks; c++) {
-        __m128i r = _mm_loadu_si128((const __m128i *)(src + x));
+    if (full_chunks > 0) {
+        __m128i r = _mm_loadu_si128((const __m128i *)src);
 
-        /* "Shifted by one byte" version of r, with the 17th byte being
-         * either the first byte of the next chunk or the row's last
-         * byte (edge replication). */
+        for (int c = 0; c + 1 < full_chunks; c++) {
+            __m128i r_next = _mm_loadu_si128((const __m128i *)(src + x + 16));
+            __m128i r_shifted = _mm_alignr_epi8(r_next, r, 1);
+            __m128i r_mid = _mm_avg_epu8(r, r_shifted);
+
+            __m128i out0 = _mm_unpacklo_epi8(r, r_mid);
+            __m128i out1 = _mm_unpackhi_epi8(r, r_mid);
+
+            _mm_storeu_si128((__m128i *)(dst + 2 * x +  0), out0);
+            _mm_storeu_si128((__m128i *)(dst + 2 * x + 16), out1);
+            x += 16;
+            r = r_next;
+        }
+
+        /* Last full chunk: the shifted-in element may be the scalar tail's
+         * first source byte or the replicated row edge. */
         uint8_t edge = (x + 16 < src_w) ? src[x + 16] : src[src_w - 1];
         __m128i edge_v = _mm_set1_epi8((char)edge);
         __m128i r_shifted = _mm_alignr_epi8(edge_v, r, 1);
@@ -133,15 +146,27 @@ static void up_h_2x_vblend_row_avx2(const uint8_t *a_row, const uint8_t *b_row,
     int x = 0;
     int full_chunks = src_w / 16;
 
-    for (int c = 0; c < full_chunks; c++) {
-        /* r = vertical average of the two source rows for this 16-byte
-         * chunk. */
+    if (full_chunks > 0) {
         __m128i r = _mm_avg_epu8(
             _mm_loadu_si128((const __m128i *)(a_row + x)),
             _mm_loadu_si128((const __m128i *)(b_row + x)));
 
-        /* Edge byte: the averaged value one column past this chunk, or the
-         * last averaged column replicated at the row end. */
+        for (int c = 0; c + 1 < full_chunks; c++) {
+            __m128i r_next = _mm_avg_epu8(
+                _mm_loadu_si128((const __m128i *)(a_row + x + 16)),
+                _mm_loadu_si128((const __m128i *)(b_row + x + 16)));
+            __m128i r_shifted = _mm_alignr_epi8(r_next, r, 1);
+            __m128i r_mid = _mm_avg_epu8(r, r_shifted);
+
+            __m128i out0 = _mm_unpacklo_epi8(r, r_mid);
+            __m128i out1 = _mm_unpackhi_epi8(r, r_mid);
+
+            _mm_storeu_si128((__m128i *)(dst + 2 * x +  0), out0);
+            _mm_storeu_si128((__m128i *)(dst + 2 * x + 16), out1);
+            x += 16;
+            r = r_next;
+        }
+
         uint8_t edge = (x + 16 < src_w)
                           ? up_avg_u8(a_row[x + 16], b_row[x + 16])
                           : up_avg_u8(a_row[src_w - 1], b_row[src_w - 1]);
@@ -742,12 +767,25 @@ up_h_2x_row_avx2_u16(const uint16_t *src, int src_w, uint16_t *dst)
     int x = 0;
     int full_chunks = src_w / 8;
 
-    for (int c = 0; c < full_chunks; c++) {
-        __m128i r = _mm_loadu_si128((const __m128i *)(src + x));
-        /* Edge: next chunk's first u16 (or replicated row end). */
+    if (full_chunks > 0) {
+        __m128i r = _mm_loadu_si128((const __m128i *)src);
+
+        for (int c = 0; c + 1 < full_chunks; c++) {
+            __m128i r_next = _mm_loadu_si128((const __m128i *)(src + x + 8));
+            __m128i r_shifted = _mm_alignr_epi8(r_next, r, 2);
+            __m128i r_mid = _mm_avg_epu16(r, r_shifted);
+            __m128i out0 = _mm_unpacklo_epi16(r, r_mid);
+            __m128i out1 = _mm_unpackhi_epi16(r, r_mid);
+            _mm_storeu_si128((__m128i *)(dst + 2 * x + 0), out0);
+            _mm_storeu_si128((__m128i *)(dst + 2 * x + 8), out1);
+            x += 8;
+            r = r_next;
+        }
+
+        /* Last full chunk: the shifted-in element may be the scalar tail's
+         * first source sample or the replicated row edge. */
         uint16_t edge = (x + 8 < src_w) ? src[x + 8] : src[src_w - 1];
         __m128i edge_v = _mm_set1_epi16((short)edge);
-        /* Shift right by one u16 = 2 bytes via alignr. */
         __m128i r_shifted = _mm_alignr_epi8(edge_v, r, 2);
         __m128i r_mid = _mm_avg_epu16(r, r_shifted);
         __m128i out0 = _mm_unpacklo_epi16(r, r_mid);
@@ -785,14 +823,27 @@ up_h_2x_vblend_row_avx2_u16(const uint16_t *a_row, const uint16_t *b_row,
     int x = 0;
     int full_chunks = src_w / 8;
 
-    for (int c = 0; c < full_chunks; c++) {
-        /* r = vertical average of the two source rows for this 8-element chunk. */
+    if (full_chunks > 0) {
         __m128i r = _mm_avg_epu16(
             _mm_loadu_si128((const __m128i *)(a_row + x)),
             _mm_loadu_si128((const __m128i *)(b_row + x)));
 
-        /* Edge: the averaged value one column past this chunk, or the last
-         * averaged column replicated at the row end. */
+        for (int c = 0; c + 1 < full_chunks; c++) {
+            __m128i r_next = _mm_avg_epu16(
+                _mm_loadu_si128((const __m128i *)(a_row + x + 8)),
+                _mm_loadu_si128((const __m128i *)(b_row + x + 8)));
+            __m128i r_shifted = _mm_alignr_epi8(r_next, r, 2);
+            __m128i r_mid = _mm_avg_epu16(r, r_shifted);
+
+            __m128i out0 = _mm_unpacklo_epi16(r, r_mid);
+            __m128i out1 = _mm_unpackhi_epi16(r, r_mid);
+
+            _mm_storeu_si128((__m128i *)(dst + 2 * x + 0), out0);
+            _mm_storeu_si128((__m128i *)(dst + 2 * x + 8), out1);
+            x += 8;
+            r = r_next;
+        }
+
         uint16_t edge = (x + 8 < src_w)
                           ? up_avg_u16_scalar(a_row[x + 8], b_row[x + 8])
                           : up_avg_u16_scalar(a_row[src_w - 1], b_row[src_w - 1]);

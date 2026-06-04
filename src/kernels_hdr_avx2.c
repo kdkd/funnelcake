@@ -595,6 +595,10 @@ static void __attribute__((hot)) scale_plane_pow2_hdr_avx2(
     if (!h_buf) return;
 
     int out_row[4] = { 0, 0, 0, 0 };
+    int emit_2x_inline = (active_outputs & (1u << bit_pos[0])) != 0;
+    int dst_2x_el_stride = emit_2x_inline
+        ? dst_strides[0] / (int)sizeof(uint16_t)
+        : 0;
 
     /* AVX2 chunk count: 16 uint16_t elements = 32 bytes per YMM */
     int avx2_chunks = src_w / 16;
@@ -613,16 +617,48 @@ static void __attribute__((hot)) scale_plane_pow2_hdr_avx2(
                 + (size_t)(2 * r + 1) * (size_t)src_el_stride;
             uint16_t *restrict dst_row = vert_buf[0]
                 + (size_t)r * (size_t)src_w;
+            uint16_t *restrict out_2x = emit_2x_inline
+                ? dst_planes[0] + (size_t)out_row[0] * (size_t)dst_2x_el_stride
+                : NULL;
 
             int x = 0;
-            for (int c = 0; c < avx2_chunks; c++, x += 16) {
+            int out_x = 0;
+            int c = 0;
+            for (; emit_2x_inline && c + 1 < avx2_chunks; c += 2, x += 32) {
                 __m256i va = _mm256_loadu_si256((const __m256i *)(ra + x));
                 __m256i vb = _mm256_loadu_si256((const __m256i *)(rb + x));
-                _mm256_storeu_si256((__m256i *)(dst_row + x),
-                                    avx2_avg_u16(va, vb));
+                __m256i avg0 = avx2_avg_u16(va, vb);
+
+                va = _mm256_loadu_si256((const __m256i *)(ra + x + 16));
+                vb = _mm256_loadu_si256((const __m256i *)(rb + x + 16));
+                __m256i avg1 = avx2_avg_u16(va, vb);
+
+                _mm256_storeu_si256((__m256i *)(dst_row + x), avg0);
+                _mm256_storeu_si256((__m256i *)(dst_row + x + 16), avg1);
+                _mm256_storeu_si256((__m256i *)(out_2x + out_x),
+                                    avx2_halve_32_to_16_hdr(avg0, avg1));
+                out_x += 16;
+            }
+            for (; c < avx2_chunks; c++, x += 16) {
+                __m256i va = _mm256_loadu_si256((const __m256i *)(ra + x));
+                __m256i vb = _mm256_loadu_si256((const __m256i *)(rb + x));
+                __m256i avg = avx2_avg_u16(va, vb);
+                _mm256_storeu_si256((__m256i *)(dst_row + x), avg);
+                if (emit_2x_inline) {
+                    __m128i half = avx2_halve_16_to_8_hdr(avg);
+                    _mm_storeu_si128((__m128i *)(out_2x + out_x), half);
+                    out_x += 8;
+                }
             }
             for (; x < src_w; x++) {
                 dst_row[x] = avg_u16(ra[x], rb[x]);
+            }
+            if (emit_2x_inline) {
+                int tail_in = avx2_chunks * 16;
+                for (int tx = tail_in; tx + 1 < src_w; tx += 2) {
+                    out_2x[out_x++] = avg_u16(dst_row[tx], dst_row[tx + 1]);
+                }
+                out_row[0]++;
             }
         }
 
@@ -653,6 +689,7 @@ static void __attribute__((hot)) scale_plane_pow2_hdr_avx2(
 
         for (int k = 0; k <= deepest; k++) {
             if (!(active_outputs & (1u << bit_pos[k]))) continue;
+            if (k == 0 && emit_2x_inline) continue;
 
             /* Convert destination byte stride to element stride */
             int dst_el_stride = dst_strides[k] / (int)sizeof(uint16_t);

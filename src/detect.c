@@ -6,6 +6,7 @@
  */
 
 #include "detect.h"
+#include "funnelcake.h"   /* for the public fused_simd_available() prototype */
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -322,4 +323,25 @@ void fused_detect_cpu_reset(void)
 {
     memset(&g_caps, 0, sizeof(g_caps));
     g_detected = 0;
+}
+
+/*
+ * Public capability query. This is the single source of truth for "will the
+ * scalers vectorize?": funnelcake.c and funnelcake_hdr.c gate their internal
+ * has_simd flag on these exact same caps fields, per the same arch #if blocks,
+ * so this stays in lock-step with the kernels they actually select.
+ */
+int fused_simd_available(void)
+{
+    const fused_cpu_caps_t *caps = fused_detect_cpu();
+#if defined(__x86_64__)
+    return caps->has_avx2 ? 1 : 0;
+#elif defined(__aarch64__)
+    return caps->has_neon ? 1 : 0;
+#elif defined(__riscv) && (__riscv_xlen == 64)
+    return caps->has_rvv ? 1 : 0;
+#else
+    (void)caps;
+    return 0;
+#endif
 }

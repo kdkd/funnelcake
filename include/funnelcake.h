@@ -289,6 +289,32 @@ void fused_scaler_run(fused_scaler_ctx_t *ctx,
 void fused_scaler_free(fused_scaler_ctx_t *ctx);
 
 
+/* --------------------------------------------------------------------------
+ * Capability query (applies to both the SDR and HDR scalers)
+ * -------------------------------------------------------------------------- */
+
+/*
+ * fused_simd_available - report whether the scalers will use SIMD kernels.
+ *
+ * Returns 1 if fused_scaler_init / fused_hdr_init will run the vectorized
+ * (AVX2 / NEON / RVV) kernels on this machine, or 0 if they will use the
+ * portable scalar kernels instead. Scalar fallback happens when:
+ *   - the build target has no SIMD kernels (a CPU family other than x86_64,
+ *     aarch64, or riscv64),
+ *   - the running CPU lacks the required extension (e.g. a pre-AVX2 x86_64
+ *     part), or
+ *   - FUNNELCAKE_FORCE_SCALAR is set to a non-empty value in the environment.
+ *
+ * When this returns 0, an otherwise-perfect init reports FUSED_WARN_BIT_SCALAR
+ * (not FUSED_OK) and every produced output's `fallback` field is 1; callers
+ * that treat that warning bit as success should consult this function first.
+ *
+ * Uses the same one-time CPU probe as the scalers; the result is cached, and
+ * the call is thread-safe after the first invocation.
+ */
+int fused_simd_available(void);
+
+
 /* ==========================================================================
  * HDR10 API - 10-bit scaling with optional tone mapping to SDR
  *

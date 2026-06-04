@@ -142,6 +142,45 @@ error (no-op in both cases). After this call the context may be
 re-initialised with new parameters.
 
 
+### `fused_simd_available`
+
+```c
+int fused_simd_available(void);
+```
+
+Returns `1` if the scalers will run the vectorized (AVX2 / NEON / RVV)
+kernels on this machine, or `0` if they will use the portable scalar
+kernels instead. Applies to both the SDR (`fused_scaler_init`) and HDR
+(`fused_hdr_init`) paths.
+
+Scalar fallback - and therefore a `0` return - happens when:
+
+- the build target has no SIMD kernels (a CPU family other than x86_64,
+  aarch64, or riscv64),
+- the running CPU lacks the required extension (e.g. a pre-AVX2 x86_64
+  part), or
+- `FUNNELCAKE_FORCE_SCALAR` is set to a non-empty value in the
+  environment.
+
+When this returns `0`, an otherwise-perfect init reports
+`FUSED_WARN_BIT_SCALAR` (not `FUSED_OK`) and every produced output's
+`fallback` field is `1`. This is the canonical way to tell *expected*
+scalar fallback (an old CPU) apart from a per-step fallback caused by
+alignment - callers and test harnesses that want to treat the whole-CPU
+case as success should consult this function first:
+
+```c
+int allow = fused_simd_available() ? 0 : FUSED_WARN_BIT_SCALAR;
+int rc = fused_scaler_init(&scaler);
+if ((rc & ~allow) != 0) {
+    /* a real warning or error, not just expected scalar fallback */
+}
+```
+
+Uses the same one-time CPU probe as the scalers; the result is cached,
+and the call is thread-safe after the first invocation.
+
+
 ## Data Types
 
 ### `fused_scaler_ctx_t`

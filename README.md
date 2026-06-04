@@ -622,6 +622,13 @@ The scalar fallback is correct on all platforms but significantly slower.
 On hardware without AVX2, NEON, or RVV, the library logs a one-time notice
 to stderr at first init.
 
+Call `fused_simd_available()` to query this at runtime: it returns `1` when
+the SIMD kernels will be used and `0` when the scalars will. It uses the same
+CPU probe the scalers do (and honors `FUNNELCAKE_FORCE_SCALAR`), so callers
+and test harnesses can tell *expected* whole-CPU scalar fallback apart from a
+real failure. When it returns `0`, a clean init reports `FUSED_WARN_BIT_SCALAR`
+rather than `FUSED_OK`.
+
 
 ## HDR10 support
 

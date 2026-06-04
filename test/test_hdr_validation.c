@@ -48,7 +48,7 @@ static void test_hdr_valid_i010_thirds(void)
     suppress_log(&ctx);
 
     int rc = fused_hdr_init(&ctx);
-    TEST_ASSERT_EQ(rc, FUSED_OK, "rc should be FUSED_OK");
+    TEST_ASSERT_OK(rc, "rc should be FUSED_OK");
     TEST_ASSERT(ctx.hdr_outputs[FUSED_IDX_1_5X].plane_y != NULL, "hdr_outputs[0].plane_y != NULL");
     TEST_ASSERT_EQ(ctx.hdr_outputs[FUSED_IDX_1_5X].width,  1280, "hdr_outputs[0].width");
     TEST_ASSERT_EQ(ctx.hdr_outputs[FUSED_IDX_1_5X].height, 720,  "hdr_outputs[0].height");
@@ -80,7 +80,7 @@ static void test_hdr_valid_i010_pow2(void)
     suppress_log(&ctx);
 
     int rc = fused_hdr_init(&ctx);
-    TEST_ASSERT_EQ(rc, FUSED_OK, "rc should be FUSED_OK");
+    TEST_ASSERT_OK(rc, "rc should be FUSED_OK");
     TEST_ASSERT_EQ(ctx.hdr_outputs[FUSED_IDX_2X].width, 640, "hdr_outputs[1].width");
     TEST_ASSERT_EQ(ctx.hdr_outputs[FUSED_IDX_4X].width, 320, "hdr_outputs[3].width");
 
@@ -109,7 +109,7 @@ static void test_hdr_valid_p010(void)
     suppress_log(&ctx);
 
     int rc = fused_hdr_init(&ctx);
-    TEST_ASSERT_EQ(rc, FUSED_OK, "rc should be FUSED_OK");
+    TEST_ASSERT_OK(rc, "rc should be FUSED_OK");
     TEST_ASSERT(ctx.hdr_outputs[FUSED_IDX_1_5X].plane_y != NULL, "hdr_outputs[0].plane_y != NULL");
 
     fused_hdr_free(&ctx);
@@ -137,7 +137,7 @@ static void test_hdr_valid_i210(void)
     suppress_log(&ctx);
 
     int rc = fused_hdr_init(&ctx);
-    TEST_ASSERT_EQ(rc, FUSED_OK, "rc should be FUSED_OK");
+    TEST_ASSERT_OK(rc, "rc should be FUSED_OK");
     TEST_ASSERT(ctx.hdr_outputs[FUSED_IDX_1_5X].plane_y != NULL, "hdr_outputs[0].plane_y != NULL");
 
     fused_hdr_free(&ctx);
@@ -165,7 +165,7 @@ static void test_hdr_valid_p210(void)
     suppress_log(&ctx);
 
     int rc = fused_hdr_init(&ctx);
-    TEST_ASSERT_EQ(rc, FUSED_OK, "rc should be FUSED_OK");
+    TEST_ASSERT_OK(rc, "rc should be FUSED_OK");
     TEST_ASSERT(ctx.hdr_outputs[FUSED_IDX_1_5X].plane_y != NULL, "hdr_outputs[0].plane_y != NULL");
 
     fused_hdr_free(&ctx);
@@ -558,7 +558,7 @@ static void test_hdr_i010_hlg(void)
     suppress_log(&ctx);
 
     int rc = fused_hdr_init(&ctx);
-    TEST_ASSERT_EQ(rc, FUSED_OK, "I010+HLG thirds -> FUSED_OK");
+    TEST_ASSERT_OK(rc, "I010+HLG thirds -> FUSED_OK");
     TEST_ASSERT(ctx.hdr_outputs[FUSED_IDX_1_5X].plane_y != NULL, "hdr_outputs[0] allocated");
 
     fused_hdr_free(&ctx);
@@ -586,7 +586,7 @@ static void test_hdr_p010_hlg(void)
     suppress_log(&ctx);
 
     int rc = fused_hdr_init(&ctx);
-    TEST_ASSERT_EQ(rc, FUSED_OK, "P010+HLG thirds -> FUSED_OK");
+    TEST_ASSERT_OK(rc, "P010+HLG thirds -> FUSED_OK");
     TEST_ASSERT(ctx.hdr_outputs[FUSED_IDX_1_5X].plane_y != NULL, "hdr_outputs[0] allocated");
 
     fused_hdr_free(&ctx);

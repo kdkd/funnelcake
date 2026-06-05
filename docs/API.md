@@ -587,6 +587,106 @@ must be a multiple of 64). Steps that fail this constraint are handled
 by the scalar fallback unless `FUSED_OPT_NO_FALLBACK` is set.
 
 
+## NUMA and Thread Affinity
+
+Funnelcake does not create worker threads or change CPU affinity. Both
+`fused_scaler_run` and `fused_hdr_run` execute on the caller's thread,
+so applications that care about NUMA placement should manage affinity at
+the caller level.
+
+This can matter on multi-socket systems, or on systems configured with
+multiple NUMA domains per socket. Large HDR frames, deep upscale cascades,
+and workloads that produce several outputs touch enough source, output,
+and scratch memory that remote-node placement can become visible.
+
+For best locality, prefer one scaler context per long-lived worker or per
+NUMA domain. The exact affinity calls are platform-specific. For example:
+
+```c
+/* Linux: libnuma, link with -lnuma. */
+#if defined(__linux__)
+#include <numa.h>
+
+static int pin_current_thread_to_numa_node(unsigned node)
+{
+    if (numa_available() < 0)
+        return -1;
+    return numa_run_on_node((int)node);
+}
+
+/* FreeBSD: build a CPU set for the target socket / NUMA domain using
+ * your application's topology knowledge, then bind this thread to it. */
+#elif defined(__FreeBSD__)
+#include <sys/param.h>
+#include <sys/cpuset.h>
+
+static int pin_current_thread_to_cpuset(const cpuset_t *cpus)
+{
+    return cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1,
+                              sizeof(*cpus), cpus);
+}
+
+/* Windows: node id to processor-group affinity. */
+#elif defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
+static int pin_current_thread_to_numa_node(unsigned node)
+{
+    GROUP_AFFINITY affinity = {0};
+    if (!GetNumaNodeProcessorMaskEx((USHORT)node, &affinity) ||
+        affinity.Mask == 0)
+        return -1;
+    return SetThreadGroupAffinity(GetCurrentThread(), &affinity, NULL) ? 0 : -1;
+}
+#endif
+
+/* Pin the owning worker before creating and warming the context. */
+#if defined(__linux__) || defined(_WIN32)
+if (pin_current_thread_to_numa_node(node) != 0) {
+    /* handle affinity failure or continue without pinning */
+}
+#elif defined(__FreeBSD__)
+cpuset_t cpus;
+CPU_ZERO(&cpus);
+/* Fill cpus with the logical CPUs in the target socket / NUMA domain. */
+CPU_SET(0, &cpus);
+CPU_SET(1, &cpus);
+if (pin_current_thread_to_cpuset(&cpus) != 0) {
+    /* handle affinity failure or continue without pinning */
+}
+#endif
+
+fused_scaler_ctx_t scaler = {0};
+/* fill scaler fields */
+int rc = fused_scaler_init(&scaler);
+if (rc < 0) {
+    /* handle error */
+}
+
+/* Optional: run one warm-up frame on the owning worker so output and
+ * scratch pages are first-touched on the intended NUMA node. */
+fused_scaler_run(&scaler, src_y, src_u, src_v);
+
+/* Reuse this context on the same worker for subsequent frames. */
+```
+
+The same pattern applies to `fused_hdr_ctx_t` and `fused_hdr_run`.
+
+Avoid bouncing a single initialized context between sockets. Output
+planes, scratch pools, and P010 deinterleave buffers are allocated during
+init and are commonly placed by first touch during the first run. Moving
+the context to a different NUMA node afterward can turn those persistent
+buffers into remote memory. Source frame buffers are owned by the caller,
+so they should also be produced, copied, or pinned in a way that matches
+the worker that will call funnelcake.
+
+Useful platform references:
+[Linux libnuma](https://man7.org/linux/man-pages/man3/numa.3.html),
+[FreeBSD cpuset(2)](https://man.freebsd.org/cgi/man.cgi?query=cpuset&sektion=2),
+and [Windows SetThreadGroupAffinity](https://learn.microsoft.com/en-us/windows/win32/api/processtopologyapi/nf-processtopologyapi-setthreadgroupaffinity).
+
+
 ## libavcodec Integration
 
 AVFrame planes map directly to the scaler's source parameters:

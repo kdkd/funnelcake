@@ -85,31 +85,22 @@ static inline void vhalve_row_u8(const uint8_t *src,
 }
 
 /* --------------------------------------------------------------------------
- * Primitive 3: 2:1 bilinear blend (the "thirds" 1.5x vertical row blend).
+ * Primitive 3: 2:1 bilinear blend of two vectors.
  *
- *   for x in 0..n: dst[x] = (171*a[x] + 85*b[x] + 128) >> 8
- *                         ~= a[x] * 2/3 + b[x] * 1/3
+ *   blend(a, b) = (171*a + 85*b + 128) >> 8   ~= a * 2/3 + b * 1/3
  *
- * Used by the 1.5x output to produce the two interior rows of every 4-row
- * output group (the rows that aren't simple pairwise vertical averages).
+ * This one operation is the whole vocabulary of the 1.5x thirds path: the
+ * vertical row blend and the horizontal 1.5x filter are both just this 2:1
+ * blend applied to different neighbours, so the kernels below are written in
+ * terms of it.  Operating on vectors (rather than memory rows) lets callers
+ * keep intermediates in registers.
  * -------------------------------------------------------------------------- */
-static inline void vblend_2_1_row_u8(const uint8_t *a,
-                                     const uint8_t *b,
-                                     uint8_t *dst,
-                                     size_t n)
+static inline vuint8m1_t vblend_2_1_u8m1(vuint8m1_t a, vuint8m1_t b, size_t vl)
 {
-    size_t x = 0;
-    while (x < n) {
-        size_t vl = __riscv_vsetvl_e8m1(n - x);
-        vuint8m1_t va = __riscv_vle8_v_u8m1(a + x, vl);
-        vuint8m1_t vb = __riscv_vle8_v_u8m1(b + x, vl);
-        vuint16m2_t s = __riscv_vwmulu_vx_u16m2(va, 171, vl);
-        s = __riscv_vwmaccu_vx_u16m2(s, 85, vb, vl);
-        s = __riscv_vadd_vx_u16m2(s, 128, vl);
-        vuint8m1_t r = __riscv_vnsrl_wx_u8m1(s, 8, vl);
-        __riscv_vse8_v_u8m1(dst + x, r, vl);
-        x += vl;
-    }
+    vuint16m2_t s = __riscv_vwmulu_vx_u16m2(a, 171, vl);
+    s = __riscv_vwmaccu_vx_u16m2(s, 85, b, vl);
+    s = __riscv_vadd_vx_u16m2(s, 128, vl);
+    return __riscv_vnsrl_wx_u8m1(s, 8, vl);
 }
 
 /* --------------------------------------------------------------------------
@@ -161,19 +152,43 @@ static inline void vh_filter_1_5x_row_u8(const uint8_t *src,
         size_t vl = __riscv_vsetvl_e8m1(pairs - i);
         vuint8m1_t a, b, c;
         fused_load3_u8m1(src + 3 * i, vl, &a, &b, &c);
+        vuint8m1_t r0 = vblend_2_1_u8m1(a, b, vl);   /* dst[2i]   */
+        vuint8m1_t r1 = vblend_2_1_u8m1(c, b, vl);   /* dst[2i+1] */
+        fused_store2_u8m1(dst + 2 * i, vl, r0, r1);
+        i += vl;
+    }
+}
 
-        /* dst[2i]   = (171*a + 85*b + 128) >> 8 */
-        vuint16m2_t s0 = __riscv_vwmulu_vx_u16m2(a, 171, vl);
-        s0 = __riscv_vwmaccu_vx_u16m2(s0, 85, b, vl);
-        s0 = __riscv_vadd_vx_u16m2(s0, 128, vl);
-        vuint8m1_t r0 = __riscv_vnsrl_wx_u8m1(s0, 8, vl);
+/* --------------------------------------------------------------------------
+ * Primitive 6: vertical 2:1 blend folded into the horizontal 1.5x filter.
+ *
+ * The two interior rows of each 1.5x output group are a vertical 2:1 blend of
+ * two reduced rows (ra, rb) that then goes through the 1.5x horizontal filter.
+ * Both steps are the same vblend_2_1, so fuse them: blend ra and rb on the fly
+ * as each stride-3 chunk arrives, then blend horizontally.  The blended row
+ * lives entirely in registers - it never gets written out and read back, which
+ * drops a full-row store and reload (and a whole loop) per interior row.
+ * -------------------------------------------------------------------------- */
+static inline void vh_filter_1_5x_blend_row_u8(const uint8_t *ra,
+                                               const uint8_t *rb,
+                                               uint8_t *dst,
+                                               size_t pairs)
+{
+    size_t i = 0;
+    while (i < pairs) {
+        size_t vl = __riscv_vsetvl_e8m1(pairs - i);
+        vuint8m1_t a0, a1, a2, b0, b1, b2;
+        fused_load3_u8m1(ra + 3 * i, vl, &a0, &a1, &a2);
+        fused_load3_u8m1(rb + 3 * i, vl, &b0, &b1, &b2);
 
-        /* dst[2i+1] = (171*c + 85*b + 128) >> 8 */
-        vuint16m2_t s1 = __riscv_vwmulu_vx_u16m2(c, 171, vl);
-        s1 = __riscv_vwmaccu_vx_u16m2(s1, 85, b, vl);
-        s1 = __riscv_vadd_vx_u16m2(s1, 128, vl);
-        vuint8m1_t r1 = __riscv_vnsrl_wx_u8m1(s1, 8, vl);
+        /* Vertical blend of the two rows at each of the three taps... */
+        vuint8m1_t t0 = vblend_2_1_u8m1(a0, b0, vl);
+        vuint8m1_t t1 = vblend_2_1_u8m1(a1, b1, vl);
+        vuint8m1_t t2 = vblend_2_1_u8m1(a2, b2, vl);
 
+        /* ...then the horizontal 1.5x of those freshly blended taps. */
+        vuint8m1_t r0 = vblend_2_1_u8m1(t0, t1, vl);   /* dst[2i]   */
+        vuint8m1_t r1 = vblend_2_1_u8m1(t2, t1, vl);   /* dst[2i+1] */
         fused_store2_u8m1(dst + 2 * i, vl, r0, r1);
         i += vl;
     }
@@ -258,33 +273,31 @@ static void scale_plane_pow2_rvv(
             for (int r = 0; r < vert_rows[k]; r++) {
                 const uint8_t *vert_row = vert_buf[k]
                     + (size_t)r * (size_t)src_w;
-
-                /* (k+1) halvings from src_w to dst_widths[k].  The first
-                 * halving reads vert_row and writes h_buf; subsequent
-                 * halvings are in-place on h_buf (safe because the read
-                 * cursor at 2*x is always ahead of the write cursor at x). */
-                int cur_w = src_w;
-                const uint8_t *cur_src = vert_row;
-                uint8_t *cur_dst = h_buf;
-                for (int hstep = 0; hstep < (k + 1); hstep++) {
-                    int next_w = cur_w >> 1;
-                    vhalve_row_u8(cur_src, cur_dst, (size_t)next_w);
-                    cur_w = next_w;
-                    cur_src = h_buf;
-                }
-
                 uint8_t *out = dst_planes[k]
                     + (size_t)out_row[k] * (size_t)dst_strides[k];
-                /* dst_widths[k] may be smaller than the final cur_w if the
-                 * source isn't a clean multiple of the output width; copy
-                 * only the requested number of bytes. */
-                size_t n = (size_t)dst_widths[k];
-                size_t i = 0;
-                while (i < n) {
-                    size_t vl = __riscv_vsetvl_e8m1(n - i);
-                    vuint8m1_t v = __riscv_vle8_v_u8m1(h_buf + i, vl);
-                    __riscv_vse8_v_u8m1(out + i, v, vl);
-                    i += vl;
+
+                /* Halve the row width (k+1) times to reach dst_widths[k].  The
+                 * first halving reads the vertically-averaged row into h_buf;
+                 * the rest run in place on h_buf, which is safe because output
+                 * element x consumes source 2x and 2x+1, so the read cursor
+                 * always stays a step ahead of the write cursor.  The last
+                 * halving stores directly into the destination plane row,
+                 * landing the final narrowing and the output write in a single
+                 * pass.  dst_widths[k] can sit just under the halved width when
+                 * the source isn't an exact multiple of the output, so the
+                 * final step is clamped to it. */
+                int steps = k + 1;
+                int cur_w = src_w;
+                const uint8_t *cur_src = vert_row;
+                for (int hstep = 0; hstep < steps; hstep++) {
+                    int next_w = cur_w >> 1;
+                    if (hstep == steps - 1) {
+                        vhalve_row_u8(cur_src, out, (size_t)dst_widths[k]);
+                    } else {
+                        vhalve_row_u8(cur_src, h_buf, (size_t)next_w);
+                        cur_src = h_buf;
+                    }
+                    cur_w = next_w;
                 }
                 out_row[k]++;
             }
@@ -410,12 +423,10 @@ static void scale_plane_thirds_rvv(
 
     uint8_t *v6x_prev = need_12x
         ? (uint8_t *)fused_scratch_alloc(&scratch, row_bytes) : NULL;
-    uint8_t *blend_tmp = need_1_5x
-        ? (uint8_t *)fused_scratch_alloc(&scratch, row_bytes) : NULL;
 
     if (!v01 || !v23 || !v45 || !v3x_0 || !v3x_1 || !v6x ||
         !h_3x_buf || !h_6x_buf ||
-        (need_12x && !v6x_prev) || (need_1_5x && !blend_tmp)) {
+        (need_12x && !v6x_prev)) {
         return;
     }
 
@@ -446,7 +457,9 @@ static void scale_plane_thirds_rvv(
             vavg_row_u8(v3x_0, v3x_1, v6x, row_bytes);
         }
 
-        /* 1.5x output: 4 rows per group, each at dst_widths[0] (~ 2/3 src_w). */
+        /* 1.5x output: 4 rows per group, each at dst_widths[0] (~ 2/3 src_w).
+         * Rows 0 and 3 filter v01 and v45 directly; rows 1 and 2 fold their
+         * vertical 2:1 blend straight into the filter, so no blend scratch. */
         if (need_1_5x) {
             int dw = dst_widths[0];
             int ds = dst_strides[0];
@@ -459,16 +472,14 @@ static void scale_plane_thirds_rvv(
             vh_filter_1_5x_row_u8(v01, out, pairs);
             out_row[0]++;
 
-            /* Row 1: blend(v01, v23) */
-            vblend_2_1_row_u8(v01, v23, blend_tmp, row_bytes);
+            /* Row 1: blend(v01, v23) -> filter */
             out = dst_planes[0] + (size_t)out_row[0] * (size_t)ds;
-            vh_filter_1_5x_row_u8(blend_tmp, out, pairs);
+            vh_filter_1_5x_blend_row_u8(v01, v23, out, pairs);
             out_row[0]++;
 
-            /* Row 2: blend(v23, v45) */
-            vblend_2_1_row_u8(v23, v45, blend_tmp, row_bytes);
+            /* Row 2: blend(v23, v45) -> filter */
             out = dst_planes[0] + (size_t)out_row[0] * (size_t)ds;
-            vh_filter_1_5x_row_u8(blend_tmp, out, pairs);
+            vh_filter_1_5x_blend_row_u8(v23, v45, out, pairs);
             out_row[0]++;
 
             /* Row 3: v45 */

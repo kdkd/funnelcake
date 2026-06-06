@@ -254,13 +254,13 @@ specifically.
 
 | Workload | funnelcake | vs libswscale |
 |---|---|---|
-| 1920×1080 down:1.5x,3x,6x        |  3.9 ms | 55.7× / 37.7× cascade |
-| 3840×2160 down:1.5x,3x,6x,12x    | 41.2 ms | 26.7× / 14.4× cascade |
-| 1920×1080 up:2x                  |  3.3 ms | 128.0× |
-| 1920×1080 down:2x up:2x          |  8.0 ms | 63.4× |
-| 1920×1080 down:1.5x,3x up:2x     |  9.2 ms | 63.9× |
-| 1920×1080 I010 down:1.5x,3x,6x   | 22.2 ms | (no HDR comparison) |
-| 1920×1080 I010 up:2x             |  9.8 ms | (no HDR comparison) |
+| 1920×1080 down:1.5x,3x,6x        |  3.7 ms | 58.4× / 39.6× cascade |
+| 3840×2160 down:1.5x,3x,6x,12x    | 40.0 ms | 27.5× / 14.8× cascade |
+| 1920×1080 up:2x                  |  3.1 ms | 138.2× |
+| 1920×1080 down:2x up:2x          |  7.6 ms | 66.5× |
+| 1920×1080 down:1.5x,3x up:2x     |  8.8 ms | 66.6× |
+| 1920×1080 I010 down:1.5x,3x,6x   | 20.9 ms | (no HDR comparison) |
+| 1920×1080 I010 up:2x             |  8.3 ms | (no HDR comparison) |
 
 HDR speedups land roughly half the SDR ratio because 10-bit u16 elements
 halve the per-vector throughput on the X60's 256-bit V unit.

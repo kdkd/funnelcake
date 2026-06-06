@@ -56,8 +56,7 @@ static inline void vblend_85_171_row_u8(const uint8_t *a, const uint8_t *b,
         vuint8m1_t vb = __riscv_vle8_v_u8m1(b + x, vl);
         vuint16m2_t s = __riscv_vwmulu_vx_u16m2(va, 85, vl);
         s = __riscv_vwmaccu_vx_u16m2(s, 171, vb, vl);
-        s = __riscv_vadd_vx_u16m2(s, 128, vl);
-        vuint8m1_t r = __riscv_vnsrl_wx_u8m1(s, 8, vl);
+        vuint8m1_t r = fused_vnclipu_wx_u8m1(s, 8, vl);
         __riscv_vse8_v_u8m1(dst + x, r, vl);
         x += vl;
     }
@@ -152,14 +151,12 @@ static inline void vup_h_1_5x_row_u8(const uint8_t *src, int w, uint8_t *dst)
         /* dst[3i+1] = (a*85 + b*171 + 128) >> 8 */
         vuint16m2_t s1 = __riscv_vwmulu_vx_u16m2(a, 85, vl);
         s1 = __riscv_vwmaccu_vx_u16m2(s1, 171, b, vl);
-        s1 = __riscv_vadd_vx_u16m2(s1, 128, vl);
-        vuint8m1_t r1 = __riscv_vnsrl_wx_u8m1(s1, 8, vl);
+        vuint8m1_t r1 = fused_vnclipu_wx_u8m1(s1, 8, vl);
 
         /* dst[3i+2] = (b*171 + c*85 + 128) >> 8 */
         vuint16m2_t s2 = __riscv_vwmulu_vx_u16m2(b, 171, vl);
         s2 = __riscv_vwmaccu_vx_u16m2(s2, 85, c, vl);
-        s2 = __riscv_vadd_vx_u16m2(s2, 128, vl);
-        vuint8m1_t r2 = __riscv_vnsrl_wx_u8m1(s2, 8, vl);
+        vuint8m1_t r2 = fused_vnclipu_wx_u8m1(s2, 8, vl);
 
         fused_store3_u8m1(dst + 3 * i, vl, a, r1, r2);
         i += vl;
@@ -389,8 +386,7 @@ static inline void vblend_85_171_row_u16(const uint16_t *a, const uint16_t *b,
         vuint16m1_t vb = __riscv_vle16_v_u16m1(b + x, vl);
         vuint32m2_t s = __riscv_vwmulu_vx_u32m2(va, 85, vl);
         s = __riscv_vwmaccu_vx_u32m2(s, 171, vb, vl);
-        s = __riscv_vadd_vx_u32m2(s, 128, vl);
-        vuint16m1_t r = __riscv_vnsrl_wx_u16m1(s, 8, vl);
+        vuint16m1_t r = fused_vnclipu_wx_u16m1(s, 8, vl);
         __riscv_vse16_v_u16m1(dst + x, r, vl);
         x += vl;
     }
@@ -471,13 +467,11 @@ static inline void vup_h_1_5x_row_u16(const uint16_t *src, int w, uint16_t *dst)
 
         vuint32m2_t s1 = __riscv_vwmulu_vx_u32m2(a, 85, vl);
         s1 = __riscv_vwmaccu_vx_u32m2(s1, 171, b, vl);
-        s1 = __riscv_vadd_vx_u32m2(s1, 128, vl);
-        vuint16m1_t r1 = __riscv_vnsrl_wx_u16m1(s1, 8, vl);
+        vuint16m1_t r1 = fused_vnclipu_wx_u16m1(s1, 8, vl);
 
         vuint32m2_t s2 = __riscv_vwmulu_vx_u32m2(b, 171, vl);
         s2 = __riscv_vwmaccu_vx_u32m2(s2, 85, c, vl);
-        s2 = __riscv_vadd_vx_u32m2(s2, 128, vl);
-        vuint16m1_t r2 = __riscv_vnsrl_wx_u16m1(s2, 8, vl);
+        vuint16m1_t r2 = fused_vnclipu_wx_u16m1(s2, 8, vl);
 
         fused_store3_u16m1(dst + 3 * i, vl, a, r1, r2);
         i += vl;

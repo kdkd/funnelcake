@@ -58,19 +58,29 @@
 #endif
 
 /* --------------------------------------------------------------------------
- * vaaddu / vxrm shim (see file header for spec details).
+ * vaaddu / vnclipu / vxrm shim (see file header for spec details).
+ *
+ * Both the rounded average (vaaddu) and the rounded narrowing shift (vnclipu)
+ * read the same vxrm rounding mode.  With vxrm = RNU a vnclipu by N is exactly
+ * round-to-nearest of (sum >> N): it folds the "+ (1 << (N-1))" bias and the
+ * shift into one instruction, so a weighted blend needs no separate vadd bias
+ * step and never has to leave the e8/e16 vtype to do it.
  * -------------------------------------------------------------------------- */
 
 #if !FUSED_RVV_HAS_SEGMENT
 /* v0.11 - global vxrm via CSR write at function entry. */
-# define FUSED_RVV_SET_VXRM_RNU()         vwrite_csr(RVV_VXRM, 0)
-# define fused_vaaddu_vv_u8m1(a, b, vl)   __riscv_vaaddu_vv_u8m1((a), (b), (vl))
-# define fused_vaaddu_vv_u16m1(a, b, vl)  __riscv_vaaddu_vv_u16m1((a), (b), (vl))
+# define FUSED_RVV_SET_VXRM_RNU()              vwrite_csr(RVV_VXRM, 0)
+# define fused_vaaddu_vv_u8m1(a, b, vl)        __riscv_vaaddu_vv_u8m1((a), (b), (vl))
+# define fused_vaaddu_vv_u16m1(a, b, vl)       __riscv_vaaddu_vv_u16m1((a), (b), (vl))
+# define fused_vnclipu_wx_u8m1(s, sh, vl)      __riscv_vnclipu_wx_u8m1((s), (sh), (vl))
+# define fused_vnclipu_wx_u16m1(s, sh, vl)     __riscv_vnclipu_wx_u16m1((s), (sh), (vl))
 #else
 /* v1.0+ - vxrm is a per-instruction argument; the global CSR write is a no-op. */
-# define FUSED_RVV_SET_VXRM_RNU()         ((void)0)
-# define fused_vaaddu_vv_u8m1(a, b, vl)   __riscv_vaaddu_vv_u8m1((a), (b), __RISCV_VXRM_RNU, (vl))
-# define fused_vaaddu_vv_u16m1(a, b, vl)  __riscv_vaaddu_vv_u16m1((a), (b), __RISCV_VXRM_RNU, (vl))
+# define FUSED_RVV_SET_VXRM_RNU()              ((void)0)
+# define fused_vaaddu_vv_u8m1(a, b, vl)        __riscv_vaaddu_vv_u8m1((a), (b), __RISCV_VXRM_RNU, (vl))
+# define fused_vaaddu_vv_u16m1(a, b, vl)       __riscv_vaaddu_vv_u16m1((a), (b), __RISCV_VXRM_RNU, (vl))
+# define fused_vnclipu_wx_u8m1(s, sh, vl)      __riscv_vnclipu_wx_u8m1((s), (sh), __RISCV_VXRM_RNU, (vl))
+# define fused_vnclipu_wx_u16m1(s, sh, vl)     __riscv_vnclipu_wx_u16m1((s), (sh), __RISCV_VXRM_RNU, (vl))
 #endif
 
 /* --------------------------------------------------------------------------

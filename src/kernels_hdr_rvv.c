@@ -58,14 +58,15 @@ static inline void vavg_row_u16(const uint16_t *a, const uint16_t *b,
  * The whole 1.5x thirds path - both the vertical row blend and the horizontal
  * 1.5x filter - is built from this one op.  10-bit inputs make a*171 overflow
  * u16 (max 174,933), so the multiply-accumulate widens to u32 before narrowing
- * back to u16.
+ * back to u16.  vnclipu does that narrowing with the rounding folded in: under
+ * vxrm = RNU it applies the 128 bias and the >>8 in one instruction, with no
+ * separate add and no vtype change.
  * -------------------------------------------------------------------------- */
 static inline vuint16m1_t vblend_2_1_u16m1(vuint16m1_t a, vuint16m1_t b, size_t vl)
 {
     vuint32m2_t s = __riscv_vwmulu_vx_u32m2(a, 171, vl);
     s = __riscv_vwmaccu_vx_u32m2(s, 85, b, vl);
-    s = __riscv_vadd_vx_u32m2(s, 128, vl);
-    return __riscv_vnsrl_wx_u16m1(s, 8, vl);
+    return fused_vnclipu_wx_u16m1(s, 8, vl);
 }
 
 /* --------------------------------------------------------------------------
@@ -173,6 +174,37 @@ static inline void vhalve_row_u16(const uint16_t *src, uint16_t *dst, size_t dst
 }
 
 /* --------------------------------------------------------------------------
+ * Fused 2x2-box downscale row (the pure-2x case), u16 twin of the SDR helper.
+ *
+ *   for x in 0..dst_n:
+ *     dst[x] = avg( avg(rowA[2x],   rowB[2x]),
+ *                   avg(rowA[2x+1], rowB[2x+1]) )
+ *
+ * Both source rows arrive as even/odd pairs from one stride-2 load each, the
+ * vertical averages stay in registers, and a final vaaddu folds them into the
+ * halved output - so the full-width intermediate row is never written or read.
+ * Bit-exact with the separate vertical-then-horizontal path.
+ * -------------------------------------------------------------------------- */
+static inline void vdown_2x2_row_u16(const uint16_t *rowA,
+                                     const uint16_t *rowB,
+                                     uint16_t *dst,
+                                     size_t dst_n)
+{
+    size_t x = 0;
+    while (x < dst_n) {
+        size_t vl = __riscv_vsetvl_e16m1(dst_n - x);
+        vuint16m1_t ae, ao, be, bo;
+        fused_load2_u16m1(rowA + 2 * x, vl, &ae, &ao);
+        fused_load2_u16m1(rowB + 2 * x, vl, &be, &bo);
+        vuint16m1_t ve = fused_vaaddu_vv_u16m1(ae, be, vl);  /* even columns, vertical */
+        vuint16m1_t vo = fused_vaaddu_vv_u16m1(ao, bo, vl);  /* odd columns, vertical  */
+        vuint16m1_t h  = fused_vaaddu_vv_u16m1(ve, vo, vl);  /* fold pair -> halved out */
+        __riscv_vse16_v_u16m1(dst + x, h, vl);
+        x += vl;
+    }
+}
+
+/* --------------------------------------------------------------------------
  * Primitive: P010 chroma deinterleave.
  *
  * P010/P210 ship chroma as a single interleaved UVUVUV... plane.  Split it
@@ -234,15 +266,35 @@ static void scale_plane_pow2_hdr_rvv(
     int group_rows = (2 << deepest);
     int num_groups = src_h / group_rows;
 
+    /* Pure 2x downscale: each group is two source rows collapsing to one output
+     * row, so fuse the vertical average and horizontal halve and skip scratch
+     * entirely.  Deeper cascades take the general path, where vert_buf[0] feeds
+     * the next level and must be materialized. */
+    if (deepest == 0) {
+        for (int g = 0; g < num_groups; g++) {
+            const uint16_t *ra = src + (size_t)(2 * g)     * (size_t)src_el_stride;
+            const uint16_t *rb = src + (size_t)(2 * g + 1) * (size_t)src_el_stride;
+            int dst_el_stride = dst_strides_bytes[0] / (int)sizeof(uint16_t);
+            uint16_t *out = dst_planes[0] + (size_t)g * (size_t)dst_el_stride;
+            vdown_2x2_row_u16(ra, rb, out, (size_t)dst_widths[0]);
+        }
+        return;
+    }
+
     fused_scratch_t scratch;
     fused_scratch_init(&scratch, scratch_pool_base, scratch_pool_size);
 
     uint16_t *vert_buf[4] = { NULL, NULL, NULL, NULL };
     int       vert_rows[4];
 
-    for (int k = 0; k <= deepest; k++) {
+    for (int k = 0; k <= deepest; k++)
         vert_rows[k] = group_rows >> (k + 1);
-        vert_buf[k]  = (uint16_t *)fused_scratch_alloc(
+
+    /* Materialize a vertical buffer for every level EXCEPT the deepest, whose
+     * vertical average is fused into its own first horizontal halve below
+     * (vdown_2x2_row_u16) - no deeper level reads it, so it need not exist. */
+    for (int k = 0; k < deepest; k++) {
+        vert_buf[k] = (uint16_t *)fused_scratch_alloc(
             &scratch,
             (size_t)vert_rows[k] * (size_t)src_w * sizeof(uint16_t));
         if (!vert_buf[k]) return;
@@ -258,14 +310,15 @@ static void scale_plane_pow2_hdr_rvv(
         const uint16_t *grp_base = src
             + (size_t)g * (size_t)group_rows * (size_t)src_el_stride;
 
-        /* Vertical cascade. */
+        /* Vertical cascade, stopping one short of the deepest level (that one
+         * is produced on the fly in the horizontal pass). */
         for (int r = 0; r < vert_rows[0]; r++) {
             const uint16_t *ra = grp_base + (size_t)(2 * r)     * (size_t)src_el_stride;
             const uint16_t *rb = grp_base + (size_t)(2 * r + 1) * (size_t)src_el_stride;
             uint16_t *dst_row  = vert_buf[0] + (size_t)r * (size_t)src_w;
             vavg_row_u16(ra, rb, dst_row, (size_t)src_w);
         }
-        for (int k = 1; k <= deepest; k++) {
+        for (int k = 1; k < deepest; k++) {
             for (int r = 0; r < vert_rows[k]; r++) {
                 const uint16_t *ra = vert_buf[k - 1]
                     + (size_t)(2 * r)     * (size_t)src_w;
@@ -281,20 +334,37 @@ static void scale_plane_pow2_hdr_rvv(
             if (!(active_outputs & (1u << bit_pos[k]))) continue;
             int dst_el_stride = dst_strides_bytes[k] / (int)sizeof(uint16_t);
 
+            int steps = k + 1;
             for (int r = 0; r < vert_rows[k]; r++) {
-                const uint16_t *vert_row = vert_buf[k]
-                    + (size_t)r * (size_t)src_w;
                 uint16_t *out = dst_planes[k]
                     + (size_t)out_row[k] * (size_t)dst_el_stride;
 
-                /* Same in-place halving cascade as the SDR kernel: the
-                 * intermediate halvings narrow through h_buf and the final one
-                 * stores straight into the destination plane, clamped to
-                 * dst_widths[k]. */
-                int steps = k + 1;
-                int cur_w = src_w;
-                const uint16_t *cur_src = vert_row;
-                for (int hstep = 0; hstep < steps; hstep++) {
+                /* Same in-place halving cascade as the SDR kernel: intermediate
+                 * halvings narrow through h_buf and the final one stores
+                 * straight into the destination plane, clamped to dst_widths[k].
+                 * The deepest level has no materialized vert_buf - vdown_2x2_row
+                 * fuses its vertical average into the first halve (landing in
+                 * h_buf) and the cascade resumes from the second step.  deepest
+                 * >= 1 here, so a halve always remains to reach the output. */
+                int cur_w;
+                const uint16_t *cur_src;
+                int hstep;
+                if (k == deepest) {
+                    const uint16_t *ra = vert_buf[deepest - 1]
+                        + (size_t)(2 * r)     * (size_t)src_w;
+                    const uint16_t *rb = vert_buf[deepest - 1]
+                        + (size_t)(2 * r + 1) * (size_t)src_w;
+                    int half_w = src_w >> 1;
+                    vdown_2x2_row_u16(ra, rb, h_buf, (size_t)half_w);
+                    cur_src = h_buf;
+                    cur_w   = half_w;
+                    hstep   = 1;
+                } else {
+                    cur_src = vert_buf[k] + (size_t)r * (size_t)src_w;
+                    cur_w   = src_w;
+                    hstep   = 0;
+                }
+                for (; hstep < steps; hstep++) {
                     int next_w = cur_w >> 1;
                     if (hstep == steps - 1) {
                         vhalve_row_u16(cur_src, out, (size_t)dst_widths[k]);

@@ -85,6 +85,40 @@ static inline void vhalve_row_u8(const uint8_t *src,
 }
 
 /* --------------------------------------------------------------------------
+ * Primitive 2b: fused 2x2-box downscale row (the pure-2x case).
+ *
+ *   for x in 0..dst_n:
+ *     dst[x] = avg( avg(rowA[2x],   rowB[2x]),
+ *                   avg(rowA[2x+1], rowB[2x+1]) )
+ *
+ * A 2x downscale is a vertical pair-average followed by a horizontal halve.
+ * Done separately, the vertical average has to write a full-width row out and
+ * read it straight back for the halve.  Here both rows arrive as even/odd
+ * pairs from a single stride-2 load each, the vertical averages happen in
+ * registers, and one more vaaddu folds them into the halved output - so the
+ * full-width middle row never exists.  Bit-exact with the two-step path: the
+ * operand pairing and the (a + b + 1) >> 1 rounding at each step are identical.
+ * -------------------------------------------------------------------------- */
+static inline void vdown_2x2_row_u8(const uint8_t *rowA,
+                                    const uint8_t *rowB,
+                                    uint8_t *dst,
+                                    size_t dst_n)
+{
+    size_t x = 0;
+    while (x < dst_n) {
+        size_t vl = __riscv_vsetvl_e8m1(dst_n - x);
+        vuint8m1_t ae, ao, be, bo;
+        fused_load2_u8m1(rowA + 2 * x, vl, &ae, &ao);
+        fused_load2_u8m1(rowB + 2 * x, vl, &be, &bo);
+        vuint8m1_t ve = fused_vaaddu_vv_u8m1(ae, be, vl);  /* even columns, vertical */
+        vuint8m1_t vo = fused_vaaddu_vv_u8m1(ao, bo, vl);  /* odd columns, vertical  */
+        vuint8m1_t h  = fused_vaaddu_vv_u8m1(ve, vo, vl);  /* fold pair -> halved out */
+        __riscv_vse8_v_u8m1(dst + x, h, vl);
+        x += vl;
+    }
+}
+
+/* --------------------------------------------------------------------------
  * Primitive 3: 2:1 bilinear blend of two vectors.
  *
  *   blend(a, b) = (171*a + 85*b + 128) >> 8   ~= a * 2/3 + b * 1/3
@@ -94,13 +128,17 @@ static inline void vhalve_row_u8(const uint8_t *src,
  * blend applied to different neighbours, so the kernels below are written in
  * terms of it.  Operating on vectors (rather than memory rows) lets callers
  * keep intermediates in registers.
+ *
+ * The widening multiply-accumulate builds 171*a + 85*b (max 65280, comfortably
+ * inside u16), then vnclipu does the round-and-shift in a single shot: with
+ * vxrm = RNU it adds the 128 bias and shifts out 8 bits for us, so the whole
+ * blend stays on the e8 vtype with no detour through a separate +128 add.
  * -------------------------------------------------------------------------- */
 static inline vuint8m1_t vblend_2_1_u8m1(vuint8m1_t a, vuint8m1_t b, size_t vl)
 {
     vuint16m2_t s = __riscv_vwmulu_vx_u16m2(a, 171, vl);
     s = __riscv_vwmaccu_vx_u16m2(s, 85, b, vl);
-    s = __riscv_vadd_vx_u16m2(s, 128, vl);
-    return __riscv_vnsrl_wx_u8m1(s, 8, vl);
+    return fused_vnclipu_wx_u8m1(s, 8, vl);
 }
 
 /* --------------------------------------------------------------------------
@@ -225,15 +263,36 @@ static void scale_plane_pow2_rvv(
     int group_rows = (2 << deepest);
     int num_groups = src_h / group_rows;
 
+    /* Pure 2x downscale: every group is just two source rows collapsing to one
+     * output row, so fuse the vertical average and the horizontal halve in one
+     * pass and skip the scratch buffers entirely.  Deeper cascades keep the
+     * general path below, where vert_buf[0] is a shared input to the next
+     * level and so genuinely has to be materialized. */
+    if (deepest == 0) {
+        for (int g = 0; g < num_groups; g++) {
+            const uint8_t *ra = src + (size_t)(2 * g)     * (size_t)src_stride;
+            const uint8_t *rb = src + (size_t)(2 * g + 1) * (size_t)src_stride;
+            uint8_t *out = dst_planes[0] + (size_t)g * (size_t)dst_strides[0];
+            vdown_2x2_row_u8(ra, rb, out, (size_t)dst_widths[0]);
+        }
+        return;
+    }
+
     fused_scratch_t scratch;
     fused_scratch_init(&scratch, scratch_pool_base, scratch_pool_size);
 
     uint8_t *vert_buf[4] = { NULL, NULL, NULL, NULL };
     int      vert_rows[4];
 
-    for (int k = 0; k <= deepest; k++) {
+    for (int k = 0; k <= deepest; k++)
         vert_rows[k] = group_rows >> (k + 1);
-        vert_buf[k]  = (uint8_t *)fused_scratch_alloc(
+
+    /* Materialize a vertical buffer for every level EXCEPT the deepest.  No
+     * deeper level reads the deepest level's vertical average, so it is folded
+     * straight into that level's first horizontal halve below (vdown_2x2_row)
+     * and the full-width row never has to land in memory. */
+    for (int k = 0; k < deepest; k++) {
+        vert_buf[k] = (uint8_t *)fused_scratch_alloc(
             &scratch, (size_t)vert_rows[k] * (size_t)src_w);
         if (!vert_buf[k]) return;
     }
@@ -247,15 +306,17 @@ static void scale_plane_pow2_rvv(
         const uint8_t *grp_base = src
             + (size_t)g * (size_t)group_rows * (size_t)src_stride;
 
-        /* Vertical cascade: level 0 averages source row pairs;
-         * each subsequent level averages pairs from the level below. */
+        /* Vertical cascade: level 0 averages source row pairs; each subsequent
+         * level averages pairs from the level below.  It stops one short of the
+         * deepest level - that one is produced on the fly inside the horizontal
+         * pass. */
         for (int r = 0; r < vert_rows[0]; r++) {
             const uint8_t *ra = grp_base + (size_t)(2 * r)     * (size_t)src_stride;
             const uint8_t *rb = grp_base + (size_t)(2 * r + 1) * (size_t)src_stride;
             uint8_t *dst_row  = vert_buf[0] + (size_t)r * (size_t)src_w;
             vavg_row_u8(ra, rb, dst_row, (size_t)src_w);
         }
-        for (int k = 1; k <= deepest; k++) {
+        for (int k = 1; k < deepest; k++) {
             for (int r = 0; r < vert_rows[k]; r++) {
                 const uint8_t *ra = vert_buf[k - 1]
                     + (size_t)(2 * r)     * (size_t)src_w;
@@ -270,26 +331,44 @@ static void scale_plane_pow2_rvv(
         for (int k = 0; k <= deepest; k++) {
             if (!(active_outputs & (1u << bit_pos[k]))) continue;
 
+            int steps = k + 1;
             for (int r = 0; r < vert_rows[k]; r++) {
-                const uint8_t *vert_row = vert_buf[k]
-                    + (size_t)r * (size_t)src_w;
                 uint8_t *out = dst_planes[k]
                     + (size_t)out_row[k] * (size_t)dst_strides[k];
 
-                /* Halve the row width (k+1) times to reach dst_widths[k].  The
-                 * first halving reads the vertically-averaged row into h_buf;
-                 * the rest run in place on h_buf, which is safe because output
-                 * element x consumes source 2x and 2x+1, so the read cursor
-                 * always stays a step ahead of the write cursor.  The last
-                 * halving stores directly into the destination plane row,
-                 * landing the final narrowing and the output write in a single
-                 * pass.  dst_widths[k] can sit just under the halved width when
-                 * the source isn't an exact multiple of the output, so the
-                 * final step is clamped to it. */
-                int steps = k + 1;
-                int cur_w = src_w;
-                const uint8_t *cur_src = vert_row;
-                for (int hstep = 0; hstep < steps; hstep++) {
+                /* Reduce the row to dst_widths[k] by halving (k+1) times.
+                 * Intermediate halvings narrow through h_buf - safe in place,
+                 * since output element x consumes source 2x and 2x+1 so the read
+                 * cursor stays a step ahead of the write - and the last halving
+                 * stores straight into the destination plane (clamped to
+                 * dst_widths[k], which can sit just under the halved width when
+                 * the source isn't an exact multiple of the output).
+                 *
+                 * For the deepest level there is no materialized vert_buf: its
+                 * vertical average is fused into the first halve.  vdown_2x2_row
+                 * reads the two parent rows directly and lands the first halve
+                 * in h_buf, then the cascade simply resumes at the second step.
+                 * deepest >= 1 here (pure 2x returned early), so there is always
+                 * at least one more halve to carry the result to the output. */
+                int cur_w;
+                const uint8_t *cur_src;
+                int hstep;
+                if (k == deepest) {
+                    const uint8_t *ra = vert_buf[deepest - 1]
+                        + (size_t)(2 * r)     * (size_t)src_w;
+                    const uint8_t *rb = vert_buf[deepest - 1]
+                        + (size_t)(2 * r + 1) * (size_t)src_w;
+                    int half_w = src_w >> 1;
+                    vdown_2x2_row_u8(ra, rb, h_buf, (size_t)half_w);
+                    cur_src = h_buf;
+                    cur_w   = half_w;
+                    hstep   = 1;
+                } else {
+                    cur_src = vert_buf[k] + (size_t)r * (size_t)src_w;
+                    cur_w   = src_w;
+                    hstep   = 0;
+                }
+                for (; hstep < steps; hstep++) {
                     int next_w = cur_w >> 1;
                     if (hstep == steps - 1) {
                         vhalve_row_u8(cur_src, out, (size_t)dst_widths[k]);

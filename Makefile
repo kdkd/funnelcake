@@ -356,20 +356,26 @@ visual: funnelcake_test
 #
 # The kernel sources and arch flag follow $(UNAME_M) exactly like LIB_SRCS
 # above, so `make asm` inspects the AVX2 kernels on x86_64, the NEON kernels on
-# arm, and the RVV kernels on riscv64. ASM_ARCH_CFLAGS mirrors the per-file
-# flag the real objects are built with (-mavx2 / none / -march=rv64gcv).
+# arm, and the RVV kernels on riscv64. The full SIMD set for the host is
+# covered - downscale, HDR downscale, and upscale - so the HDR codegen is just
+# as inspectable as the SDR codegen. ASM_ARCH_CFLAGS mirrors the per-file flag
+# the real objects are built with (-mavx2 / none / -march=rv64gcv).
 ifeq ($(UNAME_M),x86_64)
   ASM_ARCH_CFLAGS = -mavx2
-  ASM_SRCS        = src/kernels_avx2.c src/kernels_upscale_avx2.c
+  ASM_SRCS        = src/kernels_avx2.c src/kernels_hdr_avx2.c \
+                    src/kernels_upscale_avx2.c
 else ifeq ($(UNAME_M),aarch64)
   ASM_ARCH_CFLAGS =
-  ASM_SRCS        = src/kernels_neon.c src/kernels_upscale_neon.c
+  ASM_SRCS        = src/kernels_neon.c src/kernels_hdr_neon.c \
+                    src/kernels_upscale_neon.c
 else ifeq ($(UNAME_M),arm64)
   ASM_ARCH_CFLAGS =
-  ASM_SRCS        = src/kernels_neon.c src/kernels_upscale_neon.c
+  ASM_SRCS        = src/kernels_neon.c src/kernels_hdr_neon.c \
+                    src/kernels_upscale_neon.c
 else ifeq ($(UNAME_M),riscv64)
   ASM_ARCH_CFLAGS = -march=rv64gcv
-  ASM_SRCS        = src/kernels_rvv.c src/kernels_upscale_rvv.c
+  ASM_SRCS        = src/kernels_rvv.c src/kernels_hdr_rvv.c \
+                    src/kernels_upscale_rvv.c
 endif
 
 ASM_CFLAGS = $(CFLAGS_BASE) $(LIB_OPT) $(TUNE_CFLAGS) $(ASM_ARCH_CFLAGS) -S -fverbose-asm

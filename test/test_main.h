@@ -135,6 +135,7 @@ typedef struct {
     int         run_bench_sdr;     /* --bench-sdr: SDR benchmarks only */
     int         run_bench_hdr;     /* --bench-hdr: HDR benchmarks only */
     int         run_bench_swscale; /* --bench-swscale: libswscale comparison only */
+    int         skip_bench_swscale;/* --skip-bench-swscale: never run swscale bench */
     int         run_visual;
     const char *bench_filter;
 } test_options_t;

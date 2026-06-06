@@ -347,14 +347,32 @@ visual: funnelcake_test
 	./funnelcake_test --visual
 
 # --- Assembly inspection ---
-# `make asm` emits annotated assembly for the AVX2 SIMD kernels next to the
+# `make asm` emits annotated assembly for this host's SIMD kernels next to the
 # sources so optimization experiments can inspect codegen (register spills,
 # intrinsic lowering) without rediscovering the compiler invocation. Built at
-# -O3 with the same -mavx2/-mtune flags as the real objects but WITHOUT LTO:
+# -O3 with the same -march/-mtune flags as the real objects but WITHOUT LTO:
 # `-flto -S` emits pre-link IR, not the final per-function codegen we want to
 # read. Honors TUNE, e.g. `make asm TUNE=native`.
-ASM_CFLAGS = $(CFLAGS_BASE) $(LIB_OPT) $(TUNE_CFLAGS) -mavx2 -S -fverbose-asm
-ASM_SRCS   = src/kernels_avx2.c src/kernels_upscale_avx2.c
+#
+# The kernel sources and arch flag follow $(UNAME_M) exactly like LIB_SRCS
+# above, so `make asm` inspects the AVX2 kernels on x86_64, the NEON kernels on
+# arm, and the RVV kernels on riscv64. ASM_ARCH_CFLAGS mirrors the per-file
+# flag the real objects are built with (-mavx2 / none / -march=rv64gcv).
+ifeq ($(UNAME_M),x86_64)
+  ASM_ARCH_CFLAGS = -mavx2
+  ASM_SRCS        = src/kernels_avx2.c src/kernels_upscale_avx2.c
+else ifeq ($(UNAME_M),aarch64)
+  ASM_ARCH_CFLAGS =
+  ASM_SRCS        = src/kernels_neon.c src/kernels_upscale_neon.c
+else ifeq ($(UNAME_M),arm64)
+  ASM_ARCH_CFLAGS =
+  ASM_SRCS        = src/kernels_neon.c src/kernels_upscale_neon.c
+else ifeq ($(UNAME_M),riscv64)
+  ASM_ARCH_CFLAGS = -march=rv64gcv
+  ASM_SRCS        = src/kernels_rvv.c src/kernels_upscale_rvv.c
+endif
+
+ASM_CFLAGS = $(CFLAGS_BASE) $(LIB_OPT) $(TUNE_CFLAGS) $(ASM_ARCH_CFLAGS) -S -fverbose-asm
 ASM_OUT    = $(ASM_SRCS:.c=.S)
 
 asm: $(ASM_OUT)

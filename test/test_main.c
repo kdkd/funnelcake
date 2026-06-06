@@ -101,6 +101,8 @@ int main(int argc, char *argv[])
                 opts.bench_filter = argv[i + 1];
                 i++;
             }
+        } else if (strcmp(argv[i], "--skip-bench-swscale") == 0) {
+            opts.skip_bench_swscale = 1;
         } else if (strcmp(argv[i], "--visual") == 0) {
             opts.run_visual = 1;
         }
@@ -134,13 +136,15 @@ int main(int argc, char *argv[])
         printf("\n=== SDR Benchmarks ===\n\n");
         run_bench_tests(opts.bench_filter);
 
-        printf("\n=== libswscale Comparison ===\n\n");
-        run_swscale_bench_tests(opts.bench_filter);
+        if (!opts.skip_bench_swscale) {
+            printf("\n=== libswscale Comparison ===\n\n");
+            run_swscale_bench_tests(opts.bench_filter);
 
-        print_bench_comparison_table();
+            print_bench_comparison_table();
+        }
     }
 
-    if (opts.run_bench_swscale) {
+    if (opts.run_bench_swscale && !opts.skip_bench_swscale) {
         printf("\n=== libswscale Comparison ===\n\n");
         run_swscale_bench_tests(opts.bench_filter);
     }

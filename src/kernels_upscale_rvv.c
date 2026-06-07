@@ -367,10 +367,8 @@ void fused_kernel_pow2_up_rvv(const fused_kernel_params_t *p,
  * elements with vsetvl_e16m1.  The blend helper uses u32-widened
  * multiplies because 10-bit values multiplied by 171 overflow u16.
  *
- * P010/P210 chroma is NOT deinterleaved here.  The scalar HDR upscale
- * doesn't handle it either (no current test exercises P010 with upscale
- * active); matching the existing behaviour rather than silently changing
- * it.
+ * P010/P210 chroma is deinterleaved into the persistent planar temp buffers
+ * before the U/V upscale passes, matching the HDR downscale entry points.
  * -------------------------------------------------------------------------- */
 
 /* Bilinear vertical blend with 85/171 weights for u16:
@@ -624,12 +622,23 @@ void fused_kernel_upscale_hdr_rvv(const fused_hdr_kernel_params_t *p,
 {
     FUSED_RVV_SET_VXRM_RNU();
 
+    const uint16_t *up_src_u = src_u;
+    const uint16_t *up_src_v = src_v;
+    int up_src_uv_el_stride = p->src_uv_el_stride;
+
+    if (p->is_p010) {
+        if (fused_hdr_deinterleave_p010(p, src_u) != 0) return;
+        up_src_u = p->p010_tmp_u;
+        up_src_v = p->p010_tmp_v;
+        up_src_uv_el_stride = p->p010_tmp_stride / (int)sizeof(uint16_t);
+    }
+
     upscale_plane_hdr_rvv(p, src_y, p->src_width, p->src_height,
                           p->src_y_el_stride, 0);
-    upscale_plane_hdr_rvv(p, src_u, p->src_width / 2, p->src_height / 2,
-                          p->src_uv_el_stride, 1);
-    upscale_plane_hdr_rvv(p, src_v, p->src_width / 2, p->src_height / 2,
-                          p->src_uv_el_stride, 2);
+    upscale_plane_hdr_rvv(p, up_src_u, p->src_width / 2, p->src_height / 2,
+                          up_src_uv_el_stride, 1);
+    upscale_plane_hdr_rvv(p, up_src_v, p->src_width / 2, p->src_height / 2,
+                          up_src_uv_el_stride, 2);
 }
 
 void fused_kernel_thirds_up_hdr_rvv(const fused_hdr_kernel_params_t *p,

@@ -946,6 +946,51 @@ static void test_hdr_p010_tonemap_1x(void)
     TEST_PASS();
 }
 
+/* --------------------------------------------------------------------------
+ * 14. test_hdr_p010_upscale
+ *     P010 callers pass interleaved UV as src_u and NULL src_v. HDR upscale
+ *     must deinterleave chroma before scaling rather than reading src_v.
+ * -------------------------------------------------------------------------- */
+
+static void test_hdr_p010_upscale(void)
+{
+    test_p010_frame_t frame;
+    int r = test_p010_frame_create(&frame, 64, 64, PATTERN_SOLID, 0);
+    TEST_ASSERT(r == 0, "test_p010_frame_create failed");
+
+    fused_hdr_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.src_width      = frame.width;
+    ctx.src_height     = frame.height;
+    ctx.src_y_stride   = frame.y_stride;
+    ctx.src_uv_stride  = frame.uv_stride;
+    ctx.src_format     = FUSED_PIX_P010;
+    ctx.src_transfer   = FUSED_TRC_PQ;
+    ctx.requested_flags = 0;
+    ctx.hdr_flags      = 0;
+    ctx.sdr_flags      = 0;
+    ctx.upscale_flags  = FUSED_UPSCALE_2X;
+    suppress_log(&ctx);
+
+    int rc = fused_hdr_init(&ctx);
+    TEST_ASSERT_OK(rc, "P010 upscale init should succeed");
+    TEST_ASSERT(ctx.upscale_hdr_outputs[FUSED_UP_IDX_2X].plane_y != NULL,
+                "P010 2x output allocated");
+
+    fused_hdr_run(&ctx, frame.plane_y, frame.plane_uv, NULL);
+
+    const fused_hdr_output_t *out = &ctx.upscale_hdr_outputs[FUSED_UP_IDX_2X];
+    TEST_ASSERT_EQ(out->width, 128, "P010 2x output width");
+    TEST_ASSERT_EQ(out->height, 128, "P010 2x output height");
+    TEST_ASSERT(out->plane_y[0] != 0, "P010 upscale wrote Y");
+    TEST_ASSERT(out->plane_u[0] != 0, "P010 upscale wrote U");
+    TEST_ASSERT(out->plane_v[0] != 0, "P010 upscale wrote V");
+
+    fused_hdr_free(&ctx);
+    test_p010_frame_free(&frame);
+    TEST_PASS();
+}
+
 /* ==========================================================================
  * HDR upscale tests
  * ========================================================================== */
@@ -1145,6 +1190,7 @@ void run_hdr_correctness_tests(void)
     RUN_TEST(test_hdr_double_free_safety);
     RUN_TEST(test_hdr_non_standard_correctness);
     RUN_TEST(test_hdr_p010_tonemap_1x);
+    RUN_TEST(test_hdr_p010_upscale);
 
     /* HDR upscale tests */
     RUN_TEST(test_hdr_upscale_dimensions);

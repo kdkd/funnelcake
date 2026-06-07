@@ -383,7 +383,7 @@ int fused_hdr_init(fused_hdr_ctx_t *ctx)
 
         /* (d) SIMD chroma width constraint */
         int chroma_w = out_w / 2;
-        int step_fallback = 0;
+        int step_fallback = !has_simd;
 
         if (has_simd && (chroma_w & 31)) {
             if (ctx->options & FUSED_OPT_NO_FALLBACK) {
@@ -684,7 +684,7 @@ hdr_tail_done:
         ctx->output_1x.plane_y   = (uint8_t *)py;
         ctx->output_1x.plane_u   = (uint8_t *)pu;
         ctx->output_1x.plane_v   = (uint8_t *)pv;
-        ctx->output_1x.fallback  = 0;
+        ctx->output_1x.fallback  = !has_simd;
     }
 
     /* ------------------------------------------------------------------ */

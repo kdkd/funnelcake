@@ -736,12 +736,23 @@ void fused_kernel_upscale_hdr_neon(const fused_hdr_kernel_params_t *p,
                                    const uint16_t *src_u,
                                    const uint16_t *src_v)
 {
+    const uint16_t *up_src_u = src_u;
+    const uint16_t *up_src_v = src_v;
+    int up_src_uv_el_stride = p->src_uv_el_stride;
+
+    if (p->is_p010) {
+        if (fused_hdr_deinterleave_p010(p, src_u) != 0) return;
+        up_src_u = p->p010_tmp_u;
+        up_src_v = p->p010_tmp_v;
+        up_src_uv_el_stride = p->p010_tmp_stride / (int)sizeof(uint16_t);
+    }
+
     upscale_plane_hdr_neon(p, src_y, p->src_width, p->src_height,
                            p->src_y_el_stride, 0);
-    upscale_plane_hdr_neon(p, src_u, p->src_width / 2, p->src_height / 2,
-                           p->src_uv_el_stride, 1);
-    upscale_plane_hdr_neon(p, src_v, p->src_width / 2, p->src_height / 2,
-                           p->src_uv_el_stride, 2);
+    upscale_plane_hdr_neon(p, up_src_u, p->src_width / 2, p->src_height / 2,
+                           up_src_uv_el_stride, 1);
+    upscale_plane_hdr_neon(p, up_src_v, p->src_width / 2, p->src_height / 2,
+                           up_src_uv_el_stride, 2);
 }
 
 void fused_kernel_thirds_up_hdr_neon(const fused_hdr_kernel_params_t *p,

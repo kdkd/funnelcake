@@ -8,9 +8,11 @@
 #include "test_main.h"
 #include "test_patterns.h"
 #include "funnelcake.h"
+#include "detect.h"
 #include <string.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 /* --------------------------------------------------------------------------
  * Local helpers
@@ -808,6 +810,72 @@ static void test_hdr_minimum_dimensions(void)
 }
 
 /* --------------------------------------------------------------------------
+ * 25. test_hdr_forced_scalar_fallback_fields
+ *     With FUNNELCAKE_FORCE_SCALAR set, every produced HDR descriptor should
+ *     report fallback=1, matching the public fallback contract.
+ * -------------------------------------------------------------------------- */
+
+static void test_hdr_forced_scalar_fallback_fields(void)
+{
+    setenv("FUNNELCAKE_FORCE_SCALAR", "1", 1);
+    fused_detect_cpu_reset();
+
+    fused_hdr_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.src_width      = 192;
+    ctx.src_height     = 108;
+    ctx.src_y_stride   = align_up_32(192 * 2);
+    ctx.src_uv_stride  = align_up_32(96 * 2);
+    ctx.src_format     = FUSED_PIX_I010;
+    ctx.src_transfer   = FUSED_TRC_PQ;
+    ctx.requested_flags = FUSED_SCALE_1_5X | FUSED_SCALE_3X;
+    ctx.hdr_flags      = FUSED_SCALE_1_5X;
+    ctx.sdr_flags      = FUSED_SCALE_3X;
+    ctx.tonemap_1x     = 1;
+    ctx.upscale_flags  = FUSED_UPSCALE_2X;
+    suppress_log(&ctx);
+
+    int rc = fused_hdr_init(&ctx);
+    int failed = 0;
+
+    if (fused_simd_available() != 0) {
+        printf("  FAIL [%s:%d] forced scalar should disable SIMD\n", __func__, __LINE__);
+        failed = 1;
+    } else if ((rc & FUSED_WARN_BIT_SCALAR) == 0 || rc < 0) {
+        printf("  FAIL [%s:%d] forced scalar init rc=%d, expected scalar warning\n",
+               __func__, __LINE__, rc);
+        failed = 1;
+    } else if (ctx.hdr_outputs[FUSED_IDX_1_5X].fallback != 1) {
+        printf("  FAIL [%s:%d] hdr output fallback=%d, expected 1\n",
+               __func__, __LINE__, ctx.hdr_outputs[FUSED_IDX_1_5X].fallback);
+        failed = 1;
+    } else if (ctx.sdr_outputs[FUSED_IDX_3X].fallback != 1) {
+        printf("  FAIL [%s:%d] sdr output fallback=%d, expected 1\n",
+               __func__, __LINE__, ctx.sdr_outputs[FUSED_IDX_3X].fallback);
+        failed = 1;
+    } else if (ctx.output_1x.fallback != 1) {
+        printf("  FAIL [%s:%d] 1x output fallback=%d, expected 1\n",
+               __func__, __LINE__, ctx.output_1x.fallback);
+        failed = 1;
+    } else if (ctx.upscale_hdr_outputs[FUSED_UP_IDX_2X].fallback != 1) {
+        printf("  FAIL [%s:%d] upscale output fallback=%d, expected 1\n",
+               __func__, __LINE__, ctx.upscale_hdr_outputs[FUSED_UP_IDX_2X].fallback);
+        failed = 1;
+    }
+
+    fused_hdr_free(&ctx);
+    unsetenv("FUNNELCAKE_FORCE_SCALAR");
+    fused_detect_cpu_reset();
+
+    if (failed) {
+        g_results.failed++;
+        return;
+    }
+
+    TEST_PASS();
+}
+
+/* --------------------------------------------------------------------------
  * run_hdr_validation_tests
  * -------------------------------------------------------------------------- */
 
@@ -837,4 +905,5 @@ void run_hdr_validation_tests(void)
     RUN_TEST(test_hdr_custom_lut_output);
     RUN_TEST(test_hdr_non_standard_width);
     RUN_TEST(test_hdr_minimum_dimensions);
+    RUN_TEST(test_hdr_forced_scalar_fallback_fields);
 }

@@ -431,6 +431,33 @@ typedef struct {
     size_t   scratch_pool_size;
 } fused_hdr_kernel_params_t;
 
+/* Deinterleave the effective P010/P210 chroma region into the persistent
+ * planar temp buffers allocated by fused_hdr_init.  For P210, src_uv_el_stride
+ * has already been doubled by init so this naturally skips every other chroma
+ * row while producing a 4:2:0 planar temp. */
+static inline int fused_hdr_deinterleave_p010(const fused_hdr_kernel_params_t *p,
+                                              const uint16_t *src_uv)
+{
+    if (!p->is_p010) return 0;
+    if (!src_uv || !p->p010_tmp_u || !p->p010_tmp_v) return -1;
+
+    int chroma_w = p->src_width / 2;
+    int chroma_h = p->src_height / 2;
+    int planar_el_stride = p->p010_tmp_stride / (int)sizeof(uint16_t);
+
+    for (int y = 0; y < chroma_h; y++) {
+        const uint16_t *row = src_uv + (size_t)y * (size_t)p->src_uv_el_stride;
+        uint16_t *u_row = p->p010_tmp_u + (size_t)y * (size_t)planar_el_stride;
+        uint16_t *v_row = p->p010_tmp_v + (size_t)y * (size_t)planar_el_stride;
+        for (int x = 0; x < chroma_w; x++) {
+            u_row[x] = row[2 * x];
+            v_row[x] = row[2 * x + 1];
+        }
+    }
+
+    return 0;
+}
+
 
 /* --------------------------------------------------------------------------
  * fused_hdr_kernel_fn

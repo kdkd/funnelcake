@@ -58,8 +58,8 @@ constraints.
 
 ## Benchmarks
 
-All measurements are single-threaded median latency over ~1000 iterations
-per workload. Each system was built with `make pgo LTO=1 TUNE=native`.
+All measurements are single-threaded latency over ~1000 iterations per
+workload. Each system was built with `make pgo LTO=1 TUNE=native`.
 Source frames contain pseudo-random pixel data so the benchmark is not
 cache-hot from pattern repetition. libswscale is invoked with
 `SWS_BILINEAR` and one `SwsContext` per output target - the "independent"
@@ -90,12 +90,12 @@ Smaller time is better; larger speedup is better.
 
 | Workload | Epyc 7302 (Zen 2) | Xeon 6132 (Skylake) | Xeon E5v4 (Broadwell) |
 |---|---|---|---|
-| 640×360 down:2x                   |    8 µs (14.2×) |    9 µs (13.8×) |   34 µs  (4.8×) |
-| 960×540 down:1.5x,3x              |   63 µs  (8.2×) |   75 µs  (8.6×) |  202 µs  (3.9×) |
-| 1280×720 down:2x,4x               |   51 µs (13.2×) |   81 µs (10.7×) |  190 µs  (5.4×) |
-| 1920×1080 down:1.5x,3x,6x         |  259 µs (10.7×) |  312 µs (11.0×) |  585 µs  (6.9×) |
+| 640×360 down:2x                   |    8 µs (14.2×) |    9 µs (13.8×) |   40 µs  (4.8×) |
+| 960×540 down:1.5x,3x              |   55 µs  (9.4×) |   69 µs  (9.3×) |  191 µs  (4.1×) |
+| 1280×720 down:2x,4x               |   51 µs (13.2×) |   81 µs (10.7×) |  162 µs  (6.3×) |
+| 1920×1080 down:1.5x,3x,6x         |  227 µs (12.2×) |  288 µs (11.9×) |  414 µs  (9.8×) |
 | 2560×1440 down:2x,4x,8x           |  249 µs (14.9×) |  384 µs (12.0×) |  501 µs (11.0×) |
-| 3840×2160 down:1.5x,3x,6x,12x     | 1575 µs  (8.4×) | 1647 µs  (9.7×) | 1959 µs  (9.8×) |
+| 3840×2160 down:1.5x,3x,6x,12x     | 1575 µs  (8.4×) | 1523 µs (10.5×) | 1519 µs (12.6×) |
 
 **aarch64 / NEON**
 
@@ -114,14 +114,14 @@ Smaller time is better; larger speedup is better.
 
 | Workload | Epyc 7302 (Zen 2) | Xeon 6132 (Skylake) | Xeon E5v4 (Broadwell) |
 |---|---|---|---|
-| 480×270 up:2x                   |   21 µs (13.3×) |   25 µs (12.2×) |   51 µs  (9.2×) |
-| 480×270 up:2x,4x                |  105 µs  (8.7×) |  177 µs  (6.1×) |  236 µs  (6.7×) |
-| 960×540 up:2x                   |   84 µs (11.9×) |  148 µs  (8.1×) |  184 µs  (7.5×) |
-| 960×540 up:2x,3x                |  840 µs  (3.2×) | 1022 µs  (3.3×) | 1228 µs  (3.2×) |
-| 1920×1080 up:2x                 |  571 µs  (7.1×) |  738 µs  (6.4×) |  754 µs  (7.3×) |
-| 1920×1080 up:1.5x               |  743 µs  (3.7×) |  856 µs  (4.0×) | 1052 µs  (3.8×) |
-| 240×136 up:2x,4x,8x,16x         |  810 µs  (2.8×) |  997 µs  (2.5×) | 1011 µs  (3.0×) |
-| 120×68 up:2x,4x,8x,16x,32x      |  816 µs  (2.4×) |  997 µs  (2.1×) | 1038 µs  (2.4×) |
+| 480×270 up:2x                   |   18 µs (15.5×) |   21 µs (14.5×) |   48 µs  (9.8×) |
+| 480×270 up:2x,4x                |   93 µs  (9.8×) |  175 µs  (6.2×) |  226 µs  (7.0×) |
+| 960×540 up:2x                   |   74 µs (13.5×) |  149 µs  (8.0×) |  178 µs  (7.8×) |
+| 960×540 up:2x,3x                |  604 µs  (4.5×) |  682 µs  (4.9×) |  838 µs  (4.7×) |
+| 1920×1080 up:2x                 |  482 µs  (8.4×) |  691 µs  (6.8×) |  671 µs  (8.2×) |
+| 1920×1080 up:1.5x               |  519 µs  (5.3×) |  524 µs  (6.5×) |  706 µs  (5.7×) |
+| 240×136 up:2x,4x,8x,16x         |  706 µs  (3.2×) |  930 µs  (2.7×) |  976 µs  (3.1×) |
+| 120×68 up:2x,4x,8x,16x,32x      |  712 µs  (2.8×) |  931 µs  (2.2×) | 1202 µs  (2.1×) |
 
 **aarch64 / NEON**
 
@@ -136,11 +136,11 @@ Smaller time is better; larger speedup is better.
 | 240×136 up:2x,4x,8x,16x         |  480 µs (10.3×) |  382 µs  (3.7×) | 2053 µs  (4.8×) |
 | 120×68 up:2x,4x,8x,16x,32x      |  480 µs  (9.3×) |  386 µs  (3.2×) | 2063 µs  (4.5×) |
 
-On x86 the 1.5× upscale tail is materially slower per byte than the
-pure 2× steps because the AVX2 implementation is shuffle-port throughput
-limited in its deinterleave → weighted-blend → interleave-store path.
-NEON does not have this bottleneck because the 2→3 bilinear maps cleanly
-onto `vld2q_u8` / `vst3q_u8`. See [docs/API.md](docs/API.md#performance-notes)
+On x86 the 1.5× upscale tail remains slower per byte than the pure 2× steps:
+AVX2 has no 3-way interleaved store, so assembling the 2 to 3 output costs
+shuffle-port work that the 2× kernels avoid entirely.  NEON still has the
+structural advantage because the 2 to 3 bilinear maps cleanly onto
+`vld2q_u8` / `vst3q_u8`.  See [docs/API.md](docs/API.md#performance-notes)
 for a longer discussion.
 
 ### SDR combined downscale + upscale (single pass) v.s. libswscale
@@ -149,9 +149,9 @@ for a longer discussion.
 
 | Workload | Epyc 7302 (Zen 2) | Xeon 6132 (Skylake) | Xeon E5v4 (Broadwell) |
 |---|---|---|---|
-| 1920×1080 down:2x up:2x             |  710 µs (7.0×) |  967 µs (6.1×) |  854 µs (8.1×) |
-| 1920×1080 down:1.5x,3x up:2x        |  933 µs (6.5×) | 1147 µs (6.5×) | 1082 µs (7.7×) |
-| 1280×720 down:2x,4x up:2x,4x        | 2143 µs (3.5×) | 2237 µs (3.7×) | 2330 µs (4.3×) |
+| 1920×1080 down:2x up:2x             |  643 µs (7.7×) |  882 µs (6.7×) |  940 µs (7.4×) |
+| 1920×1080 down:1.5x,3x up:2x        |  889 µs (6.8×) | 1044 µs (7.1×) | 1016 µs (8.2×) |
+| 1280×720 down:2x,4x up:2x,4x        | 2150 µs (3.5×) | 2304 µs (3.6×) | 2191 µs (4.6×) |
 
 **aarch64 / NEON**
 
@@ -172,11 +172,11 @@ aren't representative.
 
 | Workload | Epyc 7302 | Xeon 6132 | Xeon E5v4 |
 |---|---|---|---|
-| 1920×1080 I010 down:1.5x,3x,6x        |  414 µs |  481 µs |  517 µs |
-| 3840×2160 I010 down:1.5x,3x,6x,12x    | 3029 µs | 2958 µs | 3114 µs |
-| 3840×2160 P010 down:1.5x,3x,6x,12x    | 3517 µs | 3870 µs | 5399 µs |
-| 1920×1080 I010 up:2x                  | 1929 µs | 2055 µs | 2402 µs |
-| 1920×1080 I010 down:1.5x,3x up:2x     | 2661 µs | 2755 µs | 2991 µs |
+| 1920×1080 I010 down:1.5x,3x,6x        |  395 µs |  441 µs |  664 µs |
+| 3840×2160 I010 down:1.5x,3x,6x,12x    | 2682 µs | 2875 µs | 3976 µs |
+| 3840×2160 P010 down:1.5x,3x,6x,12x    | 3392 µs | 3830 µs | 5510 µs |
+| 1920×1080 I010 up:2x                  | 1899 µs | 2080 µs | 1917 µs |
+| 1920×1080 I010 down:1.5x,3x up:2x     | 2542 µs | 2792 µs | 3035 µs |
 
 **aarch64 / NEON**
 
@@ -190,14 +190,14 @@ aren't representative.
 
 The P010 row uses the Y + interleaved-UV layout that most HEVC Main10
 encoders emit natively; the P010 vs I010 gap on the matching 4K
-workload (e.g. 3852 vs 3340 µs on Epyc 7302) is the on-the-fly UV
+workload (e.g. 3392 vs 2682 µs on Epyc 7302) is the on-the-fly UV
 deinterleave cost, not a fundamental difference in scaling work.
 
 HDR kernels are roughly 2–4× slower per byte than their SDR
 counterparts because 10-bit samples halve the number of pixels per
-SIMD register and because several per-lane operations (notably 16-bit
-averaging on AVX2) lack a single-instruction form and must be expanded
-to add-and-shift sequences.
+SIMD register and because the weighted blends overflow 16-bit lanes
+at 10-bit precision and must run widened in the 32-bit domain, where
+the rounding steps cost extra add-and-shift work.
 
 ### Graviton 4 is the standout deployment target
 
@@ -206,7 +206,7 @@ libswscale on the same hardware, funnelcake's SDR speedups on Graviton
 cluster around **15–22× on the pow2 workloads** - the 2× upscales,
 downscale ladders from 1080p through 4K, and single-pass combined
 down+up calls. For comparison, the same set of workloads sits around
-6–12× on Apple M3 Ultra, 7–14× on Raspberry Pi 5, and 5–10× on the
+6–12× on Apple M3 Ultra, 7–14× on Raspberry Pi 5, and 5–14× on the
 x86 server CPUs in the tables above. The one exception is the 1.5×
 upscale tail (`up:2x,3x`, `up:1.5x`): that kernel is compute-bound on
 every platform and settles at ~5–6× everywhere, Graviton included.
@@ -446,16 +446,17 @@ output exceeds 16384×16384. For example, a 1920×1080 source with
 (30720×17280) and 32× (61440×34560) are rejected and `FUSED_WARN_BIT_PARTIAL`
 is set in the return code.
 
-**1.5x upscale performance**: the 1.5x tail is materially slower per
-output byte than any of the 2× steps on AVX2 because it uses a weighted
-85/171 bilinear blend whose inner loop is dominated by shuffle-port
-throughput. On Zen 2 / Haswell and later, the 256-bit kernel is roughly
-5-8× slower per byte than a straight 2× step but still substantially
+**1.5x upscale performance**: the 1.5x tail is slower per output byte
+than any of the 2× steps on AVX2 because the 2→3 output pattern has no
+3-way interleaved store and must be assembled with shuffles. The
+weighted 85/171 blends themselves now run on raw byte pairs via
+`vpmaddubsw`, so on Zen 2 / Haswell and later the kernel is roughly 2×
+slower per output byte than a straight 2× step and several times
 faster than libswscale's bilinear upscale. On Zen 1 the gap is wider
-because Zen 1 double-pumps 256-bit AVX2 instructions through its 128-bit
-datapath. NEON does not have this bottleneck - the 2→3 pattern maps
-cleanly onto `vld2q_u8` / `vst3q_u8`. Choose the 1.5x tail with this in
-mind on compute-limited x86 targets.
+because Zen 1 double-pumps 256-bit AVX2 instructions through its
+128-bit datapath. NEON does not have this bottleneck - the 2→3 pattern
+maps cleanly onto `vld2q_u8` / `vst3q_u8`. Choose the 1.5x tail with
+this in mind on compute-limited x86 targets.
 
 ### Thread safety
 Each context is independent and not thread-safe. Use one context per thread.

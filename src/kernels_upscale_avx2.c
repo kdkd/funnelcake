@@ -78,44 +78,69 @@
 static void __attribute__((aligned(64), hot))
 up_h_2x_row_avx2(const uint8_t *src, int src_w, uint8_t *dst)
 {
-    /* 128-bit SSE inner loop.  We intentionally avoid 256-bit ops here
-     * because AVX2 _mm256_unpacklo/hi_epi8 are per-lane, and assembling
-     * linear output would require an extra _mm256_permute2x128_si256
-     * per chunk.  permute2x128 is expensive on Zen 1 (where it runs at
-     * roughly 1/3 throughput) and the savings from going to 256-bit
-     * are wiped out by the permute.  On Zen 2+ and Intel Skylake+,
-     * 128-bit is only slightly slower than a well-tuned 256-bit path
-     * because the workload is memory-bandwidth bound at typical sizes. */
+    /* 256-bit AVX2 inner loop.  A 2x horizontal doubling writes two
+     * output bytes per source byte, so the binding resource is store
+     * throughput: full-width stores halve the store count per output
+     * byte compared with an SSE loop.  The shifted source (src[i+1])
+     * comes from an overlapping unaligned load - effectively free on
+     * cores with fast unaligned loads - instead of register chaining,
+     * which keeps the shuffle budget at four ops per 32 source bytes:
+     * two unpacks plus the two cross-lane permutes that reassemble the
+     * per-lane interleaves into linear byte order. */
     int x = 0;
-    int full_chunks = src_w / 16;
+    int full_chunks = src_w / 32;
 
     if (full_chunks > 0) {
-        __m128i r = _mm_loadu_si128((const __m128i *)src);
-
         for (int c = 0; c + 1 < full_chunks; c++) {
-            __m128i r_next = _mm_loadu_si128((const __m128i *)(src + x + 16));
-            __m128i r_shifted = _mm_alignr_epi8(r_next, r, 1);
-            __m128i r_mid = _mm_avg_epu8(r, r_shifted);
+            __m256i r = _mm256_loadu_si256((const __m256i *)(src + x));
+            /* Bytes x+1 .. x+32; in bounds because another full chunk
+             * follows this one. */
+            __m256i r_shifted =
+                _mm256_loadu_si256((const __m256i *)(src + x + 1));
+            __m256i r_mid = _mm256_avg_epu8(r, r_shifted);
 
-            __m128i out0 = _mm_unpacklo_epi8(r, r_mid);
-            __m128i out1 = _mm_unpackhi_epi8(r, r_mid);
+            __m256i ilo = _mm256_unpacklo_epi8(r, r_mid);
+            __m256i ihi = _mm256_unpackhi_epi8(r, r_mid);
+            __m256i out0 = _mm256_permute2x128_si256(ilo, ihi, 0x20);
+            __m256i out1 = _mm256_permute2x128_si256(ilo, ihi, 0x31);
 
-            _mm_storeu_si128((__m128i *)(dst + 2 * x +  0), out0);
-            _mm_storeu_si128((__m128i *)(dst + 2 * x + 16), out1);
-            x += 16;
-            r = r_next;
+            _mm256_storeu_si256((__m256i *)(dst + 2 * x +  0), out0);
+            _mm256_storeu_si256((__m256i *)(dst + 2 * x + 32), out1);
+            x += 32;
         }
 
-        /* Last full chunk: the shifted-in element may be the scalar tail's
-         * first source byte or the replicated row edge. */
+        /* Last full chunk: no overlapping load past the row end, so the
+         * shifted vector is assembled in-register.  The shifted-in element
+         * may be the scalar tail's first source byte or the replicated row
+         * edge.  permute2x128 forms [r.hi | edge]; alignr then funnels each
+         * lane one byte left, pulling the next lane's (or edge's) first
+         * byte into the top slot. */
+        __m256i r = _mm256_loadu_si256((const __m256i *)(src + x));
+        uint8_t edge = (x + 32 < src_w) ? src[x + 32] : src[src_w - 1];
+        __m256i edge_v = _mm256_set1_epi8((char)edge);
+        __m256i hi_edge = _mm256_permute2x128_si256(r, edge_v, 0x21);
+        __m256i r_shifted = _mm256_alignr_epi8(hi_edge, r, 1);
+        __m256i r_mid = _mm256_avg_epu8(r, r_shifted);
+
+        __m256i ilo = _mm256_unpacklo_epi8(r, r_mid);
+        __m256i ihi = _mm256_unpackhi_epi8(r, r_mid);
+        __m256i out0 = _mm256_permute2x128_si256(ilo, ihi, 0x20);
+        __m256i out1 = _mm256_permute2x128_si256(ilo, ihi, 0x31);
+
+        _mm256_storeu_si256((__m256i *)(dst + 2 * x +  0), out0);
+        _mm256_storeu_si256((__m256i *)(dst + 2 * x + 32), out1);
+        x += 32;
+    }
+
+    /* One 16-byte SSE chunk if at least 16 bytes remain, so narrow planes
+     * (chroma rows of small sources) stay off the scalar tail. */
+    if (x + 16 <= src_w) {
+        __m128i r = _mm_loadu_si128((const __m128i *)(src + x));
         uint8_t edge = (x + 16 < src_w) ? src[x + 16] : src[src_w - 1];
         __m128i edge_v = _mm_set1_epi8((char)edge);
         __m128i r_shifted = _mm_alignr_epi8(edge_v, r, 1);
         __m128i r_mid = _mm_avg_epu8(r, r_shifted);
 
-        /* Interleave src and mid.  unpacklo/hi_epi8 on 128-bit produce
-         * linearly-ordered output (no lane crossing) so no permute is
-         * needed. */
         __m128i out0 = _mm_unpacklo_epi8(r, r_mid);
         __m128i out1 = _mm_unpackhi_epi8(r, r_mid);
 
@@ -138,11 +163,13 @@ up_h_2x_row_avx2(const uint8_t *src, int src_w, uint8_t *dst)
  * Fused vertical 2x average + horizontal doubling for one row.
  *
  * Produces the bilinearly-interpolated ("odd") output row of a 2x upscale.
- * For each 16-byte chunk it computes the vertical average of the two source
+ * For each 32-byte chunk it computes the vertical average of the two source
  * rows ((a + b + 1) >> 1) in registers and feeds it straight into the
  * horizontal doubling, so the averaged row never has to be written to a
  * scratch buffer and read back.  The horizontal doubling matches
- * up_h_2x_row_avx2.
+ * up_h_2x_row_avx2, including the overlapping-load trick: the shifted
+ * stream is the vertical average of the +1-offset loads, which equals
+ * shifting the averaged row because the average is pointwise.
  *
  * aligned(64) mirrors up_h_2x_row_avx2: this 2x path is icache-placement
  * sensitive and the alignment prevents the first iteration's decode from
@@ -153,29 +180,57 @@ up_h_2x_vblend_row_avx2(const uint8_t *a_row, const uint8_t *b_row,
                                     int src_w, uint8_t *dst)
 {
     int x = 0;
-    int full_chunks = src_w / 16;
+    int full_chunks = src_w / 32;
 
     if (full_chunks > 0) {
+        for (int c = 0; c + 1 < full_chunks; c++) {
+            __m256i r = _mm256_avg_epu8(
+                _mm256_loadu_si256((const __m256i *)(a_row + x)),
+                _mm256_loadu_si256((const __m256i *)(b_row + x)));
+            __m256i r_shifted = _mm256_avg_epu8(
+                _mm256_loadu_si256((const __m256i *)(a_row + x + 1)),
+                _mm256_loadu_si256((const __m256i *)(b_row + x + 1)));
+            __m256i r_mid = _mm256_avg_epu8(r, r_shifted);
+
+            __m256i ilo = _mm256_unpacklo_epi8(r, r_mid);
+            __m256i ihi = _mm256_unpackhi_epi8(r, r_mid);
+            __m256i out0 = _mm256_permute2x128_si256(ilo, ihi, 0x20);
+            __m256i out1 = _mm256_permute2x128_si256(ilo, ihi, 0x31);
+
+            _mm256_storeu_si256((__m256i *)(dst + 2 * x +  0), out0);
+            _mm256_storeu_si256((__m256i *)(dst + 2 * x + 32), out1);
+            x += 32;
+        }
+
+        /* Last full chunk: shifted vector assembled in-register, exactly
+         * as in up_h_2x_row_avx2. */
+        __m256i r = _mm256_avg_epu8(
+            _mm256_loadu_si256((const __m256i *)(a_row + x)),
+            _mm256_loadu_si256((const __m256i *)(b_row + x)));
+        uint8_t edge = (x + 32 < src_w)
+                          ? up_avg_u8(a_row[x + 32], b_row[x + 32])
+                          : up_avg_u8(a_row[src_w - 1], b_row[src_w - 1]);
+        __m256i edge_v = _mm256_set1_epi8((char)edge);
+        __m256i hi_edge = _mm256_permute2x128_si256(r, edge_v, 0x21);
+        __m256i r_shifted = _mm256_alignr_epi8(hi_edge, r, 1);
+        __m256i r_mid = _mm256_avg_epu8(r, r_shifted);
+
+        __m256i ilo = _mm256_unpacklo_epi8(r, r_mid);
+        __m256i ihi = _mm256_unpackhi_epi8(r, r_mid);
+        __m256i out0 = _mm256_permute2x128_si256(ilo, ihi, 0x20);
+        __m256i out1 = _mm256_permute2x128_si256(ilo, ihi, 0x31);
+
+        _mm256_storeu_si256((__m256i *)(dst + 2 * x +  0), out0);
+        _mm256_storeu_si256((__m256i *)(dst + 2 * x + 32), out1);
+        x += 32;
+    }
+
+    /* One 16-byte SSE chunk if at least 16 bytes remain, so narrow planes
+     * (chroma rows of small sources) stay off the scalar tail. */
+    if (x + 16 <= src_w) {
         __m128i r = _mm_avg_epu8(
             _mm_loadu_si128((const __m128i *)(a_row + x)),
             _mm_loadu_si128((const __m128i *)(b_row + x)));
-
-        for (int c = 0; c + 1 < full_chunks; c++) {
-            __m128i r_next = _mm_avg_epu8(
-                _mm_loadu_si128((const __m128i *)(a_row + x + 16)),
-                _mm_loadu_si128((const __m128i *)(b_row + x + 16)));
-            __m128i r_shifted = _mm_alignr_epi8(r_next, r, 1);
-            __m128i r_mid = _mm_avg_epu8(r, r_shifted);
-
-            __m128i out0 = _mm_unpacklo_epi8(r, r_mid);
-            __m128i out1 = _mm_unpackhi_epi8(r, r_mid);
-
-            _mm_storeu_si128((__m128i *)(dst + 2 * x +  0), out0);
-            _mm_storeu_si128((__m128i *)(dst + 2 * x + 16), out1);
-            x += 16;
-            r = r_next;
-        }
-
         uint8_t edge = (x + 16 < src_w)
                           ? up_avg_u8(a_row[x + 16], b_row[x + 16])
                           : up_avg_u8(a_row[src_w - 1], b_row[src_w - 1]);
@@ -286,32 +341,41 @@ up_vblend_21_row_avx2(const uint8_t *a_row,
 
 
 /* -----------------------------------------------------------------------
- * Vectorized horizontal 1.5x (2->3) upscale (AVX2 via 128-bit shuffles)
+ * Vectorized horizontal 1.5x (2->3) upscale (AVX2)
  * -----------------------------------------------------------------------
  *
- * Processes 8 source pairs (16 source bytes) -> 24 destination bytes per
- * iteration using SSE/AVX2 128-bit operations.  SSE has no direct 3-way
- * interleave store, so the output is assembled via pshufb + OR with
- * precomputed masks.  128-bit is used because AVX2 256-bit shuffles are
- * per-lane and the 3-way interleave crosses lane boundaries.
+ * For each source pair (a, b) with following sample c = src[2i+2], the
+ * output triplet is:
+ *   dst[3i+0] = a
+ *   dst[3i+1] = m1 = (85*a + 171*b + 128) >> 8
+ *   dst[3i+2] = m2 = (85*c + 171*b + 128) >> 8
  *
- * aligned(64) keeps this shuffle-port-heavy function off icache-line
- * boundaries — the 256-bit fast path issues ~13 shuffle-port uops per
- * chunk and its decode alignment can dominate the per-byte cost.
+ * The blends are computed directly on the raw interleaved row - no
+ * even/odd deinterleave and no u16 widening:
+ *   1. maddubs(r, {85,-85}) pair-sums each (a,b) byte pair into
+ *      85*a - 85*b, and adding (r & 0xFF00) | 0x80 (which is exactly
+ *      256*b + 128, since b is the high byte of each pair) yields
+ *      85*a + 171*b + 128 - the same decomposition the vertical blend
+ *      up_vblend_21_row_avx2 uses, bit-identical to the scalar blend.
+ *   2. the (b,c) pairs for m2 are the same row loaded one byte later
+ *      (r_n1 = src + 2p + 1), so maddubs(r_n1, {-85,85}) plus the
+ *      shared 256*b + 128 term yields m2.  An overlapping load is
+ *      cheaper than building the shifted pairs in-register; only the
+ *      bounds-safe slow path for the final chunk shifts in-register.
  *
- * Optimizations over a naive version:
- *   1. c_bytes (= src[2i+2]) is computed by loading src + 2*p + 2 and
- *      applying the same even-byte deinterleave mask.  This saves the
- *      srli_si128 + insert_epi8 dependency chain on the hot path.  The
- *      last chunk uses the slower srli+insert path because src+2 would
- *      walk past the end of the row.
- *   2. 171 * b is computed once and shared between m1 and m2 - saves a
- *      mullo_epi16 per chunk.
- *   3. m1 and m2 are pre-interleaved via unpacklo_epi8 into a single
- *      `mm` vector ({m1[0], m2[0], m1[1], m2[1], ...}) so the 3-way
- *      output assembly uses 4 pshufb (not 6) - saves 2 shuffle-port
- *      ops per chunk, which is significant on Zen 1 where pshufb is
- *      1/cycle throughput.
+ * The a bytes pass straight through from the raw load to the output
+ * assembly.  SSE has no 3-way interleave store, so the output is
+ * assembled via pshufb + OR with precomputed masks; m1 and m2 are
+ * packed side by side (packus(m1, m2), m1[i] at byte i and m2[i] at
+ * byte 8+i of each lane) and the masks index the halves directly.
+ * Per 32 source bytes the whole kernel needs just 7 shuffle-port ops
+ * (1 pack, 4 output pshufb, 2 lane extracts) - everything else rides
+ * the load, ALU, and store ports.  It is a quiet joy that the 3-way
+ * interleave, the expensive part of any 1.5x scaler, shares its
+ * pshufb budget with nothing.
+ *
+ * aligned(64) keeps this hot function off icache-line boundaries —
+ * decode alignment of the inner loop can dominate the per-byte cost.
  */
 static void __attribute__((aligned(64), hot))
 up_h_1_5x_row_avx2(const uint8_t *src, int w, uint8_t *dst)
@@ -320,97 +384,75 @@ up_h_1_5x_row_avx2(const uint8_t *src, int w, uint8_t *dst)
     int full_chunks = pairs / 8;   /* 8 pairs = 16 src bytes = 24 dst bytes */
     int p = 0;
 
-    /* 128-bit fast path reads src[2p .. 2p+17] (17 bytes starting from 2p).
-     * We need 2p + 17 < w, i.e. p * 16 < w - 17, so the max safe number
-     * of chunks is (w - 2) / 16 (clamped to full_chunks).  The last
-     * remaining chunk (if any) falls through to the slow path. */
+    /* 128-bit fast path reads src[2p .. 2p+16] (r from 2p, r_n1 from
+     * 2p+1, both 16 bytes).  We need 2p + 16 < w; the (w - 2) / 16
+     * bound (clamped to full_chunks) keeps one byte of margin beyond
+     * that.  The last remaining chunk (if any) falls through to the
+     * slow path. */
     int safe_chunks = (w > 1) ? (w - 2) / 16 : 0;
     if (safe_chunks > full_chunks) safe_chunks = full_chunks;
     if (safe_chunks < 0)           safe_chunks = 0;
 
     /* 256-bit fast path processes 16 pairs -> 48 dst bytes per chunk.
-     * Reads src[2p .. 2p+33] (r from 2p, r_n2 from 2p+2, both 32 bytes).
-     * Need 2p + 33 < w, so ci_256 <= (w - 34)/32.  Number of 256-bit
-     * safe chunks = (w - 34)/32 + 1 when w >= 34, else 0.  Capped at
-     * half of safe_chunks (128-bit) so the 128-bit fast-path residual
-     * stays <= 1 chunk. */
+     * Reads src[2p .. 2p+32] (r from 2p, r_n1 from 2p+1, both 32
+     * bytes).  Need 2p + 32 < w; the (w - 34)/32 bound keeps one byte
+     * of margin.  Capped at half of safe_chunks (128-bit) so the
+     * 128-bit fast-path residual stays <= 1 chunk. */
     int safe_chunks_256 = (w >= 34) ? ((w - 34) / 32 + 1) : 0;
     if (safe_chunks_256 * 2 > safe_chunks)
         safe_chunks_256 = safe_chunks / 2;
 
-    /* Deinterleave masks: even bytes -> low 8 bytes, odd bytes -> low 8 bytes. */
-    static const int8_t even_mask_bytes[16] = {
-        0, 2, 4, 6, 8, 10, 12, 14, -1, -1, -1, -1, -1, -1, -1, -1
-    };
-    static const int8_t odd_mask_bytes[16] = {
-        1, 3, 5, 7, 9, 11, 13, 15, -1, -1, -1, -1, -1, -1, -1, -1
-    };
-
-    /* Interleave masks for the first 16 output bytes.
+    /* Output interleave masks for the first 16 output bytes.
      *
      * Output position layout for 8 pairs (bytes 0..15 of the stream):
      *   0=a[0], 1=m1[0], 2=m2[0], 3=a[1], 4=m1[1], 5=m2[1],
      *   6=a[2], 7=m1[2], 8=m2[2], 9=a[3], 10=m1[3], 11=m2[3],
      *   12=a[4], 13=m1[4], 14=m2[4], 15=a[5]
      *
-     * Source a vector: a[0..7] in low 8 bytes.
-     * Source "mm" vector: unpacklo(m1, m2) = {m1[0], m2[0], m1[1], m2[1],
-     *   m1[2], m2[2], m1[3], m2[3], m1[4], m2[4], m1[5], m2[5], ...}
-     * Indices into mm: m1[i] at mm[2i], m2[i] at mm[2i+1].
-     *
-     * So:
-     *   a_lo mask selects a_bytes for positions {0, 3, 6, 9, 12, 15}:
-     *     indices 0, 1, 2, 3, 4, 5
-     *   mm_lo mask selects mm for positions {1, 2, 4, 5, 7, 8, 10, 11, 13, 14}:
-     *     mm indices 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 (= m1[0], m2[0], m1[1],
-     *     m2[1], m1[2], m2[2], m1[3], m2[3], m1[4], m2[4]) */
+     * a[i] sits at byte 2i of the raw load r, so the a masks index r
+     * directly.  mm = packus(m1_u16, m2_u16) holds m1[i] at byte i and
+     * m2[i] at byte 8+i (of each 128-bit lane). */
     static const int8_t a_lo_bytes[16] = {
-        0, -1, -1, 1, -1, -1, 2, -1, -1, 3, -1, -1, 4, -1, -1, 5
+        0, -1, -1, 2, -1, -1, 4, -1, -1, 6, -1, -1, 8, -1, -1, 10
     };
     static const int8_t mm_lo_bytes[16] = {
-        -1, 0, 1, -1, 2, 3, -1, 4, 5, -1, 6, 7, -1, 8, 9, -1
+        -1, 0, 8, -1, 1, 9, -1, 2, 10, -1, 3, 11, -1, 4, 12, -1
     };
 
     /* Interleave masks for the next 8 output bytes (positions 16..23):
      *   16=m1[5], 17=m2[5], 18=a[6], 19=m1[6], 20=m2[6], 21=a[7],
-     *   22=m1[7], 23=m2[7]
-     *
-     *   a_hi mask: positions 2 and 5 from a_bytes indices 6 and 7
-     *   mm_hi mask: positions 0, 1, 3, 4, 6, 7 from mm indices 10..15
-     *     (mm[10]=m1[5], mm[11]=m2[5], mm[12]=m1[6], mm[13]=m2[6],
-     *      mm[14]=m1[7], mm[15]=m2[7]) */
+     *   22=m1[7], 23=m2[7] */
     static const int8_t a_hi_bytes[16] = {
-        -1, -1, 6, -1, -1, 7, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1
+        -1, -1, 12, -1, -1, 14, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1
     };
     static const int8_t mm_hi_bytes[16] = {
-        10, 11, -1, 12, 13, -1, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1
+        5, 13, -1, 6, 14, -1, 7, 15, -1, -1, -1, -1, -1, -1, -1, -1
     };
 
-    const __m128i em     = _mm_loadu_si128((const __m128i *)even_mask_bytes);
-    const __m128i om     = _mm_loadu_si128((const __m128i *)odd_mask_bytes);
     const __m128i ma_lo  = _mm_loadu_si128((const __m128i *)a_lo_bytes);
     const __m128i mmm_lo = _mm_loadu_si128((const __m128i *)mm_lo_bytes);
     const __m128i ma_hi  = _mm_loadu_si128((const __m128i *)a_hi_bytes);
     const __m128i mmm_hi = _mm_loadu_si128((const __m128i *)mm_hi_bytes);
 
-    const __m128i w85_16  = _mm_set1_epi16(85);
-    const __m128i w171_16 = _mm_set1_epi16(171);
-    const __m128i r128_16 = _mm_set1_epi16(128);
-    const __m128i zero    = _mm_setzero_si128();
+    /* maddubs weight pairs: {85,-85} matches the (a,b) layout of r,
+     * {-85,85} matches the (b,c) layout of the +1-offset load.  bmask
+     * and half build the shared 256*b + 128 term from r. */
+    const __m128i w_ab  = _mm_set1_epi16((short)(((-85 & 0xFF) << 8) | 85));
+    const __m128i w_bc  = _mm_set1_epi16((short)((85 << 8) | (-85 & 0xFF)));
+    const __m128i bmask = _mm_set1_epi16((short)0xFF00);
+    const __m128i half  = _mm_set1_epi16(0x0080);
 
-    /* 256-bit mask/constant broadcasts.  vpshufb and the unpack/pack/add/
-     * mul ops we use are all lane-independent, so the same per-lane mask
-     * is broadcast to both 128-bit lanes of the __m256i. */
-    const __m256i em_256     = _mm256_broadcastsi128_si256(em);
-    const __m256i om_256     = _mm256_broadcastsi128_si256(om);
+    /* 256-bit mask/constant broadcasts.  vpshufb, vpmaddubsw, vpackuswb
+     * and the and/or/add/shift ops are all lane-independent, so the same
+     * per-lane mask is broadcast to both 128-bit lanes of the __m256i. */
     const __m256i ma_lo_256  = _mm256_broadcastsi128_si256(ma_lo);
     const __m256i mmm_lo_256 = _mm256_broadcastsi128_si256(mmm_lo);
     const __m256i ma_hi_256  = _mm256_broadcastsi128_si256(ma_hi);
     const __m256i mmm_hi_256 = _mm256_broadcastsi128_si256(mmm_hi);
-    const __m256i w85_256    = _mm256_set1_epi16(85);
-    const __m256i w171_256   = _mm256_set1_epi16(171);
-    const __m256i r128_256   = _mm256_set1_epi16(128);
-    const __m256i zero_256   = _mm256_setzero_si256();
+    const __m256i w_ab_256   = _mm256_broadcastsi128_si256(w_ab);
+    const __m256i w_bc_256   = _mm256_broadcastsi128_si256(w_bc);
+    const __m256i bmask_256  = _mm256_broadcastsi128_si256(bmask);
+    const __m256i half_256   = _mm256_broadcastsi128_si256(half);
 
     /* --------------------------------------------------------------
      * 256-bit fast path: 16 pairs -> 48 dst bytes per chunk.
@@ -432,36 +474,28 @@ up_h_1_5x_row_avx2(const uint8_t *src, int w, uint8_t *dst)
      * -------------------------------------------------------------- */
     for (int ci = 0; ci < safe_chunks_256; ci++) {
         __m256i r    = _mm256_loadu_si256((const __m256i *)(src + 2 * p));
-        __m256i r_n2 = _mm256_loadu_si256((const __m256i *)(src + 2 * p + 2));
+        __m256i r_n1 = _mm256_loadu_si256((const __m256i *)(src + 2 * p + 1));
 
-        __m256i a_bytes = _mm256_shuffle_epi8(r,    em_256);
-        __m256i b_bytes = _mm256_shuffle_epi8(r,    om_256);
-        __m256i c_bytes = _mm256_shuffle_epi8(r_n2, em_256);
-
-        __m256i a_u16 = _mm256_unpacklo_epi8(a_bytes, zero_256);
-        __m256i b_u16 = _mm256_unpacklo_epi8(b_bytes, zero_256);
-        __m256i c_u16 = _mm256_unpacklo_epi8(c_bytes, zero_256);
-
-        __m256i b171 = _mm256_mullo_epi16(b_u16, w171_256);
-        __m256i a85  = _mm256_mullo_epi16(a_u16, w85_256);
-        __m256i c85  = _mm256_mullo_epi16(c_u16, w85_256);
+        /* 256*b + 128, shared by both blends (b is the high byte of
+         * each (a,b) pair in r). */
+        __m256i t = _mm256_or_si256(_mm256_and_si256(r, bmask_256),
+                                    half_256);
 
         __m256i m1_u16 = _mm256_srli_epi16(
-            _mm256_add_epi16(_mm256_add_epi16(a85, b171), r128_256), 8);
+            _mm256_add_epi16(_mm256_maddubs_epi16(r, w_ab_256), t), 8);
         __m256i m2_u16 = _mm256_srli_epi16(
-            _mm256_add_epi16(_mm256_add_epi16(c85, b171), r128_256), 8);
+            _mm256_add_epi16(_mm256_maddubs_epi16(r_n1, w_bc_256), t), 8);
 
-        __m256i m1 = _mm256_packus_epi16(m1_u16, zero_256);
-        __m256i m2 = _mm256_packus_epi16(m2_u16, zero_256);
-
-        __m256i mm = _mm256_unpacklo_epi8(m1, m2);
+        /* Pack the two blend streams side by side: per lane, m1[0..7]
+         * in the low 8 bytes, m2[0..7] in the high 8. */
+        __m256i mm = _mm256_packus_epi16(m1_u16, m2_u16);
 
         __m256i out_lo = _mm256_or_si256(
-            _mm256_shuffle_epi8(a_bytes, ma_lo_256),
-            _mm256_shuffle_epi8(mm,      mmm_lo_256));
+            _mm256_shuffle_epi8(r,  ma_lo_256),
+            _mm256_shuffle_epi8(mm, mmm_lo_256));
         __m256i out_hi = _mm256_or_si256(
-            _mm256_shuffle_epi8(a_bytes, ma_hi_256),
-            _mm256_shuffle_epi8(mm,      mmm_hi_256));
+            _mm256_shuffle_epi8(r,  ma_hi_256),
+            _mm256_shuffle_epi8(mm, mmm_hi_256));
 
         /* Extract each 128-bit lane and store 24 bytes (16 + 8). */
         __m128i ol_lane0 = _mm256_castsi256_si128(out_lo);
@@ -482,39 +516,23 @@ up_h_1_5x_row_avx2(const uint8_t *src, int w, uint8_t *dst)
      * on CPUs / workloads where the 256-bit loop can't run (w < 34). */
     for (int ci = 2 * safe_chunks_256; ci < safe_chunks; ci++) {
         __m128i r    = _mm_loadu_si128((const __m128i *)(src + 2 * p));
-        __m128i r_n2 = _mm_loadu_si128((const __m128i *)(src + 2 * p + 2));
+        __m128i r_n1 = _mm_loadu_si128((const __m128i *)(src + 2 * p + 1));
 
-        __m128i a_bytes = _mm_shuffle_epi8(r,    em);
-        __m128i b_bytes = _mm_shuffle_epi8(r,    om);
-        __m128i c_bytes = _mm_shuffle_epi8(r_n2, em);
-
-        __m128i a_u16 = _mm_unpacklo_epi8(a_bytes, zero);
-        __m128i b_u16 = _mm_unpacklo_epi8(b_bytes, zero);
-        __m128i c_u16 = _mm_unpacklo_epi8(c_bytes, zero);
-
-        /* Share 171*b between m1 and m2. */
-        __m128i b171 = _mm_mullo_epi16(b_u16, w171_16);
-        __m128i a85  = _mm_mullo_epi16(a_u16, w85_16);
-        __m128i c85  = _mm_mullo_epi16(c_u16, w85_16);
+        __m128i t = _mm_or_si128(_mm_and_si128(r, bmask), half);
 
         __m128i m1_u16 = _mm_srli_epi16(
-            _mm_add_epi16(_mm_add_epi16(a85, b171), r128_16), 8);
+            _mm_add_epi16(_mm_maddubs_epi16(r, w_ab), t), 8);
         __m128i m2_u16 = _mm_srli_epi16(
-            _mm_add_epi16(_mm_add_epi16(c85, b171), r128_16), 8);
+            _mm_add_epi16(_mm_maddubs_epi16(r_n1, w_bc), t), 8);
 
-        __m128i m1 = _mm_packus_epi16(m1_u16, zero);
-        __m128i m2 = _mm_packus_epi16(m2_u16, zero);
-
-        /* Pre-interleave m1 and m2 so the output assembly needs only
-         * 4 shuffles (2 for lo, 2 for hi) instead of 6. */
-        __m128i mm = _mm_unpacklo_epi8(m1, m2);  /* {m1[0], m2[0], m1[1], m2[1], ...} */
+        __m128i mm = _mm_packus_epi16(m1_u16, m2_u16);
 
         __m128i out_lo = _mm_or_si128(
-            _mm_shuffle_epi8(a_bytes, ma_lo),
-            _mm_shuffle_epi8(mm,      mmm_lo));
+            _mm_shuffle_epi8(r,  ma_lo),
+            _mm_shuffle_epi8(mm, mmm_lo));
         __m128i out_hi = _mm_or_si128(
-            _mm_shuffle_epi8(a_bytes, ma_hi),
-            _mm_shuffle_epi8(mm,      mmm_hi));
+            _mm_shuffle_epi8(r,  ma_hi),
+            _mm_shuffle_epi8(mm, mmm_hi));
 
         _mm_storeu_si128((__m128i *)(dst + 3 * p), out_lo);
         _mm_storel_epi64((__m128i *)(dst + 3 * p + 16), out_hi);
@@ -522,43 +540,31 @@ up_h_1_5x_row_avx2(const uint8_t *src, int w, uint8_t *dst)
         p += 8;
     }
 
-    /* Slow path for the last (unsafe) chunk(s) - uses srli+insert for
-     * the c vector so we don't walk past the end of the row. */
+    /* Slow path for the last (unsafe) chunk(s) - builds the (b,c) pairs
+     * in-register (shift one byte, insert the next source byte or the
+     * replicated edge at the top) so we never load past the row end. */
     for (int ci = safe_chunks; ci < full_chunks; ci++) {
         __m128i r = _mm_loadu_si128((const __m128i *)(src + 2 * p));
 
-        __m128i a_bytes = _mm_shuffle_epi8(r, em);
-        __m128i b_bytes = _mm_shuffle_epi8(r, om);
-
         int next_idx = 2 * (p + 8);
         uint8_t next_a = (next_idx < w) ? src[next_idx] : src[w - 1];
-        __m128i c_raw  = _mm_srli_si128(a_bytes, 1);
-        __m128i c_bytes = _mm_insert_epi8(c_raw, next_a, 7);
+        __m128i r_n1 = _mm_insert_epi8(_mm_srli_si128(r, 1), next_a, 15);
 
-        __m128i a_u16 = _mm_unpacklo_epi8(a_bytes, zero);
-        __m128i b_u16 = _mm_unpacklo_epi8(b_bytes, zero);
-        __m128i c_u16 = _mm_unpacklo_epi8(c_bytes, zero);
-
-        __m128i b171 = _mm_mullo_epi16(b_u16, w171_16);
-        __m128i a85  = _mm_mullo_epi16(a_u16, w85_16);
-        __m128i c85  = _mm_mullo_epi16(c_u16, w85_16);
+        __m128i t = _mm_or_si128(_mm_and_si128(r, bmask), half);
 
         __m128i m1_u16 = _mm_srli_epi16(
-            _mm_add_epi16(_mm_add_epi16(a85, b171), r128_16), 8);
+            _mm_add_epi16(_mm_maddubs_epi16(r, w_ab), t), 8);
         __m128i m2_u16 = _mm_srli_epi16(
-            _mm_add_epi16(_mm_add_epi16(c85, b171), r128_16), 8);
+            _mm_add_epi16(_mm_maddubs_epi16(r_n1, w_bc), t), 8);
 
-        __m128i m1 = _mm_packus_epi16(m1_u16, zero);
-        __m128i m2 = _mm_packus_epi16(m2_u16, zero);
-
-        __m128i mm = _mm_unpacklo_epi8(m1, m2);
+        __m128i mm = _mm_packus_epi16(m1_u16, m2_u16);
 
         __m128i out_lo = _mm_or_si128(
-            _mm_shuffle_epi8(a_bytes, ma_lo),
-            _mm_shuffle_epi8(mm,      mmm_lo));
+            _mm_shuffle_epi8(r,  ma_lo),
+            _mm_shuffle_epi8(mm, mmm_lo));
         __m128i out_hi = _mm_or_si128(
-            _mm_shuffle_epi8(a_bytes, ma_hi),
-            _mm_shuffle_epi8(mm,      mmm_hi));
+            _mm_shuffle_epi8(r,  ma_hi),
+            _mm_shuffle_epi8(mm, mmm_hi));
 
         _mm_storeu_si128((__m128i *)(dst + 3 * p), out_lo);
         _mm_storel_epi64((__m128i *)(dst + 3 * p + 16), out_hi);
@@ -773,7 +779,13 @@ static inline uint16_t up_blend_21_u16_scalar(uint16_t a, uint16_t b)
     return (uint16_t)(((uint32_t)a * 85 + (uint32_t)b * 171 + 128) >> 8);
 }
 
-/* ---- Horizontal 2x upscale of one HDR row (128-bit SSE) ----
+/* ---- Horizontal 2x upscale of one HDR row (256-bit AVX2) ----
+ *
+ * Same structure as the SDR up_h_2x_row_avx2: full-width stores halve the
+ * store count per output sample (the binding resource for a doubling
+ * kernel), the shifted source comes from an overlapping unaligned load,
+ * and two cross-lane permutes reassemble the per-lane u16 interleaves
+ * into linear order.
  *
  * Explicit 64-byte alignment keeps the hot loop entry out of the tail end
  * of a 64-byte icache line.  We observed this path being very sensitive to
@@ -784,31 +796,60 @@ static void __attribute__((aligned(64), hot))
 up_h_2x_row_avx2_u16(const uint16_t *src, int src_w, uint16_t *dst)
 {
     int x = 0;
-    int full_chunks = src_w / 8;
+    int full_chunks = src_w / 16;
 
     if (full_chunks > 0) {
-        __m128i r = _mm_loadu_si128((const __m128i *)src);
-
         for (int c = 0; c + 1 < full_chunks; c++) {
-            __m128i r_next = _mm_loadu_si128((const __m128i *)(src + x + 8));
-            __m128i r_shifted = _mm_alignr_epi8(r_next, r, 2);
-            __m128i r_mid = _mm_avg_epu16(r, r_shifted);
-            __m128i out0 = _mm_unpacklo_epi16(r, r_mid);
-            __m128i out1 = _mm_unpackhi_epi16(r, r_mid);
-            _mm_storeu_si128((__m128i *)(dst + 2 * x + 0), out0);
-            _mm_storeu_si128((__m128i *)(dst + 2 * x + 8), out1);
-            x += 8;
-            r = r_next;
+            __m256i r = _mm256_loadu_si256((const __m256i *)(src + x));
+            /* Samples x+1 .. x+16; in bounds because another full chunk
+             * follows this one. */
+            __m256i r_shifted =
+                _mm256_loadu_si256((const __m256i *)(src + x + 1));
+            __m256i r_mid = _mm256_avg_epu16(r, r_shifted);
+
+            __m256i ilo = _mm256_unpacklo_epi16(r, r_mid);
+            __m256i ihi = _mm256_unpackhi_epi16(r, r_mid);
+            __m256i out0 = _mm256_permute2x128_si256(ilo, ihi, 0x20);
+            __m256i out1 = _mm256_permute2x128_si256(ilo, ihi, 0x31);
+
+            _mm256_storeu_si256((__m256i *)(dst + 2 * x +  0), out0);
+            _mm256_storeu_si256((__m256i *)(dst + 2 * x + 16), out1);
+            x += 16;
         }
 
-        /* Last full chunk: the shifted-in element may be the scalar tail's
-         * first source sample or the replicated row edge. */
+        /* Last full chunk: no overlapping load past the row end; the
+         * shifted vector is assembled in-register.  The shifted-in element
+         * may be the scalar tail's first source sample or the replicated
+         * row edge. */
+        __m256i r = _mm256_loadu_si256((const __m256i *)(src + x));
+        uint16_t edge = (x + 16 < src_w) ? src[x + 16] : src[src_w - 1];
+        __m256i edge_v = _mm256_set1_epi16((short)edge);
+        __m256i hi_edge = _mm256_permute2x128_si256(r, edge_v, 0x21);
+        __m256i r_shifted = _mm256_alignr_epi8(hi_edge, r, 2);
+        __m256i r_mid = _mm256_avg_epu16(r, r_shifted);
+
+        __m256i ilo = _mm256_unpacklo_epi16(r, r_mid);
+        __m256i ihi = _mm256_unpackhi_epi16(r, r_mid);
+        __m256i out0 = _mm256_permute2x128_si256(ilo, ihi, 0x20);
+        __m256i out1 = _mm256_permute2x128_si256(ilo, ihi, 0x31);
+
+        _mm256_storeu_si256((__m256i *)(dst + 2 * x +  0), out0);
+        _mm256_storeu_si256((__m256i *)(dst + 2 * x + 16), out1);
+        x += 16;
+    }
+
+    /* One 8-sample SSE chunk if at least 8 samples remain, so narrow
+     * planes (chroma rows of small sources) stay off the scalar tail. */
+    if (x + 8 <= src_w) {
+        __m128i r = _mm_loadu_si128((const __m128i *)(src + x));
         uint16_t edge = (x + 8 < src_w) ? src[x + 8] : src[src_w - 1];
         __m128i edge_v = _mm_set1_epi16((short)edge);
         __m128i r_shifted = _mm_alignr_epi8(edge_v, r, 2);
         __m128i r_mid = _mm_avg_epu16(r, r_shifted);
+
         __m128i out0 = _mm_unpacklo_epi16(r, r_mid);
         __m128i out1 = _mm_unpackhi_epi16(r, r_mid);
+
         _mm_storeu_si128((__m128i *)(dst + 2 * x + 0), out0);
         _mm_storeu_si128((__m128i *)(dst + 2 * x + 8), out1);
         x += 8;
@@ -827,42 +868,72 @@ up_h_2x_row_avx2_u16(const uint16_t *src, int src_w, uint16_t *dst)
  * Fused vertical 2x average + horizontal doubling for one HDR row.
  *
  * Produces the bilinearly-interpolated ("odd") output row of a 2x HDR
- * upscale.  For each 8-element chunk it computes the vertical average of
+ * upscale.  For each 16-element chunk it computes the vertical average of
  * the two source rows ((a + b + 1) >> 1) in registers and feeds it straight
  * into the horizontal doubling, so the averaged row never has to be written
- * to a scratch buffer and read back.  The horizontal doubling is byte-for-byte
- * identical to up_h_2x_row_avx2_u16 (same alignr/avg/unpack on the same
- * per-column averages).  aligned(64) mirrors up_h_2x_row_avx2_u16: this HDR
- * 2x path is icache-placement sensitive.
+ * to a scratch buffer and read back.  The horizontal doubling matches
+ * up_h_2x_row_avx2_u16, including the overlapping-load trick: the shifted
+ * stream is the vertical average of the +1-offset loads, which equals
+ * shifting the averaged row because the average is pointwise.  aligned(64)
+ * mirrors up_h_2x_row_avx2_u16: this HDR 2x path is icache-placement
+ * sensitive.
  * ----------------------------------------------------------------------- */
 static void __attribute__((aligned(64), hot))
 up_h_2x_vblend_row_avx2_u16(const uint16_t *a_row, const uint16_t *b_row,
                             int src_w, uint16_t *dst)
 {
     int x = 0;
-    int full_chunks = src_w / 8;
+    int full_chunks = src_w / 16;
 
     if (full_chunks > 0) {
+        for (int c = 0; c + 1 < full_chunks; c++) {
+            __m256i r = _mm256_avg_epu16(
+                _mm256_loadu_si256((const __m256i *)(a_row + x)),
+                _mm256_loadu_si256((const __m256i *)(b_row + x)));
+            __m256i r_shifted = _mm256_avg_epu16(
+                _mm256_loadu_si256((const __m256i *)(a_row + x + 1)),
+                _mm256_loadu_si256((const __m256i *)(b_row + x + 1)));
+            __m256i r_mid = _mm256_avg_epu16(r, r_shifted);
+
+            __m256i ilo = _mm256_unpacklo_epi16(r, r_mid);
+            __m256i ihi = _mm256_unpackhi_epi16(r, r_mid);
+            __m256i out0 = _mm256_permute2x128_si256(ilo, ihi, 0x20);
+            __m256i out1 = _mm256_permute2x128_si256(ilo, ihi, 0x31);
+
+            _mm256_storeu_si256((__m256i *)(dst + 2 * x +  0), out0);
+            _mm256_storeu_si256((__m256i *)(dst + 2 * x + 16), out1);
+            x += 16;
+        }
+
+        /* Last full chunk: shifted vector assembled in-register, exactly
+         * as in up_h_2x_row_avx2_u16. */
+        __m256i r = _mm256_avg_epu16(
+            _mm256_loadu_si256((const __m256i *)(a_row + x)),
+            _mm256_loadu_si256((const __m256i *)(b_row + x)));
+        uint16_t edge = (x + 16 < src_w)
+                          ? up_avg_u16_scalar(a_row[x + 16], b_row[x + 16])
+                          : up_avg_u16_scalar(a_row[src_w - 1], b_row[src_w - 1]);
+        __m256i edge_v = _mm256_set1_epi16((short)edge);
+        __m256i hi_edge = _mm256_permute2x128_si256(r, edge_v, 0x21);
+        __m256i r_shifted = _mm256_alignr_epi8(hi_edge, r, 2);
+        __m256i r_mid = _mm256_avg_epu16(r, r_shifted);
+
+        __m256i ilo = _mm256_unpacklo_epi16(r, r_mid);
+        __m256i ihi = _mm256_unpackhi_epi16(r, r_mid);
+        __m256i out0 = _mm256_permute2x128_si256(ilo, ihi, 0x20);
+        __m256i out1 = _mm256_permute2x128_si256(ilo, ihi, 0x31);
+
+        _mm256_storeu_si256((__m256i *)(dst + 2 * x +  0), out0);
+        _mm256_storeu_si256((__m256i *)(dst + 2 * x + 16), out1);
+        x += 16;
+    }
+
+    /* One 8-sample SSE chunk if at least 8 samples remain, so narrow
+     * planes (chroma rows of small sources) stay off the scalar tail. */
+    if (x + 8 <= src_w) {
         __m128i r = _mm_avg_epu16(
             _mm_loadu_si128((const __m128i *)(a_row + x)),
             _mm_loadu_si128((const __m128i *)(b_row + x)));
-
-        for (int c = 0; c + 1 < full_chunks; c++) {
-            __m128i r_next = _mm_avg_epu16(
-                _mm_loadu_si128((const __m128i *)(a_row + x + 8)),
-                _mm_loadu_si128((const __m128i *)(b_row + x + 8)));
-            __m128i r_shifted = _mm_alignr_epi8(r_next, r, 2);
-            __m128i r_mid = _mm_avg_epu16(r, r_shifted);
-
-            __m128i out0 = _mm_unpacklo_epi16(r, r_mid);
-            __m128i out1 = _mm_unpackhi_epi16(r, r_mid);
-
-            _mm_storeu_si128((__m128i *)(dst + 2 * x + 0), out0);
-            _mm_storeu_si128((__m128i *)(dst + 2 * x + 8), out1);
-            x += 8;
-            r = r_next;
-        }
-
         uint16_t edge = (x + 8 < src_w)
                           ? up_avg_u16_scalar(a_row[x + 8], b_row[x + 8])
                           : up_avg_u16_scalar(a_row[src_w - 1], b_row[src_w - 1]);
@@ -954,7 +1025,16 @@ static inline void up_vblend_21_row_avx2_u16(const uint16_t *a_row,
 }
 
 /* ---- Horizontal 1.5x (2->3) HDR upscale of one row (AVX2, 256-bit
- *      fast path + 128-bit slow-path residual) ---- */
+ *      fast path + 128-bit slow-path residual) ----
+ *
+ * Same raw-pair strategy as the SDR up_h_1_5x_row_avx2, and even
+ * simpler: both blend weights fit in a signed 16-bit lane, so
+ * madd_epi16 computes 85*a + 171*b straight from the interleaved
+ * (a,b) u16 pairs of the raw load - no deinterleave, no decomposition.
+ * The (b,c) pairs come from the same row loaded one element later,
+ * weighted {171,85}.  m1/m2 are packed side by side (packus_epi32)
+ * and the output assembly indexes the raw load and the packed blends
+ * directly. */
 static void up_h_1_5x_row_avx2_u16(const uint16_t *src, int w, uint16_t *dst)
 {
     int pairs = w / 2;
@@ -964,113 +1044,81 @@ static void up_h_1_5x_row_avx2_u16(const uint16_t *src, int w, uint16_t *dst)
 
     /* 256-bit fast path: 8 pairs -> 24 dst u16 per chunk.  Reads 16 u16
      * source elements starting at 2p (32 bytes) into r, and another 16
-     * starting at 2p+2 into r_n2 - last element accessed is at index
-     * 2p + 17.  Need 2p + 17 < w, so ci_256 <= (w - 18)/16.  The residual
-     * falls through to the existing 128-bit loop (which has its own
-     * bounds-safe srli+insert slow path for c). */
+     * starting at 2p+1 into r_n1 - last element accessed is at index
+     * 2p + 16.  The (w - 18)/16 bound keeps one element of margin.  The
+     * residual falls through to the 128-bit loop (which has its own
+     * bounds-safe srli+insert slow path). */
     int safe_chunks_256 = (w >= 18) ? ((w - 18) / 16 + 1) : 0;
     if (safe_chunks_256 * 2 > full_chunks) safe_chunks_256 = full_chunks / 2;
 
-    /* Byte-level shuffle masks - they operate on the 16-byte registers
-     * holding u16 values (2 bytes each). */
+    /* Byte-level shuffle masks - they operate on registers holding u16
+     * values (2 bytes each). */
 
-    /* Deinterleave masks: even u16 -> low 8 bytes, odd u16 -> low 8 bytes. */
-    static const int8_t even_u16_mask[16] = {
-        0, 1, 4, 5, 8, 9, 12, 13, -1, -1, -1, -1, -1, -1, -1, -1
-    };
-    static const int8_t odd_u16_mask[16] = {
-        2, 3, 6, 7, 10, 11, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1
-    };
-
-    /* Interleave masks for the first 16 output bytes (8 u16 = a[0,1,2],
-     * m1[0,1,2], m2[0,1]).  mm = _mm_unpacklo_epi16(m1, m2) = {m1[0],
-     * m2[0], m1[1], m2[1], m1[2], m2[2], m1[3], m2[3]} - 8 u16 = 16 bytes.
-     *
-     * Output u16 positions 0..7: a[0], m1[0], m2[0], a[1], m1[1], m2[1],
+    /* Output u16 positions 0..7: a[0], m1[0], m2[0], a[1], m1[1], m2[1],
      *   a[2], m1[2]
-     *   -> a bytes at u16 pos 0, 3, 6     = a_bytes indices 0,1  2,3  4,5
-     *   -> mm bytes at u16 pos 1, 2, 4, 5, 7  = mm indices 0..5 and 8..9 */
+     * a[i] sits at bytes 4i,4i+1 of the raw load r.
+     * mm = packus_epi32(m1_u32, m2_u32) holds m1[i] at bytes 2i,2i+1 and
+     * m2[i] at bytes 8+2i,9+2i (of each 128-bit lane). */
     static const int8_t a_lo_u16_mask[16] = {
-        0, 1, -1, -1, -1, -1, 2, 3, -1, -1, -1, -1, 4, 5, -1, -1
+        0, 1, -1, -1, -1, -1, 4, 5, -1, -1, -1, -1, 8, 9, -1, -1
     };
     static const int8_t mm_lo_u16_mask[16] = {
-        -1, -1, 0, 1, 2, 3, -1, -1, 4, 5, 6, 7, -1, -1, 8, 9
+        -1, -1, 0, 1, 8, 9, -1, -1, 2, 3, 10, 11, -1, -1, 4, 5
     };
 
-    /* Next 8 output bytes (4 u16): m2[2], a[3], m1[3], m2[3]
-     *   mm[10,11] = m2[2]  -> position 0
-     *   a[3]      = a bytes 6,7
-     *   mm[12,13] = m1[3]  -> position 4
-     *   mm[14,15] = m2[3]  -> position 6 */
+    /* Next 4 output u16: m2[2], a[3], m1[3], m2[3] */
     static const int8_t a_hi_u16_mask[16] = {
-        -1, -1, 6, 7, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1
+        -1, -1, 12, 13, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1
     };
     static const int8_t mm_hi_u16_mask[16] = {
-        10, 11, -1, -1, 12, 13, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1
+        12, 13, -1, -1, 6, 7, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1
     };
 
-    const __m128i em       = _mm_loadu_si128((const __m128i *)even_u16_mask);
-    const __m128i om       = _mm_loadu_si128((const __m128i *)odd_u16_mask);
     const __m128i ma_lo    = _mm_loadu_si128((const __m128i *)a_lo_u16_mask);
     const __m128i mmm_lo   = _mm_loadu_si128((const __m128i *)mm_lo_u16_mask);
     const __m128i ma_hi    = _mm_loadu_si128((const __m128i *)a_hi_u16_mask);
     const __m128i mmm_hi   = _mm_loadu_si128((const __m128i *)mm_hi_u16_mask);
 
-    /* {85, 171, 85, 171, ...} as 8 i16 - used with _mm_madd_epi16 on
-     * interleaved (a, b) u16 pairs to get 85*a + 171*b per pair. */
-    const __m128i weights  = _mm_set1_epi32((171 << 16) | 85);
+    /* {85, 171, ...} matches the (a,b) layout of r; {171, 85, ...}
+     * matches the (b,c) layout of the +1-offset load. */
+    const __m128i w_ab     = _mm_set1_epi32((171 << 16) | 85);
+    const __m128i w_bc     = _mm_set1_epi32((85 << 16) | 171);
     const __m128i r128_32  = _mm_set1_epi32(128);
-    const __m128i zero     = _mm_setzero_si128();
 
-    /* 256-bit broadcasts of the same masks/weights.  vpshufb,
-     * vpmaddwd, vpunpcklwd, vpackusdw and the add/shift ops we use are
-     * all lane-independent, so each 128-bit lane independently
-     * computes its own 4 pairs. */
-    const __m256i em_256       = _mm256_broadcastsi128_si256(em);
-    const __m256i om_256       = _mm256_broadcastsi128_si256(om);
+    /* 256-bit broadcasts of the same masks/weights.  vpshufb, vpmaddwd,
+     * vpackusdw and the add/shift ops we use are all lane-independent,
+     * so each 128-bit lane independently computes its own 4 pairs. */
     const __m256i ma_lo_256    = _mm256_broadcastsi128_si256(ma_lo);
     const __m256i mmm_lo_256   = _mm256_broadcastsi128_si256(mmm_lo);
     const __m256i ma_hi_256    = _mm256_broadcastsi128_si256(ma_hi);
     const __m256i mmm_hi_256   = _mm256_broadcastsi128_si256(mmm_hi);
-    const __m256i weights_256  = _mm256_set1_epi32((171 << 16) | 85);
+    const __m256i w_ab_256     = _mm256_set1_epi32((171 << 16) | 85);
+    const __m256i w_bc_256     = _mm256_set1_epi32((85 << 16) | 171);
     const __m256i r128_32_256  = _mm256_set1_epi32(128);
-    const __m256i zero_256     = _mm256_setzero_si256();
 
     /* --------------------------------------------------------------
      * 256-bit HDR fast path.  Lane 0 handles 4 pairs [p..p+3], lane 1
-     * handles [p+4..p+7].  Uses the same "load r_n2 = src + 2p + 2"
-     * trick as the SDR fast path to avoid a per-chunk srli+insert for
-     * the c vector - simpler and faster, but requires an extra 16 u16
-     * of headroom beyond the chunk's end.
+     * handles [p+4..p+7].
      * -------------------------------------------------------------- */
     for (int ci = 0; ci < safe_chunks_256; ci++) {
         __m256i r    = _mm256_loadu_si256((const __m256i *)(src + 2 * p));
-        __m256i r_n2 = _mm256_loadu_si256((const __m256i *)(src + 2 * p + 2));
+        __m256i r_n1 = _mm256_loadu_si256((const __m256i *)(src + 2 * p + 1));
 
-        __m256i a_bytes = _mm256_shuffle_epi8(r,    em_256);
-        __m256i b_bytes = _mm256_shuffle_epi8(r,    om_256);
-        __m256i c_bytes = _mm256_shuffle_epi8(r_n2, em_256);
+        __m256i m1_u32 = _mm256_srli_epi32(_mm256_add_epi32(
+            _mm256_madd_epi16(r, w_ab_256), r128_32_256), 8);
+        __m256i m2_u32 = _mm256_srli_epi32(_mm256_add_epi32(
+            _mm256_madd_epi16(r_n1, w_bc_256), r128_32_256), 8);
 
-        __m256i ab = _mm256_unpacklo_epi16(a_bytes, b_bytes);
-        __m256i cb = _mm256_unpacklo_epi16(c_bytes, b_bytes);
-
-        __m256i m1_u32 = _mm256_madd_epi16(ab, weights_256);
-        __m256i m2_u32 = _mm256_madd_epi16(cb, weights_256);
-
-        m1_u32 = _mm256_srli_epi32(_mm256_add_epi32(m1_u32, r128_32_256), 8);
-        m2_u32 = _mm256_srli_epi32(_mm256_add_epi32(m2_u32, r128_32_256), 8);
-
-        __m256i m1 = _mm256_packus_epi32(m1_u32, zero_256);
-        __m256i m2 = _mm256_packus_epi32(m2_u32, zero_256);
-
-        __m256i mm = _mm256_unpacklo_epi16(m1, m2);
+        /* Pack the two blend streams side by side: per lane, m1[0..3]
+         * in the low 8 bytes, m2[0..3] in the high 8. */
+        __m256i mm = _mm256_packus_epi32(m1_u32, m2_u32);
 
         __m256i out_lo = _mm256_or_si256(
-            _mm256_shuffle_epi8(a_bytes, ma_lo_256),
-            _mm256_shuffle_epi8(mm,      mmm_lo_256));
+            _mm256_shuffle_epi8(r,  ma_lo_256),
+            _mm256_shuffle_epi8(mm, mmm_lo_256));
         __m256i out_hi = _mm256_or_si256(
-            _mm256_shuffle_epi8(a_bytes, ma_hi_256),
-            _mm256_shuffle_epi8(mm,      mmm_hi_256));
+            _mm256_shuffle_epi8(r,  ma_hi_256),
+            _mm256_shuffle_epi8(mm, mmm_hi_256));
 
         /* Extract each 128-bit lane and store 12 u16 (16 + 8 bytes). */
         __m128i ol_lane0 = _mm256_castsi256_si128(out_lo);
@@ -1092,42 +1140,28 @@ static void up_h_1_5x_row_avx2_u16(const uint16_t *src, int w, uint16_t *dst)
         /* Load 16 bytes = 8 u16 source elements covering 4 pairs. */
         __m128i r = _mm_loadu_si128((const __m128i *)(src + 2 * p));
 
-        /* Deinterleave even/odd u16 values. */
-        __m128i a_bytes = _mm_shuffle_epi8(r, em);  /* a[0..3] in low 8 bytes */
-        __m128i b_bytes = _mm_shuffle_epi8(r, om);  /* b[0..3] in low 8 bytes */
-
-        /* c_bytes = a shifted by one u16 element, with next_a at index 3. */
+        /* (b,c) pairs built in-register: shift one u16 element, insert
+         * the next source element (or the replicated edge) at the top -
+         * this path never loads past the row end. */
         int next_idx = 2 * (p + 4);
         uint16_t next_a = (next_idx < w) ? src[next_idx] : src[w - 1];
-        __m128i c_raw = _mm_srli_si128(a_bytes, 2);            /* shift a by 1 u16 */
-        __m128i c_bytes = _mm_insert_epi16(c_raw, next_a, 3);  /* u16 at pos 3 */
+        __m128i r_n1 = _mm_insert_epi16(_mm_srli_si128(r, 2), next_a, 7);
 
-        /* Interleave a with b and c with b for madd_epi16. */
-        __m128i ab = _mm_unpacklo_epi16(a_bytes, b_bytes);
-        __m128i cb = _mm_unpacklo_epi16(c_bytes, b_bytes);
+        /* 85*a + 171*b and 171*b + 85*c -> 4 i32 results each. */
+        __m128i m1_u32 = _mm_srli_epi32(_mm_add_epi32(
+            _mm_madd_epi16(r, w_ab), r128_32), 8);
+        __m128i m2_u32 = _mm_srli_epi32(_mm_add_epi32(
+            _mm_madd_epi16(r_n1, w_bc), r128_32), 8);
 
-        /* 85*a + 171*b -> 4 i32 results */
-        __m128i m1_u32 = _mm_madd_epi16(ab, weights);
-        __m128i m2_u32 = _mm_madd_epi16(cb, weights);
-
-        m1_u32 = _mm_srli_epi32(_mm_add_epi32(m1_u32, r128_32), 8);
-        m2_u32 = _mm_srli_epi32(_mm_add_epi32(m2_u32, r128_32), 8);
-
-        /* Pack i32 -> u16 (4 values in low 8 bytes). */
-        __m128i m1 = _mm_packus_epi32(m1_u32, zero);
-        __m128i m2 = _mm_packus_epi32(m2_u32, zero);
-
-        /* Interleave m1 and m2 at u16 granularity:
-         * mm = {m1[0], m2[0], m1[1], m2[1], m1[2], m2[2], m1[3], m2[3]} */
-        __m128i mm = _mm_unpacklo_epi16(m1, m2);
+        __m128i mm = _mm_packus_epi32(m1_u32, m2_u32);
 
         /* Assemble output via two shuffle + OR for each 16/8 slice. */
         __m128i out_lo = _mm_or_si128(
-            _mm_shuffle_epi8(a_bytes, ma_lo),
-            _mm_shuffle_epi8(mm,      mmm_lo));
+            _mm_shuffle_epi8(r,  ma_lo),
+            _mm_shuffle_epi8(mm, mmm_lo));
         __m128i out_hi = _mm_or_si128(
-            _mm_shuffle_epi8(a_bytes, ma_hi),
-            _mm_shuffle_epi8(mm,      mmm_hi));
+            _mm_shuffle_epi8(r,  ma_hi),
+            _mm_shuffle_epi8(mm, mmm_hi));
 
         _mm_storeu_si128((__m128i *)(dst + 3 * p), out_lo);
         _mm_storel_epi64((__m128i *)(dst + 3 * p + 8), out_hi);

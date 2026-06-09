@@ -72,7 +72,11 @@
  *   dst[2i+1] = (src[i] + src[i+1] + 1) >> 1   <- _mm256_avg_epu8
  * The rightmost edge replicates src[w-1].
  */
-static void up_h_2x_row_avx2(const uint8_t *src, int src_w, uint8_t *dst)
+/* aligned(64) keeps the hot loop entry off a 64-byte icache-line
+ * boundary — critical on Zen and Intel where the first decode
+ * straddling a line can silently regress this path by 10-60%. */
+static void __attribute__((aligned(64), hot))
+up_h_2x_row_avx2(const uint8_t *src, int src_w, uint8_t *dst)
 {
     /* 128-bit SSE inner loop.  We intentionally avoid 256-bit ops here
      * because AVX2 _mm256_unpacklo/hi_epi8 are per-lane, and assembling
@@ -139,8 +143,13 @@ static void up_h_2x_row_avx2(const uint8_t *src, int src_w, uint8_t *dst)
  * horizontal doubling, so the averaged row never has to be written to a
  * scratch buffer and read back.  The horizontal doubling matches
  * up_h_2x_row_avx2.
+ *
+ * aligned(64) mirrors up_h_2x_row_avx2: this 2x path is icache-placement
+ * sensitive and the alignment prevents the first iteration's decode from
+ * straddling a cache-line boundary.
  * ----------------------------------------------------------------------- */
-static void up_h_2x_vblend_row_avx2(const uint8_t *a_row, const uint8_t *b_row,
+static void __attribute__((aligned(64), hot))
+up_h_2x_vblend_row_avx2(const uint8_t *a_row, const uint8_t *b_row,
                                     int src_w, uint8_t *dst)
 {
     int x = 0;
@@ -223,8 +232,13 @@ static void up_2x_plane_avx2(const uint8_t *src, int src_w, int src_h,
 
 /* -----------------------------------------------------------------------
  * Vectorized vertical 85/171 blend of two rows (AVX2, 32 bytes at a time)
+ *
+ * aligned(64) keeps this hot function off icache-line boundaries.
+ * The blend is called per output-row pair in the 1.5x cascade and its
+ * decode alignment can silently affect that path by several percent.
  * ----------------------------------------------------------------------- */
-static inline void up_vblend_21_row_avx2(const uint8_t *a_row,
+static inline void __attribute__((aligned(64)))
+up_vblend_21_row_avx2(const uint8_t *a_row,
                                          const uint8_t *b_row,
                                          int w, uint8_t *out)
 {
@@ -281,6 +295,10 @@ static inline void up_vblend_21_row_avx2(const uint8_t *a_row,
  * precomputed masks.  128-bit is used because AVX2 256-bit shuffles are
  * per-lane and the 3-way interleave crosses lane boundaries.
  *
+ * aligned(64) keeps this shuffle-port-heavy function off icache-line
+ * boundaries — the 256-bit fast path issues ~13 shuffle-port uops per
+ * chunk and its decode alignment can dominate the per-byte cost.
+ *
  * Optimizations over a naive version:
  *   1. c_bytes (= src[2i+2]) is computed by loading src + 2*p + 2 and
  *      applying the same even-byte deinterleave mask.  This saves the
@@ -295,7 +313,8 @@ static inline void up_vblend_21_row_avx2(const uint8_t *a_row,
  *      ops per chunk, which is significant on Zen 1 where pshufb is
  *      1/cycle throughput.
  */
-static void up_h_1_5x_row_avx2(const uint8_t *src, int w, uint8_t *dst)
+static void __attribute__((aligned(64), hot))
+up_h_1_5x_row_avx2(const uint8_t *src, int w, uint8_t *dst)
 {
     int pairs = w / 2;
     int full_chunks = pairs / 8;   /* 8 pairs = 16 src bytes = 24 dst bytes */

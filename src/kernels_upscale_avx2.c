@@ -56,6 +56,7 @@
 #if defined(__x86_64__)
 
 #include "internal.h"
+#include "detect.h"
 #include "upscale_chunk.h"
 #include <immintrin.h>
 #include <stdlib.h>
@@ -72,11 +73,46 @@
  *   dst[2i+1] = (src[i] + src[i+1] + 1) >> 1   <- _mm256_avg_epu8
  * The rightmost edge replicates src[w-1].
  */
-/* aligned(64) keeps the hot loop entry off a 64-byte icache-line
- * boundary — critical on Zen and Intel where the first decode
- * straddling a line can silently regress this path by 10-60%. */
-static void __attribute__((aligned(64), hot))
-up_h_2x_row_avx2(const uint8_t *src, int src_w, uint8_t *dst)
+/* Output planes at or above this size get streaming stores when they
+ * are terminal (not read back by a deeper cascade level).  Smaller
+ * planes stay temporal: they live in the last-level cache, where
+ * normal stores are far cheaper than forced DRAM writes (measured 4x
+ * slower for a cache-resident 1080p->4K doubling).  The threshold is
+ * 1.5x the probed LLC size: on the Zen 5 reference part (16MB LLC per
+ * CPUID) a plane at about 1.0x the LLC measured flat streamed - the
+ * write stream is its own working set, and write-allocate plus
+ * prefetch keep up until the plane genuinely dwarfs the cache - while
+ * 1.8x the LLC measured -20%.  1.5x lands at the 24MB that part was
+ * tuned to.  When the probe reports nothing, fall back to that same
+ * constant. */
+static inline size_t up_2x_stream_min_bytes(void)
+{
+    size_t llc = fused_detect_cpu()->llc_bytes;
+    return llc ? llc + llc / 2 : (size_t)(24u << 20);
+}
+
+/* Store 64 output bytes either through the cache (storeu) or as
+ * non-temporal streaming stores (vmovntdq).  Streaming skips the
+ * read-for-ownership a normal store performs on each output line, so a
+ * kernel that only ever writes a destination once - and whose output
+ * nobody reads back - moves roughly half the memory traffic.  The
+ * caller guarantees 32-byte alignment when stream is set; `stream` is
+ * always a literal at the call sites below, so each wrapper compiles
+ * to a single store flavor with no runtime branch. */
+static inline __attribute__((always_inline)) void
+up_2x_store64(uint8_t *dst, __m256i out0, __m256i out1, int stream)
+{
+    if (stream) {
+        _mm256_stream_si256((__m256i *)(dst +  0), out0);
+        _mm256_stream_si256((__m256i *)(dst + 32), out1);
+    } else {
+        _mm256_storeu_si256((__m256i *)(dst +  0), out0);
+        _mm256_storeu_si256((__m256i *)(dst + 32), out1);
+    }
+}
+
+static inline __attribute__((always_inline)) void
+up_h_2x_row_avx2_impl(const uint8_t *src, int src_w, uint8_t *dst, int stream)
 {
     /* 256-bit AVX2 inner loop.  A 2x horizontal doubling writes two
      * output bytes per source byte, so the binding resource is store
@@ -104,8 +140,7 @@ up_h_2x_row_avx2(const uint8_t *src, int src_w, uint8_t *dst)
             __m256i out0 = _mm256_permute2x128_si256(ilo, ihi, 0x20);
             __m256i out1 = _mm256_permute2x128_si256(ilo, ihi, 0x31);
 
-            _mm256_storeu_si256((__m256i *)(dst + 2 * x +  0), out0);
-            _mm256_storeu_si256((__m256i *)(dst + 2 * x + 32), out1);
+            up_2x_store64(dst + 2 * x, out0, out1, stream);
             x += 32;
         }
 
@@ -127,13 +162,15 @@ up_h_2x_row_avx2(const uint8_t *src, int src_w, uint8_t *dst)
         __m256i out0 = _mm256_permute2x128_si256(ilo, ihi, 0x20);
         __m256i out1 = _mm256_permute2x128_si256(ilo, ihi, 0x31);
 
-        _mm256_storeu_si256((__m256i *)(dst + 2 * x +  0), out0);
-        _mm256_storeu_si256((__m256i *)(dst + 2 * x + 32), out1);
+        up_2x_store64(dst + 2 * x, out0, out1, stream);
         x += 32;
     }
 
     /* One 16-byte SSE chunk if at least 16 bytes remain, so narrow planes
-     * (chroma rows of small sources) stay off the scalar tail. */
+     * (chroma rows of small sources) stay off the scalar tail.  These
+     * residual stores stay temporal even in streaming mode; partial
+     * cache lines at the row edge are not worth a write-combining
+     * round-trip. */
     if (x + 16 <= src_w) {
         __m128i r = _mm_loadu_si128((const __m128i *)(src + x));
         uint8_t edge = (x + 16 < src_w) ? src[x + 16] : src[src_w - 1];
@@ -158,6 +195,23 @@ up_h_2x_row_avx2(const uint8_t *src, int src_w, uint8_t *dst)
     }
 }
 
+/* aligned(64) keeps the hot loop entry off a 64-byte icache-line
+ * boundary — critical on Zen and Intel where the first decode
+ * straddling a line can silently regress this path by 10-60%. */
+static void __attribute__((aligned(64), hot))
+up_h_2x_row_avx2(const uint8_t *src, int src_w, uint8_t *dst)
+{
+    up_h_2x_row_avx2_impl(src, src_w, dst, 0);
+}
+
+/* Streaming-store variant for terminal output levels (see
+ * up_2x_plane_avx2). */
+static void __attribute__((aligned(64), hot))
+up_h_2x_row_avx2_nt(const uint8_t *src, int src_w, uint8_t *dst)
+{
+    up_h_2x_row_avx2_impl(src, src_w, dst, 1);
+}
+
 
 /* -----------------------------------------------------------------------
  * Fused vertical 2x average + horizontal doubling for one row.
@@ -175,9 +229,9 @@ up_h_2x_row_avx2(const uint8_t *src, int src_w, uint8_t *dst)
  * sensitive and the alignment prevents the first iteration's decode from
  * straddling a cache-line boundary.
  * ----------------------------------------------------------------------- */
-static void __attribute__((aligned(64), hot))
-up_h_2x_vblend_row_avx2(const uint8_t *a_row, const uint8_t *b_row,
-                                    int src_w, uint8_t *dst)
+static inline __attribute__((always_inline)) void
+up_h_2x_vblend_row_avx2_impl(const uint8_t *a_row, const uint8_t *b_row,
+                             int src_w, uint8_t *dst, int stream)
 {
     int x = 0;
     int full_chunks = src_w / 32;
@@ -197,8 +251,7 @@ up_h_2x_vblend_row_avx2(const uint8_t *a_row, const uint8_t *b_row,
             __m256i out0 = _mm256_permute2x128_si256(ilo, ihi, 0x20);
             __m256i out1 = _mm256_permute2x128_si256(ilo, ihi, 0x31);
 
-            _mm256_storeu_si256((__m256i *)(dst + 2 * x +  0), out0);
-            _mm256_storeu_si256((__m256i *)(dst + 2 * x + 32), out1);
+            up_2x_store64(dst + 2 * x, out0, out1, stream);
             x += 32;
         }
 
@@ -220,8 +273,7 @@ up_h_2x_vblend_row_avx2(const uint8_t *a_row, const uint8_t *b_row,
         __m256i out0 = _mm256_permute2x128_si256(ilo, ihi, 0x20);
         __m256i out1 = _mm256_permute2x128_si256(ilo, ihi, 0x31);
 
-        _mm256_storeu_si256((__m256i *)(dst + 2 * x +  0), out0);
-        _mm256_storeu_si256((__m256i *)(dst + 2 * x + 32), out1);
+        up_2x_store64(dst + 2 * x, out0, out1, stream);
         x += 32;
     }
 
@@ -255,6 +307,22 @@ up_h_2x_vblend_row_avx2(const uint8_t *a_row, const uint8_t *b_row,
     }
 }
 
+static void __attribute__((aligned(64), hot))
+up_h_2x_vblend_row_avx2(const uint8_t *a_row, const uint8_t *b_row,
+                        int src_w, uint8_t *dst)
+{
+    up_h_2x_vblend_row_avx2_impl(a_row, b_row, src_w, dst, 0);
+}
+
+/* Streaming-store variant for terminal output levels (see
+ * up_2x_plane_avx2). */
+static void __attribute__((aligned(64), hot))
+up_h_2x_vblend_row_avx2_nt(const uint8_t *a_row, const uint8_t *b_row,
+                           int src_w, uint8_t *dst)
+{
+    up_h_2x_vblend_row_avx2_impl(a_row, b_row, src_w, dst, 1);
+}
+
 
 /* -----------------------------------------------------------------------
  * Vertical 2x upscale of one plane (with horizontal doubling fused)
@@ -262,26 +330,52 @@ up_h_2x_vblend_row_avx2(const uint8_t *a_row, const uint8_t *b_row,
 
 static void up_2x_plane_avx2(const uint8_t *src, int src_w, int src_h,
                              int src_stride, uint8_t *dst, int dst_stride,
-                             uint8_t *scratch)
+                             uint8_t *scratch, int terminal)
 {
     if (!scratch) return;
+
+    /* Terminal levels - outputs no deeper cascade level reads back -
+     * can use non-temporal stores, skipping the read-for-ownership on
+     * every output cache line.  That only pays when the plane is too
+     * large to live in the last-level cache anyway: for cache-resident
+     * planes, normal stores hit L3 and never touch DRAM at all, while
+     * streaming forces every byte out to memory (measured 4x slower
+     * for a 1080p->4K doubling on a 64MB-L3 part).  So stream only
+     * planes that would blow the LLC out regardless.  vmovntdq needs
+     * 32-byte-aligned addresses; the library allocates output planes
+     * 32-aligned with 32-multiple strides, but verify at run time and
+     * fall back rather than trust the caller's buffers. */
+    int stream = terminal &&
+                 (size_t)dst_stride * (size_t)(2 * src_h)
+                     >= up_2x_stream_min_bytes() &&
+                 (((uintptr_t)dst | (uintptr_t)dst_stride) & 31) == 0;
 
     for (int i = 0; i < src_h; i++) {
         const uint8_t *row_cur = src + (size_t)i * src_stride;
         const uint8_t *row_nxt = (i + 1 < src_h)
                                     ? src + (size_t)(i + 1) * src_stride
                                     : row_cur;
+        uint8_t *dst_even = dst + (size_t)(2 * i)     * dst_stride;
+        uint8_t *dst_odd  = dst + (size_t)(2 * i + 1) * dst_stride;
 
-        /* Even output row: horizontal doubling of the source row directly. */
-        up_h_2x_row_avx2(row_cur, src_w,
-                         dst + (size_t)(2 * i) * dst_stride);
-
-        /* Odd output row: the vertical average of (row_cur, row_nxt) is
-         * computed inline and fused with the horizontal doubling, so it does
-         * not need a scratch row between the two steps. */
-        up_h_2x_vblend_row_avx2(row_cur, row_nxt, src_w,
-                                dst + (size_t)(2 * i + 1) * dst_stride);
+        /* Even output row: horizontal doubling of the source row
+         * directly.  Odd output row: the vertical average of (row_cur,
+         * row_nxt) is computed inline and fused with the horizontal
+         * doubling, so it does not need a scratch row between the two
+         * steps. */
+        if (stream) {
+            up_h_2x_row_avx2_nt(row_cur, src_w, dst_even);
+            up_h_2x_vblend_row_avx2_nt(row_cur, row_nxt, src_w, dst_odd);
+        } else {
+            up_h_2x_row_avx2(row_cur, src_w, dst_even);
+            up_h_2x_vblend_row_avx2(row_cur, row_nxt, src_w, dst_odd);
+        }
     }
+
+    /* Streaming stores are weakly ordered; fence once per plane so the
+     * data is globally visible before the caller hands the frame to
+     * another thread. */
+    if (stream) _mm_sfence();
 }
 
 
@@ -627,6 +721,11 @@ static void upscale_plane_avx2(const fused_kernel_params_t *p,
     int N    = p->upscale_cascade_depth;
     int tail = p->upscale_tail_1_5x;
 
+    /* A 2x level's output is read back by the next cascade level, and
+     * the deepest level feeds the 1.5x tail when one is active.  The
+     * one level nobody reads again - the deepest, with no tail - is
+     * terminal and can use streaming stores. */
+
     if (N >= 1 && (p->upscale_active & (1u << FUSED_UP_IDX_2X))) {
         uint8_t *dst;
         int dst_stride;
@@ -639,7 +738,7 @@ static void upscale_plane_avx2(const fused_kernel_params_t *p,
             dst_stride = p->up_out[FUSED_UP_IDX_2X].uv_stride;
         }
         if (dst) up_2x_plane_avx2(src, src_w, src_h, src_stride, dst, dst_stride,
-                                   p->upscale_scratch);
+                                   p->upscale_scratch, N == 1 && !tail);
     }
 
     for (int k = 1; k < N; k++) {
@@ -665,7 +764,7 @@ static void upscale_plane_avx2(const fused_kernel_params_t *p,
         }
         if (src_up && dst) {
             up_2x_plane_avx2(src_up, up_w, up_h, src_up_stride, dst, dst_stride,
-                             p->upscale_scratch);
+                             p->upscale_scratch, k == N - 1 && !tail);
         }
     }
 
@@ -792,8 +891,9 @@ static inline uint16_t up_blend_21_u16_scalar(uint16_t a, uint16_t b)
  * function placement: when the HDR downscale kernel's text size changes,
  * the unrelated HDR 2x upscale can regress by 10-60% simply because the
  * first iteration's decode straddles an icache-line boundary. */
-static void __attribute__((aligned(64), hot))
-up_h_2x_row_avx2_u16(const uint16_t *src, int src_w, uint16_t *dst)
+static inline __attribute__((always_inline)) void
+up_h_2x_row_avx2_u16_impl(const uint16_t *src, int src_w, uint16_t *dst,
+                          int stream)
 {
     int x = 0;
     int full_chunks = src_w / 16;
@@ -812,8 +912,7 @@ up_h_2x_row_avx2_u16(const uint16_t *src, int src_w, uint16_t *dst)
             __m256i out0 = _mm256_permute2x128_si256(ilo, ihi, 0x20);
             __m256i out1 = _mm256_permute2x128_si256(ilo, ihi, 0x31);
 
-            _mm256_storeu_si256((__m256i *)(dst + 2 * x +  0), out0);
-            _mm256_storeu_si256((__m256i *)(dst + 2 * x + 16), out1);
+            up_2x_store64((uint8_t *)(dst + 2 * x), out0, out1, stream);
             x += 16;
         }
 
@@ -833,13 +932,13 @@ up_h_2x_row_avx2_u16(const uint16_t *src, int src_w, uint16_t *dst)
         __m256i out0 = _mm256_permute2x128_si256(ilo, ihi, 0x20);
         __m256i out1 = _mm256_permute2x128_si256(ilo, ihi, 0x31);
 
-        _mm256_storeu_si256((__m256i *)(dst + 2 * x +  0), out0);
-        _mm256_storeu_si256((__m256i *)(dst + 2 * x + 16), out1);
+        up_2x_store64((uint8_t *)(dst + 2 * x), out0, out1, stream);
         x += 16;
     }
 
     /* One 8-sample SSE chunk if at least 8 samples remain, so narrow
-     * planes (chroma rows of small sources) stay off the scalar tail. */
+     * planes (chroma rows of small sources) stay off the scalar tail.
+     * Residual stores stay temporal even in streaming mode. */
     if (x + 8 <= src_w) {
         __m128i r = _mm_loadu_si128((const __m128i *)(src + x));
         uint16_t edge = (x + 8 < src_w) ? src[x + 8] : src[src_w - 1];
@@ -864,6 +963,20 @@ up_h_2x_row_avx2_u16(const uint16_t *src, int src_w, uint16_t *dst)
     }
 }
 
+static void __attribute__((aligned(64), hot))
+up_h_2x_row_avx2_u16(const uint16_t *src, int src_w, uint16_t *dst)
+{
+    up_h_2x_row_avx2_u16_impl(src, src_w, dst, 0);
+}
+
+/* Streaming-store variant for terminal output levels (see
+ * up_2x_plane_avx2_u16). */
+static void __attribute__((aligned(64), hot))
+up_h_2x_row_avx2_u16_nt(const uint16_t *src, int src_w, uint16_t *dst)
+{
+    up_h_2x_row_avx2_u16_impl(src, src_w, dst, 1);
+}
+
 /* -----------------------------------------------------------------------
  * Fused vertical 2x average + horizontal doubling for one HDR row.
  *
@@ -878,9 +991,9 @@ up_h_2x_row_avx2_u16(const uint16_t *src, int src_w, uint16_t *dst)
  * mirrors up_h_2x_row_avx2_u16: this HDR 2x path is icache-placement
  * sensitive.
  * ----------------------------------------------------------------------- */
-static void __attribute__((aligned(64), hot))
-up_h_2x_vblend_row_avx2_u16(const uint16_t *a_row, const uint16_t *b_row,
-                            int src_w, uint16_t *dst)
+static inline __attribute__((always_inline)) void
+up_h_2x_vblend_row_avx2_u16_impl(const uint16_t *a_row, const uint16_t *b_row,
+                                 int src_w, uint16_t *dst, int stream)
 {
     int x = 0;
     int full_chunks = src_w / 16;
@@ -900,8 +1013,7 @@ up_h_2x_vblend_row_avx2_u16(const uint16_t *a_row, const uint16_t *b_row,
             __m256i out0 = _mm256_permute2x128_si256(ilo, ihi, 0x20);
             __m256i out1 = _mm256_permute2x128_si256(ilo, ihi, 0x31);
 
-            _mm256_storeu_si256((__m256i *)(dst + 2 * x +  0), out0);
-            _mm256_storeu_si256((__m256i *)(dst + 2 * x + 16), out1);
+            up_2x_store64((uint8_t *)(dst + 2 * x), out0, out1, stream);
             x += 16;
         }
 
@@ -923,8 +1035,7 @@ up_h_2x_vblend_row_avx2_u16(const uint16_t *a_row, const uint16_t *b_row,
         __m256i out0 = _mm256_permute2x128_si256(ilo, ihi, 0x20);
         __m256i out1 = _mm256_permute2x128_si256(ilo, ihi, 0x31);
 
-        _mm256_storeu_si256((__m256i *)(dst + 2 * x +  0), out0);
-        _mm256_storeu_si256((__m256i *)(dst + 2 * x + 16), out1);
+        up_2x_store64((uint8_t *)(dst + 2 * x), out0, out1, stream);
         x += 16;
     }
 
@@ -959,29 +1070,61 @@ up_h_2x_vblend_row_avx2_u16(const uint16_t *a_row, const uint16_t *b_row,
     }
 }
 
+static void __attribute__((aligned(64), hot))
+up_h_2x_vblend_row_avx2_u16(const uint16_t *a_row, const uint16_t *b_row,
+                            int src_w, uint16_t *dst)
+{
+    up_h_2x_vblend_row_avx2_u16_impl(a_row, b_row, src_w, dst, 0);
+}
+
+/* Streaming-store variant for terminal output levels (see
+ * up_2x_plane_avx2_u16). */
+static void __attribute__((aligned(64), hot))
+up_h_2x_vblend_row_avx2_u16_nt(const uint16_t *a_row, const uint16_t *b_row,
+                               int src_w, uint16_t *dst)
+{
+    up_h_2x_vblend_row_avx2_u16_impl(a_row, b_row, src_w, dst, 1);
+}
+
 /* ---- Vertical 2x upscale of one HDR plane ---- */
 static void up_2x_plane_avx2_u16(const uint16_t *src, int src_w, int src_h,
                                  int src_el_stride, uint16_t *dst,
-                                 int dst_el_stride, uint16_t *scratch)
+                                 int dst_el_stride, uint16_t *scratch,
+                                 int terminal)
 {
     if (!scratch) return;
+
+    /* Terminal levels use streaming stores - same policy, size gate,
+     * and alignment guard as the SDR up_2x_plane_avx2 (strides here
+     * are in u16 elements, so the byte stride is 2x). */
+    int stream = terminal &&
+                 (size_t)dst_el_stride * 2 * (size_t)(2 * src_h)
+                     >= up_2x_stream_min_bytes() &&
+                 (((uintptr_t)dst | (uintptr_t)(dst_el_stride * 2)) & 31) == 0;
 
     for (int i = 0; i < src_h; i++) {
         const uint16_t *row_cur = src + (size_t)i * src_el_stride;
         const uint16_t *row_nxt = (i + 1 < src_h)
                                     ? src + (size_t)(i + 1) * src_el_stride
                                     : row_cur;
+        uint16_t *dst_even = dst + (size_t)(2 * i)     * dst_el_stride;
+        uint16_t *dst_odd  = dst + (size_t)(2 * i + 1) * dst_el_stride;
 
-        /* Even output row: horizontal doubling of the source row directly. */
-        up_h_2x_row_avx2_u16(row_cur, src_w,
-                             dst + (size_t)(2 * i)     * dst_el_stride);
-
-        /* Odd output row: the vertical average of (row_cur, row_nxt) is
-         * computed inline and fused with the horizontal doubling, so it does
-         * not need a scratch row between the two steps. */
-        up_h_2x_vblend_row_avx2_u16(row_cur, row_nxt, src_w,
-                                    dst + (size_t)(2 * i + 1) * dst_el_stride);
+        /* Even output row: horizontal doubling of the source row
+         * directly.  Odd output row: the vertical average of (row_cur,
+         * row_nxt) fused with the horizontal doubling, no scratch row
+         * in between. */
+        if (stream) {
+            up_h_2x_row_avx2_u16_nt(row_cur, src_w, dst_even);
+            up_h_2x_vblend_row_avx2_u16_nt(row_cur, row_nxt, src_w, dst_odd);
+        } else {
+            up_h_2x_row_avx2_u16(row_cur, src_w, dst_even);
+            up_h_2x_vblend_row_avx2_u16(row_cur, row_nxt, src_w, dst_odd);
+        }
     }
+
+    /* Flush write-combining buffers before anyone else looks. */
+    if (stream) _mm_sfence();
 }
 
 /* ---- Vertical 85/171 blend of two HDR rows ----
@@ -1230,7 +1373,8 @@ static void upscale_plane_hdr_avx2(const fused_hdr_kernel_params_t *p,
         }
         if (dst) up_2x_plane_avx2_u16(src, src_w, src_h, src_el_stride,
                                        dst, dst_el_stride,
-                                       p->upscale_scratch_hdr);
+                                       p->upscale_scratch_hdr,
+                                       N == 1 && !tail);
     }
 
     for (int k = 1; k < N; k++) {
@@ -1256,7 +1400,8 @@ static void upscale_plane_hdr_avx2(const fused_hdr_kernel_params_t *p,
         }
         if (src_up && dst) {
             up_2x_plane_avx2_u16(src_up, up_w, up_h, src_up_el_stride,
-                                 dst, dst_el_stride, p->upscale_scratch_hdr);
+                                 dst, dst_el_stride, p->upscale_scratch_hdr,
+                                 k == N - 1 && !tail);
         }
     }
 

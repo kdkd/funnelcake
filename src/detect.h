@@ -8,6 +8,8 @@
 #ifndef FUNNELCAKE_DETECT_H
 #define FUNNELCAKE_DETECT_H
 
+#include <stddef.h>  /* size_t */
+
 /*
  * CPU capability detection for funnelcake.
  *
@@ -25,6 +27,11 @@ typedef struct {
     int has_neon;   /* aarch64 only - 1 if NEON is available                    */
     int has_rvv;    /* riscv64 only - 1 if RVV 1.0 (V extension) is available
                      * AND misaligned vector access is fast on the chip        */
+    size_t llc_bytes; /* x86_64 only - last-level data cache size in bytes as
+                       * CPUID reports it for one core (per-CCX on AMD, per
+                       * socket on Intel).  0 = unknown.  Kernels use this to
+                       * judge whether an output plane can stay cache-resident
+                       * or should be written with streaming stores.          */
 } fused_cpu_caps_t;
 
 /*

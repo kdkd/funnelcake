@@ -12,7 +12,7 @@
 #include <string.h>
 
 /* Static cache - zero-initialised at startup */
-static fused_cpu_caps_t g_caps = {0, 0, 0};
+static fused_cpu_caps_t g_caps = {0, 0, 0, 0};
 static int              g_detected = 0;
 
 
@@ -37,9 +37,67 @@ static int              g_detected = 0;
  * Skipping any of these can lead to illegal-instruction faults on machines
  * where the OS has not enabled AVX context saving.
  */
+/*
+ * Probe the last-level data cache size.
+ *
+ * Intel publishes deterministic cache parameters in CPUID leaf 4; AMD
+ * (Zen and newer) publishes the identical layout at leaf 0x8000001D.
+ * Both are walked subleaf by subleaf and the largest data or unified
+ * cache wins.  On AMD this reports the per-CCX L3 share - which is the
+ * right number for a single thread, since that is the capacity its
+ * working set actually competes for.  Older AMD parts fall back to leaf
+ * 0x80000006 (L3 in 512KB units, L2 in KB).  Returns 0 when nothing can
+ * be determined.
+ */
+static size_t probe_llc_bytes(void)
+{
+    unsigned int eax, ebx, ecx, edx;
+    unsigned int max_ext = 0;
+    size_t best = 0;
+
+    if (__get_cpuid(0x80000000u, &eax, &ebx, &ecx, &edx))
+        max_ext = eax;
+
+    unsigned int leaves[2] = { 4, 0 };
+    if (max_ext >= 0x8000001du)
+        leaves[1] = 0x8000001du;
+
+    for (int l = 0; l < 2 && best == 0; l++) {
+        if (leaves[l] == 0) continue;
+        for (unsigned int sub = 0; sub < 8; sub++) {
+            if (__get_cpuid_count(leaves[l], sub, &eax, &ebx, &ecx, &edx) == 0)
+                break;
+            unsigned int cache_type = eax & 0x1f;
+            if (cache_type == 0)
+                break;                          /* no more cache levels */
+            if (cache_type != 1 && cache_type != 3)
+                continue;                       /* data or unified only */
+            size_t ways  = ((ebx >> 22) & 0x3ff) + 1;
+            size_t parts = ((ebx >> 12) & 0x3ff) + 1;
+            size_t line  = (ebx & 0xfff) + 1;
+            size_t sets  = (size_t)ecx + 1;
+            size_t size  = ways * parts * line * sets;
+            if (size > best) best = size;
+        }
+    }
+
+    if (best == 0 && max_ext >= 0x80000006u &&
+        __get_cpuid(0x80000006u, &eax, &ebx, &ecx, &edx)) {
+        size_t l3 = (size_t)((edx >> 18) & 0x3fffu) * 512u * 1024u;
+        size_t l2 = (size_t)((ecx >> 16) & 0xffffu) * 1024u;
+        best = l3 ? l3 : l2;
+    }
+
+    return best;
+}
+
 static void detect_x86(void)
 {
     unsigned int eax, ebx, ecx, edx;
+
+    /* Cache geometry is independent of the SIMD checks below (and their
+     * early returns), so probe it first. */
+    g_caps.llc_bytes = probe_llc_bytes();
 
     /* Step 1+2: check OSXSAVE and AVX in cpuid leaf 1 */
     if (__get_cpuid(1, &eax, &ebx, &ecx, &edx) == 0) {

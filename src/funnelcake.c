@@ -249,6 +249,19 @@ int fused_scaler_init(fused_scaler_ctx_t *ctx)
         simd_upscale_fn   = fused_kernel_upscale_avx2;
         simd_thirds_up_fn = fused_kernel_thirds_up_avx2;
         simd_pow2_up_fn   = fused_kernel_pow2_up_avx2;
+
+        /* AVX-512 needs both the hardware (has_avx512: F+BW+VL+VBMI with
+         * OS ZMM state) and a build whose compiler accepted the AVX-512
+         * flags (fused_avx512_compiled).  Entry points not yet ported to
+         * 512-bit delegate to their AVX2 counterparts internally, so the
+         * whole table swaps at once. */
+        if (caps->has_avx512 && fused_avx512_compiled()) {
+            simd_thirds_fn    = fused_kernel_thirds_avx512;
+            simd_pow2_fn      = fused_kernel_pow2_avx512;
+            simd_upscale_fn   = fused_kernel_upscale_avx512;
+            simd_thirds_up_fn = fused_kernel_thirds_up_avx512;
+            simd_pow2_up_fn   = fused_kernel_pow2_up_avx512;
+        }
     }
 #elif defined(__riscv) && (__riscv_xlen == 64)
     if (caps->has_rvv) {

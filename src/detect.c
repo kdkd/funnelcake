@@ -12,7 +12,7 @@
 #include <string.h>
 
 /* Static cache - zero-initialised at startup */
-static fused_cpu_caps_t g_caps = {0, 0, 0, 0};
+static fused_cpu_caps_t g_caps = {0, 0, 0, 0, 0};
 static int              g_detected = 0;
 
 
@@ -94,6 +94,8 @@ static size_t probe_llc_bytes(void)
 static void detect_x86(void)
 {
     unsigned int eax, ebx, ecx, edx;
+    uint32_t xcr0 = 0;   /* low 32 bits of XCR0, captured below; the AVX-512
+                          * check reuses it for the opmask/ZMM state bits */
 
     /* Cache geometry is independent of the SIMD checks below (and their
      * early returns), so probe it first. */
@@ -130,6 +132,7 @@ static void detect_x86(void)
         if ((xcr0_lo & 0x6) != 0x6) {
             return;
         }
+        xcr0 = xcr0_lo;
 #else
         return; /* can't check without inline asm - be conservative */
 #endif
@@ -143,6 +146,36 @@ static void detect_x86(void)
     /* ebx bit 5 = AVX2 */
     if ((ebx >> 5) & 1) {
         g_caps.has_avx2 = 1;
+    }
+
+    /* AVX-512.  Two further requirements beyond AVX2:
+     *  1. The OS has enabled AVX-512 register state in XCR0: bit 5 (opmask
+     *     k registers), bit 6 (upper 256 bits of ZMM0-15), bit 7 (ZMM16-31).
+     *     A kernel that hasn't can still run a CPU that advertises the
+     *     instructions, and using them would fault.
+     *  2. The CPU advertises the full feature set the kernels are built
+     *     with: F (foundation), BW (byte/word ops - all of our pixel math),
+     *     VL (128/256-bit EVEX forms), and VBMI (vpermb-class byte
+     *     shuffles).  Requiring VBMI deliberately excludes Skylake-SP,
+     *     where 512-bit code downclocks the whole core and the AVX2
+     *     kernels are the better choice anyway.
+     *
+     * Leaf 7 sub-leaf 0: ebx bit 16 = AVX512F, bit 30 = AVX512BW,
+     * bit 31 = AVX512VL; ecx bit 1 = AVX512_VBMI. */
+    if (g_caps.has_avx2 && (xcr0 & 0xe0) == 0xe0 &&
+        ((ebx >> 16) & 1) && ((ebx >> 30) & 1) && ((ebx >> 31) & 1) &&
+        ((ecx >> 1) & 1)) {
+        g_caps.has_avx512 = 1;
+    }
+
+    /* Diagnostic/benchmark override: FUNNELCAKE_NO_AVX512=<non-empty>
+     * forces the AVX2 path on AVX-512 hardware, giving a controlled
+     * same-build A/B between the two kernel sets. */
+    if (g_caps.has_avx512) {
+        const char *no512 = getenv("FUNNELCAKE_NO_AVX512");
+        if (no512 != NULL && no512[0] != '\0') {
+            g_caps.has_avx512 = 0;
+        }
     }
 }
 

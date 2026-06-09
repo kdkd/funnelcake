@@ -246,6 +246,29 @@ ifneq ($(SWSCALE_LIBS),)
   SWSCALE_TEST_LDFLAGS = $(SWSCALE_LIBS)
 endif
 
+# --- AVX-512 kernel support (x86_64 only) ---
+# The AVX-512 kernels need a compiler that accepts the F/BW/VL/VBMI flag set
+# (gcc >= 8, clang >= 7).  Feature-probe by try-compiling rather than
+# version-sniffing: distro backports and Apple clang's renumbering make
+# version checks unreliable, and the compiler itself is the authority on
+# what it supports.  When the probe fails the same kernels_*_avx512.c files
+# are still compiled, just WITHOUT these flags - they detect the missing
+# __AVX512*__ macros and build as stubs that runtime dispatch never selects
+# (fused_avx512_compiled() returns 0).  Old compilers therefore keep
+# building a fully working library; they only omit a fast path their host
+# CPU most likely cannot run anyway.  The minimum compiler version for the
+# project is unchanged.
+ifeq ($(UNAME_M),x86_64)
+  AVX512_KERNEL_CFLAGS := -mavx512f -mavx512bw -mavx512vl -mavx512vbmi
+  CC_HAS_AVX512 := $(shell $(CC) $(AVX512_KERNEL_CFLAGS) -x c -c /dev/null -o /dev/null 2>/dev/null && echo 1)
+  ifeq ($(CC_HAS_AVX512),1)
+    $(info funnelcake: AVX-512 kernels: WILL be compiled ($(CC) accepts $(AVX512_KERNEL_CFLAGS)); used only on CPUs with F+BW+VL+VBMI)
+  else
+    $(info funnelcake: AVX-512 kernels: will NOT be compiled ($(CC) rejects $(AVX512_KERNEL_CFLAGS) - needs gcc >= 8 or clang >= 7). Building stub fallback; AVX2 and scalar kernels are unaffected.)
+    AVX512_KERNEL_CFLAGS :=
+  endif
+endif
+
 # Library sources (always compiled)
 LIB_SRCS = src/funnelcake.c src/funnelcake_hdr.c src/log.c src/detect.c \
            src/kernels_scalar.c src/kernels_hdr_scalar.c src/tonemap.c \
@@ -254,7 +277,9 @@ LIB_SRCS = src/funnelcake.c src/funnelcake_hdr.c src/log.c src/detect.c \
 # Platform-specific SIMD kernels (SDR + HDR + upscale)
 ifeq ($(UNAME_M),x86_64)
   LIB_SRCS += src/kernels_avx2.c src/kernels_hdr_avx2.c \
-              src/kernels_upscale_avx2.c
+              src/kernels_upscale_avx2.c \
+              src/kernels_avx512.c src/kernels_hdr_avx512.c \
+              src/kernels_upscale_avx512.c
 else ifeq ($(UNAME_M),aarch64)
   LIB_SRCS += src/kernels_neon.c src/kernels_hdr_neon.c \
               src/kernels_upscale_neon.c
@@ -364,6 +389,17 @@ ifeq ($(UNAME_M),x86_64)
   ASM_ARCH_CFLAGS = -mavx2
   ASM_SRCS        = src/kernels_avx2.c src/kernels_hdr_avx2.c \
                     src/kernels_upscale_avx2.c
+  # AVX-512 kernels join the asm set only when the compiler can build them
+  # for real (stub assembly is just delegation jumps - nothing to inspect).
+  # The target-specific variable below swaps in the AVX-512 flag set for
+  # those three .S files while the AVX2 files keep plain -mavx2, mirroring
+  # the per-file flags the real objects are built with.
+  ifeq ($(CC_HAS_AVX512),1)
+    ASM_SRCS += src/kernels_avx512.c src/kernels_hdr_avx512.c \
+                src/kernels_upscale_avx512.c
+  endif
+  src/kernels_avx512.S src/kernels_hdr_avx512.S src/kernels_upscale_avx512.S: \
+    ASM_ARCH_CFLAGS = $(AVX512_KERNEL_CFLAGS)
 else ifeq ($(UNAME_M),aarch64)
   ASM_ARCH_CFLAGS =
   ASM_SRCS        = src/kernels_neon.c src/kernels_hdr_neon.c \
@@ -549,6 +585,19 @@ src/kernels_scalar.o: src/kernels_scalar.c
 
 src/kernels_avx2.o: src/kernels_avx2.c
 	$(CC) $(LIB_CFLAGS) -mavx2 -c -o $@ $<
+
+# AVX-512 kernels: $(AVX512_KERNEL_CFLAGS) is the probed flag set, or empty
+# when the compiler can't build AVX-512 (the files then self-stub).  These
+# rules use $(LIB_CFLAGS), so PGO's LIB_OPT override flows through them the
+# same as every other kernel.
+src/kernels_avx512.o: src/kernels_avx512.c
+	$(CC) $(LIB_CFLAGS) $(AVX512_KERNEL_CFLAGS) -c -o $@ $<
+
+src/kernels_hdr_avx512.o: src/kernels_hdr_avx512.c
+	$(CC) $(LIB_CFLAGS) $(AVX512_KERNEL_CFLAGS) -c -o $@ $<
+
+src/kernels_upscale_avx512.o: src/kernels_upscale_avx512.c
+	$(CC) $(LIB_CFLAGS) $(AVX512_KERNEL_CFLAGS) -c -o $@ $<
 
 src/kernels_neon.o: src/kernels_neon.c
 	$(CC) $(LIB_CFLAGS) -c -o $@ $<

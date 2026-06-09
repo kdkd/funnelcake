@@ -234,6 +234,25 @@ void fused_kernel_pow2_avx2(const fused_kernel_params_t *p,
                              const uint8_t *src_y,
                              const uint8_t *src_u,
                              const uint8_t *src_v);
+
+/* AVX-512 (x86_64 only).  These symbols always exist on x86_64: when the
+ * compiler can't build real AVX-512 code the kernels_*_avx512.c files
+ * compile self-stubbed delegations to the AVX2 kernels instead.  Dispatch
+ * must gate on fused_avx512_compiled() && caps->has_avx512 so the stubs
+ * are never selected.  Entry points not yet ported to 512-bit also
+ * delegate to AVX2 internally - the swap to the avx512 table is always
+ * safe. */
+int fused_avx512_compiled(void);
+
+void fused_kernel_thirds_avx512(const fused_kernel_params_t *p,
+                                const uint8_t *src_y,
+                                const uint8_t *src_u,
+                                const uint8_t *src_v);
+
+void fused_kernel_pow2_avx512(const fused_kernel_params_t *p,
+                              const uint8_t *src_y,
+                              const uint8_t *src_u,
+                              const uint8_t *src_v);
 #endif /* __x86_64__ */
 
 #if defined(__aarch64__)
@@ -304,6 +323,21 @@ void fused_kernel_pow2_up_avx2(const fused_kernel_params_t *p,
                                const uint8_t *src_y,
                                const uint8_t *src_u,
                                const uint8_t *src_v);
+
+void fused_kernel_upscale_avx512(const fused_kernel_params_t *p,
+                                 const uint8_t *src_y,
+                                 const uint8_t *src_u,
+                                 const uint8_t *src_v);
+
+void fused_kernel_thirds_up_avx512(const fused_kernel_params_t *p,
+                                   const uint8_t *src_y,
+                                   const uint8_t *src_u,
+                                   const uint8_t *src_v);
+
+void fused_kernel_pow2_up_avx512(const fused_kernel_params_t *p,
+                                 const uint8_t *src_y,
+                                 const uint8_t *src_u,
+                                 const uint8_t *src_v);
 #endif /* __x86_64__ */
 
 #if defined(__aarch64__)
@@ -548,6 +582,16 @@ void fused_kernel_pow2_hdr_avx2(const fused_hdr_kernel_params_t *p,
                                  const uint16_t *src_y,
                                  const uint16_t *src_u,
                                  const uint16_t *src_v);
+
+void fused_kernel_thirds_hdr_avx512(const fused_hdr_kernel_params_t *p,
+                                    const uint16_t *src_y,
+                                    const uint16_t *src_u,
+                                    const uint16_t *src_v);
+
+void fused_kernel_pow2_hdr_avx512(const fused_hdr_kernel_params_t *p,
+                                  const uint16_t *src_y,
+                                  const uint16_t *src_u,
+                                  const uint16_t *src_v);
 #endif /* __x86_64__ */
 
 #if defined(__aarch64__)
@@ -611,6 +655,21 @@ void fused_kernel_pow2_up_hdr_avx2(const fused_hdr_kernel_params_t *p,
                                    const uint16_t *src_y,
                                    const uint16_t *src_u,
                                    const uint16_t *src_v);
+
+void fused_kernel_upscale_hdr_avx512(const fused_hdr_kernel_params_t *p,
+                                     const uint16_t *src_y,
+                                     const uint16_t *src_u,
+                                     const uint16_t *src_v);
+
+void fused_kernel_thirds_up_hdr_avx512(const fused_hdr_kernel_params_t *p,
+                                       const uint16_t *src_y,
+                                       const uint16_t *src_u,
+                                       const uint16_t *src_v);
+
+void fused_kernel_pow2_up_hdr_avx512(const fused_hdr_kernel_params_t *p,
+                                     const uint16_t *src_y,
+                                     const uint16_t *src_u,
+                                     const uint16_t *src_v);
 #endif /* __x86_64__ */
 
 #if defined(__aarch64__)

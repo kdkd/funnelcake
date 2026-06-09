@@ -295,6 +295,17 @@ int fused_hdr_init(fused_hdr_ctx_t *ctx)
         simd_upscale_fn   = fused_kernel_upscale_hdr_avx2;
         simd_thirds_up_fn = fused_kernel_thirds_up_hdr_avx2;
         simd_pow2_up_fn   = fused_kernel_pow2_up_hdr_avx2;
+
+        /* Same gating as the SDR dispatch in funnelcake.c: hardware caps
+         * plus a compiler that actually built AVX-512 code.  Unported
+         * entry points delegate to AVX2 internally. */
+        if (caps->has_avx512 && fused_avx512_compiled()) {
+            simd_thirds_fn    = fused_kernel_thirds_hdr_avx512;
+            simd_pow2_fn      = fused_kernel_pow2_hdr_avx512;
+            simd_upscale_fn   = fused_kernel_upscale_hdr_avx512;
+            simd_thirds_up_fn = fused_kernel_thirds_up_hdr_avx512;
+            simd_pow2_up_fn   = fused_kernel_pow2_up_hdr_avx512;
+        }
     }
 #elif defined(__riscv) && (__riscv_xlen == 64)
     if (caps->has_rvv) {

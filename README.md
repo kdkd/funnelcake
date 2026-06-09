@@ -2,9 +2,9 @@
 
 Funnelcake is a fused multi-resolution YUV420 scaler. A single call
 produces up to four downscaled outputs and up to six upscaled outputs
-simultaneously in one pass over the source data, using AVX2 (x86-64),
-NEON (aarch64), or RVV 1.0 (RISC-V) SIMD kernels with a portable scalar
-fallback. An HDR10 path handles 10-bit PQ and HLG input with optional
+simultaneously in one pass over the source data, using AVX2/AVX-512
+(x86-64), NEON (aarch64), or RVV 1.0 (RISC-V) SIMD kernels with a
+portable scalar fallback. An HDR10 path handles 10-bit PQ and HLG input with optional
 built-in tone mapping to SDR.
 
 It is designed for video pipelines that need to derive multiple
@@ -67,7 +67,8 @@ configuration a naive multi-output libswscale consumer would use. For
 downscale workloads libswscale also supports a "cascade" mode where each
 output feeds the next, which is roughly 1.5–2× faster than independent
 mode on multi-level ladders; even against cascaded libswscale, funnelcake
-remains 3–10× faster on every tested CPU. 
+remains 3–10× faster on every tested AVX2/NEON CPU and 13–16× faster on
+the AVX-512 path. 
 
 Each workload label spells out the exact scales being produced. For
 example:
@@ -86,16 +87,22 @@ Smaller time is better; larger speedup is better.
 
 ### SDR downscale v.s. libswscale
 
-**x86_64 / AVX2**
+**x86_64 / AVX2 & AVX-512**
 
-| Workload | Epyc 7302 (Zen 2) | Xeon 6132 (Skylake) | Xeon E5v4 (Broadwell) |
-|---|---|---|---|
-| 640×360 down:2x                   |    8 µs (14.2×) |    9 µs (13.8×) |   40 µs  (4.8×) |
-| 960×540 down:1.5x,3x              |   55 µs  (9.4×) |   69 µs  (9.3×) |  191 µs  (4.1×) |
-| 1280×720 down:2x,4x               |   51 µs (13.2×) |   81 µs (10.7×) |  162 µs  (6.3×) |
-| 1920×1080 down:1.5x,3x,6x         |  227 µs (12.2×) |  288 µs (11.9×) |  414 µs  (9.8×) |
-| 2560×1440 down:2x,4x,8x           |  249 µs (14.9×) |  384 µs (12.0×) |  501 µs (11.0×) |
-| 3840×2160 down:1.5x,3x,6x,12x     | 1575 µs  (8.4×) | 1523 µs (10.5×) | 1519 µs (12.6×) |
+| Workload | Ryzen 9955HX (Zen 5, AVX-512) | Epyc 7302 (Zen 2, AVX2) | Xeon 6132 (Skylake, AVX2) | Xeon E5v4 (Broadwell, AVX2) |
+|---|---|---|---|---|
+| 640×360 down:2x                   |    4 µs (13.8×) |    8 µs (14.2×) |    9 µs (13.8×) |   40 µs  (4.8×) |
+| 960×540 down:1.5x,3x              |   14 µs (23.1×) |   55 µs  (9.4×) |   69 µs  (9.3×) |  191 µs  (4.1×) |
+| 1280×720 down:2x,4x               |   21 µs (19.2×) |   51 µs (13.2×) |   81 µs (10.7×) |  162 µs  (6.3×) |
+| 1920×1080 down:1.5x,3x,6x         |   56 µs (28.7×) |  227 µs (12.2×) |  288 µs (11.9×) |  414 µs  (9.8×) |
+| 2560×1440 down:2x,4x,8x           |   82 µs (27.2×) |  249 µs (14.9×) |  384 µs (12.0×) |  501 µs (11.0×) |
+| 3840×2160 down:1.5x,3x,6x,12x     |  245 µs (31.9×) | 1575 µs  (8.4×) | 1523 µs (10.5×) | 1519 µs (12.6×) |
+
+The AVX-512 kernels require the F+BW+VL+VBMI feature set (Zen 4 and
+later, Ice Lake and later) and are selected at runtime. The Xeon 6132
+advertises AVX-512 but lacks VBMI, so funnelcake deliberately keeps it
+on the AVX2 kernels - on that generation 512-bit code downclocks the
+core and AVX2 is the faster choice anyway.
 
 **aarch64 / NEON**
 
@@ -110,18 +117,23 @@ Smaller time is better; larger speedup is better.
 
 ### SDR upscale v.s. libswscale
 
-**x86_64 / AVX2**
+**x86_64 / AVX2 & AVX-512**
 
-| Workload | Epyc 7302 (Zen 2) | Xeon 6132 (Skylake) | Xeon E5v4 (Broadwell) |
-|---|---|---|---|
-| 480×270 up:2x                   |   18 µs (15.5×) |   21 µs (14.5×) |   48 µs  (9.8×) |
-| 480×270 up:2x,4x                |   93 µs  (9.8×) |  175 µs  (6.2×) |  226 µs  (7.0×) |
-| 960×540 up:2x                   |   74 µs (13.5×) |  149 µs  (8.0×) |  178 µs  (7.8×) |
-| 960×540 up:2x,3x                |  604 µs  (4.5×) |  682 µs  (4.9×) |  838 µs  (4.7×) |
-| 1920×1080 up:2x                 |  482 µs  (8.4×) |  691 µs  (6.8×) |  671 µs  (8.2×) |
-| 1920×1080 up:1.5x               |  519 µs  (5.3×) |  524 µs  (6.5×) |  706 µs  (5.7×) |
-| 240×136 up:2x,4x,8x,16x         |  706 µs  (3.2×) |  930 µs  (2.7×) |  976 µs  (3.1×) |
-| 120×68 up:2x,4x,8x,16x,32x      |  712 µs  (2.8×) |  931 µs  (2.2×) | 1202 µs  (2.1×) |
+The upscale kernels themselves are AVX2 on every x86 part - the large
+terminal upscale outputs are store-bandwidth bound, so wider vectors
+have nothing to add there - but the AVX-512 column below reflects the
+whole-call timing on that system.
+
+| Workload | Ryzen 9955HX (Zen 5, AVX-512) | Epyc 7302 (Zen 2, AVX2) | Xeon 6132 (Skylake, AVX2) | Xeon E5v4 (Broadwell, AVX2) |
+|---|---|---|---|---|
+| 480×270 up:2x                   |    7 µs (18.3×) |   18 µs (15.5×) |   21 µs (14.5×) |   48 µs  (9.8×) |
+| 480×270 up:2x,4x                |   37 µs (11.4×) |   93 µs  (9.8×) |  175 µs  (6.2×) |  226 µs  (7.0×) |
+| 960×540 up:2x                   |   29 µs (16.6×) |   74 µs (13.5×) |  149 µs  (8.0×) |  178 µs  (7.8×) |
+| 960×540 up:2x,3x                |  238 µs  (5.3×) |  604 µs  (4.5×) |  682 µs  (4.9×) |  838 µs  (4.7×) |
+| 1920×1080 up:2x                 |  119 µs (16.1×) |  482 µs  (8.4×) |  691 µs  (6.8×) |  671 µs  (8.2×) |
+| 1920×1080 up:1.5x               |  208 µs  (6.6×) |  519 µs  (5.3×) |  524 µs  (6.5×) |  706 µs  (5.7×) |
+| 240×136 up:2x,4x,8x,16x         |  164 µs  (5.4×) |  706 µs  (3.2×) |  930 µs  (2.7×) |  976 µs  (3.1×) |
+| 120×68 up:2x,4x,8x,16x,32x      |  166 µs  (4.3×) |  712 µs  (2.8×) |  931 µs  (2.2×) | 1202 µs  (2.1×) |
 
 **aarch64 / NEON**
 
@@ -145,13 +157,13 @@ for a longer discussion.
 
 ### SDR combined downscale + upscale (single pass) v.s. libswscale
 
-**x86_64 / AVX2**
+**x86_64 / AVX2 & AVX-512**
 
-| Workload | Epyc 7302 (Zen 2) | Xeon 6132 (Skylake) | Xeon E5v4 (Broadwell) |
-|---|---|---|---|
-| 1920×1080 down:2x up:2x             |  643 µs (7.7×) |  882 µs (6.7×) |  940 µs (7.4×) |
-| 1920×1080 down:1.5x,3x up:2x        |  889 µs (6.8×) | 1044 µs (7.1×) | 1016 µs (8.2×) |
-| 1280×720 down:2x,4x up:2x,4x        | 2150 µs (3.5×) | 2304 µs (3.6×) | 2191 µs (4.6×) |
+| Workload | Ryzen 9955HX (Zen 5, AVX-512) | Epyc 7302 (Zen 2, AVX2) | Xeon 6132 (Skylake, AVX2) | Xeon E5v4 (Broadwell, AVX2) |
+|---|---|---|---|---|
+| 1920×1080 down:2x up:2x             |  159 µs (15.0×) |  643 µs (7.7×) |  882 µs (6.7×) |  940 µs (7.4×) |
+| 1920×1080 down:1.5x,3x up:2x        |  173 µs (18.0×) |  889 µs (6.8×) | 1044 µs (7.1×) | 1016 µs (8.2×) |
+| 1280×720 down:2x,4x up:2x,4x        |  469 µs  (7.5×) | 2150 µs (3.5×) | 2304 µs (3.6×) | 2191 µs (4.6×) |
 
 **aarch64 / NEON**
 
@@ -168,15 +180,15 @@ numbers are funnelcake's absolute time only. Tone-mapping benchmarks are
 omitted. Tone map correctness is being rewritten and the current timings
 aren't representative.
 
-**x86_64 / AVX2**
+**x86_64 / AVX2 & AVX-512**
 
-| Workload | Epyc 7302 | Xeon 6132 | Xeon E5v4 |
-|---|---|---|---|
-| 1920×1080 I010 down:1.5x,3x,6x        |  395 µs |  441 µs |  664 µs |
-| 3840×2160 I010 down:1.5x,3x,6x,12x    | 2682 µs | 2875 µs | 3976 µs |
-| 3840×2160 P010 down:1.5x,3x,6x,12x    | 3392 µs | 3830 µs | 5510 µs |
-| 1920×1080 I010 up:2x                  | 1899 µs | 2080 µs | 1917 µs |
-| 1920×1080 I010 down:1.5x,3x up:2x     | 2542 µs | 2792 µs | 3035 µs |
+| Workload | Ryzen 9955HX (AVX-512) | Epyc 7302 (AVX2) | Xeon 6132 (AVX2) | Xeon E5v4 (AVX2) |
+|---|---|---|---|---|
+| 1920×1080 I010 down:1.5x,3x,6x        |   88 µs |  395 µs |  441 µs |  664 µs |
+| 3840×2160 I010 down:1.5x,3x,6x,12x    |  707 µs | 2682 µs | 2875 µs | 3976 µs |
+| 3840×2160 P010 down:1.5x,3x,6x,12x    | 1061 µs | 3392 µs | 3830 µs | 5510 µs |
+| 1920×1080 I010 up:2x                  |  475 µs | 1899 µs | 2080 µs | 1917 µs |
+| 1920×1080 I010 down:1.5x,3x up:2x     |  648 µs | 2542 µs | 2792 µs | 3035 µs |
 
 **aarch64 / NEON**
 
@@ -193,11 +205,15 @@ encoders emit natively; the P010 vs I010 gap on the matching 4K
 workload (e.g. 3392 vs 2682 µs on Epyc 7302) is the on-the-fly UV
 deinterleave cost, not a fundamental difference in scaling work.
 
-HDR kernels are roughly 2–4× slower per byte than their SDR
-counterparts because 10-bit samples halve the number of pixels per
-SIMD register and because the weighted blends overflow 16-bit lanes
-at 10-bit precision and must run widened in the 32-bit domain, where
-the rounding steps cost extra add-and-shift work.
+The AVX2 and NEON HDR kernels are roughly 2–4× slower per byte than
+their SDR counterparts because 10-bit samples halve the number of
+pixels per SIMD register and because the weighted blends overflow
+16-bit lanes at 10-bit precision and must run widened in the 32-bit
+domain, where the rounding steps cost extra add-and-shift work. The
+AVX-512 HDR kernels claw most of that back: a 512-bit register restores
+the lane count a 256-bit register has for 8-bit samples, so on the
+Zen 5 column above the HDR rows run much closer to their SDR twins
+(e.g. 88 µs vs 56 µs at the 1080p thirds ladder).
 
 ### Graviton 4 is the standout deployment target
 
@@ -207,7 +223,9 @@ cluster around **15–22× on the pow2 workloads** - the 2× upscales,
 downscale ladders from 1080p through 4K, and single-pass combined
 down+up calls. For comparison, the same set of workloads sits around
 6–12× on Apple M3 Ultra, 7–14× on Raspberry Pi 5, and 5–14× on the
-x86 server CPUs in the tables above. The one exception is the 1.5×
+AVX2 x86 server CPUs in the tables above; among x86 parts only the
+AVX-512 path on Zen 5 (14–32× on those same workloads) plays in the
+same league. The one exception is the 1.5×
 upscale tail (`up:2x,3x`, `up:1.5x`): that kernel is compute-bound on
 every platform and settles at ~5–6× everywhere, Graviton included.
 
@@ -613,7 +631,8 @@ benchmark comparison; without it the library and headers install but
 
 | Platform | SIMD | Notes |
 |----------|------|-------|
-| x86-64 with AVX2 (Linux, macOS, FreeBSD) | AVX2 | Detected at runtime via cpuid |
+| x86-64 with AVX-512 F+BW+VL+VBMI (Zen 4+, Ice Lake+) | AVX-512 | Detected at runtime via cpuid + xgetbv; needs a compiler that accepts the AVX-512 flags (gcc ≥ 8, clang ≥ 7), otherwise the build quietly carries AVX2 as its best tier |
+| x86-64 with AVX2 (Linux, macOS, FreeBSD) | AVX2 | Detected at runtime via cpuid; also used on CPUs whose AVX-512 lacks VBMI (e.g. Skylake-SP, where 512-bit downclocking favors AVX2 anyway) |
 | x86-64 without AVX2 | Scalar | Broadwell and later all have AVX2 |
 | aarch64 (Apple Silicon, AWS Graviton, FreeBSD/arm64) | NEON | All aarch64 cores have NEON |
 | riscv64 with RVV 1.0 (Linux) | RVV | Detected via `riscv_hwprobe`; requires the full V extension and non-emulated misaligned-vector loads |

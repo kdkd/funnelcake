@@ -380,6 +380,14 @@ static const sdr_workload_t k_sdr_workloads[] = {
     /* Thirds down + up combined */
     { "1280x720 down:1.5x,3x up:2x",
       1280, 720, FUSED_SCALE_1_5X | FUSED_SCALE_3X, FUSED_UPSCALE_2X, 0 },
+    /* Full thirds stack at a width that is a multiple of 24 (so nothing
+     * crops) but NOT a multiple of any SIMD chunk size, leaving a partial
+     * chunk at every cascade level on both luma and chroma.  This is the
+     * only workload that exercises the kernels' deep-cascade (6x/12x)
+     * column-tail handling - the benchmark sizes all divide evenly. */
+    { "2904x1632 down:1.5x,3x,6x,12x",
+      2904, 1632, FUSED_SCALE_1_5X | FUSED_SCALE_3X | FUSED_SCALE_6X |
+      FUSED_SCALE_12X, 0, 0 },
 };
 
 typedef struct {
@@ -403,6 +411,10 @@ static const hdr_workload_t k_hdr_workloads[] = {
       1280, 720, FUSED_SCALE_2X, FUSED_UPSCALE_2X, 0 },
     { "1280x720 HDR down:1.5x,3x up:2x",
       1280, 720, FUSED_SCALE_1_5X | FUSED_SCALE_3X, FUSED_UPSCALE_2X, 0 },
+    /* Deep-cascade column-tail coverage; see the SDR twin above. */
+    { "2904x1632 HDR down:1.5x,3x,6x,12x",
+      2904, 1632, FUSED_SCALE_1_5X | FUSED_SCALE_3X | FUSED_SCALE_6X |
+      FUSED_SCALE_12X, 0, 0 },
 };
 
 /* --------------------------------------------------------------------------

@@ -176,9 +176,15 @@ for a longer discussion.
 ### HDR10 (10-bit PQ / HLG)
 
 The bench suite does not include a libswscale HDR comparison path, so HDR
-numbers are funnelcake's absolute time only. Tone-mapping benchmarks are
-omitted while the tone mapping pipeline (correctness rewrite plus x86 and
-NEON SIMD landed, RVV pending) is still settling.
+numbers are funnelcake's absolute time only. Rows marked `tone` produce
+tone-mapped 8-bit SDR outputs at every ladder step, `HDR+tone` produces
+both the 10-bit HDR and the tone-mapped SDR output at each step, and
+`tone 1x` is a source-resolution tone map with no scaling. All of them
+run the full tone-mapping pipeline (PQ-domain tone curve, BT.2020 NCL
+reconstruction, BT.2020→BT.709 gamut conversion, BT.709 re-encode)
+through the SIMD kernels - AVX-512, AVX2, NEON, and RVV all have
+dedicated tone-mapping kernels that match the scalar reference bit for
+bit.
 
 **x86_64 / AVX2 & AVX-512**
 
@@ -189,6 +195,10 @@ NEON SIMD landed, RVV pending) is still settling.
 | 3840×2160 P010 down:1.5x,3x,6x,12x    | 1061 µs | 3392 µs | 3830 µs | 5510 µs |
 | 1920×1080 I010 up:2x                  |  475 µs | 1899 µs | 2080 µs | 1917 µs |
 | 1920×1080 I010 down:1.5x,3x up:2x     |  648 µs | 2542 µs | 2792 µs | 3035 µs |
+| 1920×1080 I010 down:1.5x,3x,6x tone   |  395 µs | 3436 µs | 5008 µs | 4458 µs |
+| 3840×2160 I010 down:1.5x,3x,6x,12x tone | 1913 µs | 17356 µs | 21690 µs | 15036 µs |
+| 1920×1080 I010 down:1.5x,3x,6x HDR+tone |  384 µs | 3424 µs | 4992 µs | 2950 µs |
+| 3840×2160 I010 tone 1x                | 2160 µs | 21020 µs | 30426 µs | 13845 µs |
 
 **aarch64 / NEON**
 
@@ -199,6 +209,10 @@ NEON SIMD landed, RVV pending) is still settling.
 | 3840×2160 P010 down:1.5x,3x,6x,12x    | 3389 µs | 1509 µs | 12379 µs |
 | 1920×1080 I010 up:2x                  |  787 µs |  510 µs |  3068 µs |
 | 1920×1080 I010 down:1.5x,3x up:2x     | 1421 µs |  758 µs |  5140 µs |
+| 1920×1080 I010 down:1.5x,3x,6x tone   | 3017 µs | 1398 µs |  6043 µs |
+| 3840×2160 I010 down:1.5x,3x,6x,12x tone | 12463 µs | 5911 µs | 26633 µs |
+| 1920×1080 I010 down:1.5x,3x,6x HDR+tone | 3025 µs | 1449 µs | 6068 µs |
+| 3840×2160 I010 tone 1x                | 15918 µs | 7909 µs | 26815 µs |
 
 The P010 row uses the Y + interleaved-UV layout that most HEVC Main10
 encoders emit natively; the P010 vs I010 gap on the matching 4K
@@ -277,8 +291,10 @@ specifically.
 | 1920×1080 up:2x                  |  3.1 ms | 138.2× |
 | 1920×1080 down:2x up:2x          |  7.4 ms | 67.9× |
 | 1920×1080 down:1.5x,3x up:2x     |  8.7 ms | 67.3× |
-| 1920×1080 I010 down:1.5x,3x,6x   | 20.3 ms | (no HDR comparison) |
-| 1920×1080 I010 up:2x             |  8.3 ms | (no HDR comparison) |
+| 1920×1080 I010 down:1.5x,3x,6x   | 12.8 ms | (no HDR comparison) |
+| 1920×1080 I010 up:2x             |  7.6 ms | (no HDR comparison) |
+| 1920×1080 I010 down:1.5x,3x,6x tone | 19.5 ms | (no HDR comparison) |
+| 3840×2160 I010 tone 1x           | 46.8 ms | (no HDR comparison) |
 
 HDR speedups land roughly half the SDR ratio because 10-bit u16 elements
 halve the per-vector throughput on the X60's 256-bit V unit.

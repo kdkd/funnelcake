@@ -351,11 +351,40 @@ int fused_simd_available(void);
 
 
 /* --------------------------------------------------------------------------
+ * Quantization range (fused_tonemap_config_t.src_range / dst_range)
+ *
+ * Limited (video/MPEG) range is the default because essentially all real
+ * HDR10/HLG video streams are limited range: 10-bit Y 64..940, chroma
+ * 64..960.  Full (PC/JPEG) range uses the entire code space (0..1023 in,
+ * 0..255 out).  Only the tone mapping stage interprets pixel values, so
+ * these flags have no effect on pure scaling outputs.
+ * -------------------------------------------------------------------------- */
+
+#define FUSED_RANGE_LIMITED 0   /* video range: 10-bit 64..940/960, 8-bit 16..235/240 */
+#define FUSED_RANGE_FULL    1   /* full range: 10-bit 0..1023, 8-bit 0..255            */
+
+
+/* --------------------------------------------------------------------------
  * Tone mapping curve presets (fused_tonemap_config_t.curve)
  *
  * Applied to SDR outputs and the 1:1 tone map output. The LUT is
  * precomputed at init time from the selected curve, peak_nits, and
  * target_nits.
+ *
+ * All built-in curves map [0, peak_nits] smoothly onto the SDR range -
+ * highlights compress progressively rather than clipping, and peak_nits
+ * controls how much headroom the curve reserves.  They differ in look:
+ *
+ *   HABLE    - filmic shoulder/toe.  Preserves the most highlight detail;
+ *              renders midtones noticeably darker than the source
+ *              (about -1 stop at default settings), as filmic curves do.
+ *   REINHARD - extended Reinhard with white point at peak_nits.  Soft,
+ *              lower contrast; midtones at about half the source level.
+ *   BT2390   - ITU-R BT.2390 EETF in PQ space.  Reference broadcast
+ *              behavior: content below the knee (a few tens of nits at
+ *              default settings) passes through at the correct brightness,
+ *              only the top of the range is compressed.  Use this when
+ *              output should track the source as closely as possible.
  * -------------------------------------------------------------------------- */
 
 #define FUSED_TONEMAP_HABLE    0   /* Hable/Uncharted 2 filmic - good default    */
@@ -386,13 +415,20 @@ typedef struct {
 
 /*
  * Tone mapping configuration for SDR outputs.
- * Zero-initialised struct means: Hable curve, 1000-nit peak, 100-nit target.
+ * Zero-initialised struct means: Hable curve, 1000-nit peak, 100-nit target,
+ * limited (video) range in and out.
+ *
+ * Range flags apply to the built-in curves only.  FUSED_TONEMAP_CUSTOM
+ * passes 10-bit codes straight through the caller's LUT, so range handling
+ * is the caller's responsibility there.
  */
 typedef struct {
     int            curve;          /* FUSED_TONEMAP_* preset                    */
     int            peak_nits;      /* source peak brightness (0 = default 1000) */
     int            target_nits;    /* SDR target (0 = default 100)              */
     const uint8_t *custom_lut;     /* 1024-entry Y LUT for FUSED_TONEMAP_CUSTOM */
+    int            src_range;      /* FUSED_RANGE_* of 10-bit input (default limited) */
+    int            dst_range;      /* FUSED_RANGE_* of 8-bit SDR output (default limited) */
 } fused_tonemap_config_t;
 
 /*

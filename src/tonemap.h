@@ -14,14 +14,17 @@
 /* --------------------------------------------------------------------------
  * Tone mapping LUT generation
  *
- * Fills the tone mapping LUT arrays (lut_y, pq_to_linear, linear_to_sdr)
- * inside fused_hdr_internal_t based on the source transfer function and
- * tone mapping configuration.  Called once at init time by fused_hdr_init.
+ * Fills the tone mapping LUT arrays (lut_y, pq_to_sdr, the chroma delta
+ * tables) and the SDR re-encode constants inside fused_hdr_internal_t
+ * based on the source transfer function and tone mapping configuration.
+ * All color science - EOTF, tone curve, SDR OETF, limited/full range -
+ * is folded into the tables here; the per-pixel path is integer-only.
+ * Called once at init time by fused_hdr_init.
  *
  * hdr       : internal state whose LUT arrays will be written.
  * src_transfer : FUSED_TRC_PQ or FUSED_TRC_HLG.
  * tm        : tone mapping configuration (curve preset, peak/target nits,
- *             optional custom LUT pointer).
+ *             src/dst range, optional custom LUT pointer).
  * log_warn  : logging config for diagnostic messages (may be NULL).
  * -------------------------------------------------------------------------- */
 

@@ -519,30 +519,44 @@ typedef struct {
 
     /* Tone mapping LUTs - generated at init from transfer + curve config.
      *
-     * lut_y: 10-bit PQ/HLG input -> 8-bit BT.709 gamma output (1024 entries).
-     *   Used by the luma pass for fast per-pixel tone mapping.
+     * All color science (EOTF, tone curve, SDR OETF, range handling) is
+     * compiled into pq_to_sdr at init.  Per-pixel work is then three
+     * saturating adds and three byte lookups - no floats anywhere.
      *
-     * pq_to_linear: 10-bit PQ code -> linear luminance as float [0, 1]
-     *   where 1.0 = 10000 nits.  Used by the chroma pass to reconstruct
-     *   linear-light R, G, B from YCbCr for correct gamut mapping.
+     * lut_y: 10-bit code -> 8-bit SDR output (1024 entries).  For built-in
+     *   curves this is a copy of pq_to_sdr; for FUSED_TONEMAP_CUSTOM it is
+     *   the caller's LUT.  Used by the custom-LUT luma pass.
      *
-     * linear_to_sdr: linear luminance [0, 1] quantized to 12 bits -> 8-bit
-     *   SDR gamma output.  Incorporates tone curve + BT.709 OETF.
-     *   Indexed by (linear_value * 4095).  Used by the chroma pass to
-     *   tone-map the reconstructed R, G, B channels individually.
+     * pq_to_sdr: 10-bit PQ/HLG code -> 8-bit tone-mapped SDR gamma output.
+     *   Applied per channel: gamma-domain R', G', B' (each Y' + a chroma
+     *   delta, below) index this one shared table.  Per-channel tone
+     *   mapping through one monotonic LUT in PQ space is equivalent to
+     *   per-channel in linear space, and PQ indexing is perceptually
+     *   uniform so shadow resolution is preserved by construction.
      *
-     * pq_to_sdr / pq_*_delta:
-     *   Small derived LUTs for the built-in RGB reconstruction path.  They
-     *   avoid redoing affine chroma index math and R/B tone-map indexing for
-     *   every luma pixel while preserving the same quantization steps as
-     *   pq_to_linear + linear_to_sdr.
+     * pq_*_delta: per-chroma-sample offsets in Y'-code units, from the
+     *   BT.2020 NCL inverse in the gamma domain:
+     *     R' = Y' + 1.4746*Cr            -> pq_r_delta[Cr]
+     *     B' = Y' + 1.8814*Cb            -> pq_b_delta[Cb]
+     *     G' = (Y' - Kr*R' - Kb*B')/Kg
+     *        = Y' - (Kr*1.4746*Cr + Kb*1.8814*Cb)/Kg
+     *                                    -> pq_g_delta_cr[Cr] + pq_g_delta_cb[Cb]
+     *   (using 1 - Kr - Kb = Kg).  Limited/full range scaling between the
+     *   chroma and luma code domains is folded in at init.
      */
     uint8_t  lut_y[1024];
-    float    pq_to_linear[1024];    /* PQ code -> linear [0,1] */
-    uint8_t  linear_to_sdr[4096];   /* linear 12-bit -> 8-bit SDR gamma */
-    uint8_t  pq_to_sdr[1024];       /* PQ code -> SDR via pq_to_linear */
-    int16_t  pq_r_delta[1024];      /* Cr code -> PQ(R) offset from Y */
-    int16_t  pq_b_delta[1024];      /* Cb code -> PQ(B) offset from Y */
+    uint8_t  pq_to_sdr[1024];       /* PQ/HLG code -> tone-mapped SDR */
+    int16_t  pq_r_delta[1024];      /* Cr code -> R' offset from Y' */
+    int16_t  pq_b_delta[1024];      /* Cb code -> B' offset from Y' */
+    int16_t  pq_g_delta_cr[1024];   /* Cr code -> G' offset contribution */
+    int16_t  pq_g_delta_cb[1024];   /* Cb code -> G' offset contribution */
+
+    /* SDR YCbCr re-encode constants, derived from dst_range at init.
+     * cb/cr_out_scale are 8.8 fixed point. */
+    int      cb_out_scale;
+    int      cr_out_scale;
+    int      chroma_out_min;
+    int      chroma_out_max;
 
     /* Temp 10-bit buffers for SDR-only outputs (no HDR output requested
      * at that step, but we need a 10-bit intermediate to tone map from).

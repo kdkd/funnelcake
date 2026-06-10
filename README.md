@@ -177,8 +177,8 @@ for a longer discussion.
 
 The bench suite does not include a libswscale HDR comparison path, so HDR
 numbers are funnelcake's absolute time only. Tone-mapping benchmarks are
-omitted. Tone map correctness is being rewritten and the current timings
-aren't representative.
+omitted while the tone mapping pipeline (correctness rewrite landed,
+SIMD work pending) is still settling.
 
 **x86_64 / AVX2 & AVX-512**
 
@@ -673,10 +673,21 @@ Built-in curves applied to SDR outputs:
 
 | Preset | Description |
 |--------|-------------|
-| `FUSED_TONEMAP_HABLE` | Hable/Uncharted 2 filmic (default) |
-| `FUSED_TONEMAP_REINHARD` | Reinhard global operator |
-| `FUSED_TONEMAP_BT2390` | ITU-R BT.2390 EETF (broadcast reference) |
+| `FUSED_TONEMAP_HABLE` | Hable/Uncharted 2 filmic (default). Most highlight detail; filmic midtone dimming (~-1 stop) |
+| `FUSED_TONEMAP_REINHARD` | Extended Reinhard with white point at `peak_nits`. Soft, lower contrast |
+| `FUSED_TONEMAP_BT2390` | ITU-R BT.2390 EETF in PQ space (broadcast reference). Midtones pass through at correct brightness |
 | `FUSED_TONEMAP_CUSTOM` | Caller-supplied 1024-entry Y LUT |
+
+All built-in curves compress `[0, peak_nits]` smoothly onto the SDR range -
+nothing below the source peak hard-clips. Chroma is reconstructed with the
+exact BT.2020 non-constant-luminance inverse in the gamma domain, gamut-
+converted from BT.2020 to BT.709 primaries, and re-encoded as BT.709 YCbCr.
+
+Input and output quantization ranges are configurable via
+`tonemap.src_range` / `tonemap.dst_range` (`FUSED_RANGE_LIMITED` or
+`FUSED_RANGE_FULL`). The default is limited (video) range on both sides,
+matching real HDR10/HLG streams; set `FUSED_RANGE_FULL` on `dst_range` if
+the consumer expects PC-range 8-bit output.
 
 ### Example: 4K HDR to 1080p HDR + SDR ladder
 

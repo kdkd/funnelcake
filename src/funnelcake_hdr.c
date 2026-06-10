@@ -135,6 +135,17 @@ int fused_hdr_init(fused_hdr_ctx_t *ctx)
         return FUSED_ERR_INVALID_FLAGS;
     }
 
+    if ((ctx->tonemap.src_range != FUSED_RANGE_LIMITED &&
+         ctx->tonemap.src_range != FUSED_RANGE_FULL) ||
+        (ctx->tonemap.dst_range != FUSED_RANGE_LIMITED &&
+         ctx->tonemap.dst_range != FUSED_RANGE_FULL)) {
+        fused_log(&ctx->log_errors, FUSED_LOG_ERROR,
+            "funnelcake-hdr: tonemap src_range=%d/dst_range=%d invalid "
+            "(must be FUSED_RANGE_LIMITED or FUSED_RANGE_FULL)\n",
+            ctx->tonemap.src_range, ctx->tonemap.dst_range);
+        return FUSED_ERR_INVALID_FLAGS;
+    }
+
     /* hdr_flags and sdr_flags must be subsets of requested_flags */
     if (ctx->hdr_flags & ~ctx->requested_flags) {
         fused_log(&ctx->log_errors, FUSED_LOG_ERROR,

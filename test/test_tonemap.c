@@ -557,6 +557,156 @@ static void test_tonemap_e2e_colorbars(void)
 }
 
 /* --------------------------------------------------------------------------
+ * 10. test_tonemap_simd_parity
+ *     The dispatched implementation (AVX-512/AVX2 when available) must
+ *     match the scalar reference bit for bit, for I010 and P010, across
+ *     chunk-multiple and ragged widths, on random data including
+ *     out-of-range codes.  On platforms without a SIMD tone map kernel
+ *     dispatch falls through to scalar and this passes trivially.
+ * -------------------------------------------------------------------------- */
+
+static uint32_t tm_rand(uint32_t *s)
+{
+    *s ^= *s << 13;
+    *s ^= *s >> 17;
+    *s ^= *s << 5;
+    return *s;
+}
+
+static void test_tonemap_simd_parity(void)
+{
+    static const struct { int w, h; } sizes[] = {
+        { 64, 2 },      /* single full chunk, minimum height */
+        { 66, 4 },      /* 1 chunk + 1-sample tail */
+        { 250, 62 },    /* 3 chunks + 29-sample tail */
+        { 1920, 32 },   /* chunk-multiple row */
+    };
+    static const struct { int curve, src_range, dst_range; } cfgs[] = {
+        { FUSED_TONEMAP_HABLE,  FUSED_RANGE_LIMITED, FUSED_RANGE_LIMITED },
+        { FUSED_TONEMAP_BT2390, FUSED_RANGE_FULL,    FUSED_RANGE_FULL    },
+    };
+    uint32_t seed = 0xC0FFEEu;
+
+    for (unsigned si = 0; si < sizeof(sizes) / sizeof(sizes[0]); si++)
+    for (unsigned ci = 0; ci < sizeof(cfgs) / sizeof(cfgs[0]); ci++) {
+        int w = sizes[si].w, h = sizes[si].h;
+        int cw = w / 2, ch = h / 2;
+        /* strides with padding to catch pitch handling */
+        int sy_pitch  = w + 8;            /* uint16 elements */
+        int suv_pitch = w + 8;            /* covers planar (cw) and P010 (2*cw) */
+        int dy_stride  = w + 16;          /* bytes */
+        int duv_stride = cw + 16;
+
+        uint16_t *src_y  = malloc((size_t)sy_pitch * h * 2);
+        uint16_t *src_u  = malloc((size_t)suv_pitch * ch * 2);
+        uint16_t *src_v  = malloc((size_t)suv_pitch * ch * 2);
+        uint16_t *src_uv = malloc((size_t)suv_pitch * ch * 2);
+        uint8_t  *ref_y = malloc((size_t)dy_stride * h);
+        uint8_t  *ref_u = malloc((size_t)duv_stride * ch);
+        uint8_t  *ref_v = malloc((size_t)duv_stride * ch);
+        uint8_t  *got_y = malloc((size_t)dy_stride * h);
+        uint8_t  *got_u = malloc((size_t)duv_stride * ch);
+        uint8_t  *got_v = malloc((size_t)duv_stride * ch);
+        if (!src_y || !src_u || !src_v || !src_uv ||
+            !ref_y || !ref_u || !ref_v || !got_y || !got_u || !got_v) {
+            printf("\n  FAIL [%s:%d] allocation failed\n", __func__, __LINE__);
+            g_results.failed++;
+            return;
+        }
+
+        /* Random data, full 16-bit (both paths mask to 10 bits) */
+        for (int i = 0; i < sy_pitch * h; i++)
+            src_y[i] = (uint16_t)tm_rand(&seed);
+        for (int i = 0; i < suv_pitch * ch; i++) {
+            src_u[i]  = (uint16_t)tm_rand(&seed);
+            src_v[i]  = (uint16_t)tm_rand(&seed);
+            src_uv[i] = (uint16_t)tm_rand(&seed);
+        }
+
+        gen_luts(&g_state, cfgs[ci].curve, 1000, 100, FUSED_TRC_PQ,
+                 cfgs[ci].src_range, cfgs[ci].dst_range);
+
+        int fail = 0;
+
+        /* I010 */
+        memset(ref_y, 0xAA, (size_t)dy_stride * h);
+        memset(got_y, 0x55, (size_t)dy_stride * h);
+        memset(ref_u, 0xAA, (size_t)duv_stride * ch);
+        memset(got_u, 0x55, (size_t)duv_stride * ch);
+        memset(ref_v, 0xAA, (size_t)duv_stride * ch);
+        memset(got_v, 0x55, (size_t)duv_stride * ch);
+        fused_tonemap_apply_scalar(&g_state,
+                                   src_y, sy_pitch * 2,
+                                   src_u, suv_pitch * 2, src_v,
+                                   ref_y, dy_stride, ref_u, duv_stride, ref_v,
+                                   w, h);
+        fused_tonemap_apply(&g_state,
+                            src_y, sy_pitch * 2,
+                            src_u, suv_pitch * 2, src_v,
+                            got_y, dy_stride, got_u, duv_stride, got_v,
+                            w, h);
+        for (int y = 0; y < h && !fail; y++)
+            if (memcmp(ref_y + y * dy_stride, got_y + y * dy_stride, w))
+                fail = 1;
+        for (int y = 0; y < ch && !fail; y++)
+            if (memcmp(ref_u + y * duv_stride, got_u + y * duv_stride, cw) ||
+                memcmp(ref_v + y * duv_stride, got_v + y * duv_stride, cw))
+                fail = 2;
+        if (fail) {
+            printf("\n  FAIL [%s:%d] I010 %dx%d cfg=%u: scalar/SIMD mismatch "
+                   "(plane %s)\n", __func__, __LINE__, w, h, ci,
+                   fail == 1 ? "Y" : "U/V");
+            g_results.failed++;
+            goto cleanup;
+        }
+
+        /* P010 */
+        memset(ref_y, 0xAA, (size_t)dy_stride * h);
+        memset(got_y, 0x55, (size_t)dy_stride * h);
+        memset(ref_u, 0xAA, (size_t)duv_stride * ch);
+        memset(got_u, 0x55, (size_t)duv_stride * ch);
+        memset(ref_v, 0xAA, (size_t)duv_stride * ch);
+        memset(got_v, 0x55, (size_t)duv_stride * ch);
+        fused_tonemap_apply_p010_scalar(&g_state,
+                                        src_y, sy_pitch * 2,
+                                        src_uv, suv_pitch * 2,
+                                        ref_y, dy_stride, ref_u, duv_stride,
+                                        ref_v, w, h);
+        fused_tonemap_apply_p010(&g_state,
+                                 src_y, sy_pitch * 2,
+                                 src_uv, suv_pitch * 2,
+                                 got_y, dy_stride, got_u, duv_stride, got_v,
+                                 w, h);
+        for (int y = 0; y < h && !fail; y++)
+            if (memcmp(ref_y + y * dy_stride, got_y + y * dy_stride, w))
+                fail = 1;
+        for (int y = 0; y < ch && !fail; y++)
+            if (memcmp(ref_u + y * duv_stride, got_u + y * duv_stride, cw) ||
+                memcmp(ref_v + y * duv_stride, got_v + y * duv_stride, cw))
+                fail = 2;
+        if (fail) {
+            printf("\n  FAIL [%s:%d] P010 %dx%d cfg=%u: scalar/SIMD mismatch "
+                   "(plane %s)\n", __func__, __LINE__, w, h, ci,
+                   fail == 1 ? "Y" : "U/V");
+            g_results.failed++;
+            goto cleanup;
+        }
+
+        free(src_y); free(src_u); free(src_v); free(src_uv);
+        free(ref_y); free(ref_u); free(ref_v);
+        free(got_y); free(got_u); free(got_v);
+        continue;
+
+cleanup:
+        free(src_y); free(src_u); free(src_v); free(src_uv);
+        free(ref_y); free(ref_u); free(ref_v);
+        free(got_y); free(got_u); free(got_v);
+        return;
+    }
+    TEST_PASS();
+}
+
+/* --------------------------------------------------------------------------
  * run_tonemap_tests
  * -------------------------------------------------------------------------- */
 
@@ -571,4 +721,5 @@ void run_tonemap_tests(void)
     RUN_TEST(test_tonemap_golden_pixels);
     RUN_TEST(test_tonemap_hue_sanity);
     RUN_TEST(test_tonemap_e2e_colorbars);
+    RUN_TEST(test_tonemap_simd_parity);
 }

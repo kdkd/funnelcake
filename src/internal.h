@@ -551,6 +551,16 @@ typedef struct {
     int16_t  pq_g_delta_cr[1024];   /* Cr code -> G' offset contribution */
     int16_t  pq_g_delta_cb[1024];   /* Cb code -> G' offset contribution */
 
+    /* Q15 coefficients defining the delta tables:
+     *   pq_*_delta[i] = (int16_t)(((i - 512) * coef + (1 << 14)) >> 15)
+     * SIMD kernels evaluate this exact integer form arithmetically
+     * instead of gathering from the tables, so the coefficients are the
+     * single source of truth for scalar/SIMD bit-exactness. */
+    int32_t  delta_coef_r;
+    int32_t  delta_coef_b;
+    int32_t  delta_coef_g_cr;
+    int32_t  delta_coef_g_cb;
+
     /* SDR YCbCr re-encode constants, derived from dst_range at init.
      * cb/cr_out_scale are 8.8 fixed point. */
     int      cb_out_scale;

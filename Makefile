@@ -279,7 +279,7 @@ ifeq ($(UNAME_M),x86_64)
   LIB_SRCS += src/kernels_avx2.c src/kernels_hdr_avx2.c \
               src/kernels_upscale_avx2.c \
               src/kernels_avx512.c src/kernels_hdr_avx512.c \
-              src/kernels_upscale_avx512.c
+              src/kernels_upscale_avx512.c src/tonemap_avx512.c
 else ifeq ($(UNAME_M),aarch64)
   LIB_SRCS += src/kernels_neon.c src/kernels_hdr_neon.c \
               src/kernels_upscale_neon.c
@@ -397,9 +397,10 @@ ifeq ($(UNAME_M),x86_64)
   # the per-file flags the real objects are built with.
   ifeq ($(CC_HAS_AVX512),1)
     ASM_SRCS += src/kernels_avx512.c src/kernels_hdr_avx512.c \
-                src/kernels_upscale_avx512.c
+                src/kernels_upscale_avx512.c src/tonemap_avx512.c
   endif
-  src/kernels_avx512.S src/kernels_hdr_avx512.S src/kernels_upscale_avx512.S: \
+  src/kernels_avx512.S src/kernels_hdr_avx512.S src/kernels_upscale_avx512.S \
+  src/tonemap_avx512.S: \
     ASM_ARCH_CFLAGS = $(AVX512_KERNEL_CFLAGS)
 else ifeq ($(UNAME_M),aarch64)
   ASM_ARCH_CFLAGS =
@@ -598,6 +599,9 @@ src/kernels_hdr_avx512.o: src/kernels_hdr_avx512.c
 	$(CC) $(LIB_CFLAGS) $(AVX512_KERNEL_CFLAGS) -c -o $@ $<
 
 src/kernels_upscale_avx512.o: src/kernels_upscale_avx512.c
+	$(CC) $(LIB_CFLAGS) $(AVX512_KERNEL_CFLAGS) -c -o $@ $<
+
+src/tonemap_avx512.o: src/tonemap_avx512.c
 	$(CC) $(LIB_CFLAGS) $(AVX512_KERNEL_CFLAGS) -c -o $@ $<
 
 src/kernels_neon.o: src/kernels_neon.c

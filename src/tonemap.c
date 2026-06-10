@@ -349,12 +349,20 @@ void fused_tonemap_generate_luts(fused_hdr_internal_t *hdr,
         double g_cr = -(BT2020_KR / BT2020_KG) * NCL_CR_SCALE; /* -0.5714 */
         double g_cb = -(BT2020_KB / BT2020_KG) * NCL_CB_SCALE; /* -0.1646 */
 
+        /* Q15 coefficients are the canonical definition; tables and SIMD
+         * kernels both evaluate ((i-512)*coef + 16384) >> 15 so the two
+         * paths agree bit for bit. */
+        hdr->delta_coef_r    = (int32_t)floor(NCL_CR_SCALE * k * 32768.0 + 0.5);
+        hdr->delta_coef_b    = (int32_t)floor(NCL_CB_SCALE * k * 32768.0 + 0.5);
+        hdr->delta_coef_g_cr = (int32_t)floor(g_cr * k * 32768.0 + 0.5);
+        hdr->delta_coef_g_cb = (int32_t)floor(g_cb * k * 32768.0 + 0.5);
+
         for (int i = 0; i < 1024; i++) {
-            double c = (double)(i - 512) * k;
-            hdr->pq_r_delta[i]    = (int16_t)floor(NCL_CR_SCALE * c + 0.5);
-            hdr->pq_b_delta[i]    = (int16_t)floor(NCL_CB_SCALE * c + 0.5);
-            hdr->pq_g_delta_cr[i] = (int16_t)floor(g_cr * c + 0.5);
-            hdr->pq_g_delta_cb[i] = (int16_t)floor(g_cb * c + 0.5);
+            int x = i - 512;
+            hdr->pq_r_delta[i]    = (int16_t)((x * hdr->delta_coef_r    + 16384) >> 15);
+            hdr->pq_b_delta[i]    = (int16_t)((x * hdr->delta_coef_b    + 16384) >> 15);
+            hdr->pq_g_delta_cr[i] = (int16_t)((x * hdr->delta_coef_g_cr + 16384) >> 15);
+            hdr->pq_g_delta_cb[i] = (int16_t)((x * hdr->delta_coef_g_cb + 16384) >> 15);
         }
     }
 
@@ -667,19 +675,57 @@ void fused_tonemap_apply(
     }
 
     /* ------------------------------------------------------------------ */
-    /* Built-in curves: RGB reconstruction and tone mapping per luma       */
-    /* pixel, then BT.709 YCbCr re-encode.  Chroma is nearest-neighbor     */
-    /* shared across each 2x2 luma block, and U/V are written from the     */
-    /* block's top-left reconstructed RGB, matching the previous sampling  */
-    /* position while avoiding a second reconstruction pass.                */
+    /* Built-in curves: SIMD when available, scalar otherwise.             */
     /* ------------------------------------------------------------------ */
 
-    /* Process one 4:2:0 block at a time.  The previous implementation did
-     * a full luma-resolution RGB reconstruction pass, then revisited the
-     * top-left pixel of each 2x2 block for chroma.  Doing chroma while that
-     * top-left reconstruction is already hot removes one expensive
-     * tonemap_pixel_rgb() call per chroma sample without changing the
-     * sampling position used for U/V. */
+#if defined(__x86_64__)
+    if (fused_detect_cpu()->has_avx512 && fused_tonemap_avx512_compiled()) {
+        fused_tonemap_apply_avx512(state, src_y, src_y_stride,
+                                   src_u, src_uv_stride, src_v,
+                                   dst_y, dst_y_stride,
+                                   dst_u, dst_uv_stride, dst_v,
+                                   width, height);
+        return;
+    }
+#endif
+
+    fused_tonemap_apply_scalar(state, src_y, src_y_stride,
+                               src_u, src_uv_stride, src_v,
+                               dst_y, dst_y_stride,
+                               dst_u, dst_uv_stride, dst_v,
+                               width, height);
+}
+
+
+/* --------------------------------------------------------------------------
+ * fused_tonemap_apply_scalar - built-in-curve reference path
+ *
+ * RGB reconstruction and tone mapping per luma pixel, then BT.709 YCbCr
+ * re-encode.  Chroma is nearest-neighbor shared across each 2x2 luma
+ * block, and U/V are written from the block's top-left reconstructed RGB.
+ * The SIMD kernels replicate this integer pipeline bit for bit; parity
+ * tests compare against this function.
+ * -------------------------------------------------------------------------- */
+
+__attribute__((hot))
+void fused_tonemap_apply_scalar(
+    const fused_hdr_internal_t *state,
+    const uint16_t *src_y,  int src_y_stride,
+    const uint16_t *src_u,  int src_uv_stride,
+    const uint16_t *src_v,
+    uint8_t *dst_y, int dst_y_stride,
+    uint8_t *dst_u, int dst_uv_stride,
+    uint8_t *dst_v,
+    int width, int height)
+{
+    int chroma_w = width  / 2;
+    int chroma_h = height / 2;
+
+    int src_y_pitch  = src_y_stride  / (int)sizeof(uint16_t);
+    int src_uv_pitch = src_uv_stride / (int)sizeof(uint16_t);
+
+    /* Process one 4:2:0 block at a time, doing chroma while the top-left
+     * reconstruction is hot. */
     for (int cy = 0; cy < chroma_h; cy++) {
         const uint16_t *su = src_u + cy * src_uv_pitch;
         const uint16_t *sv = src_v + cy * src_uv_pitch;
@@ -781,6 +827,45 @@ void fused_tonemap_apply_p010(
         }
         return;
     }
+
+#if defined(__x86_64__)
+    if (fused_detect_cpu()->has_avx512 && fused_tonemap_avx512_compiled()) {
+        fused_tonemap_apply_p010_avx512(state, src_y, src_y_stride,
+                                        src_uv, src_uv_stride,
+                                        dst_y, dst_y_stride,
+                                        dst_u, dst_uv_stride, dst_v,
+                                        width, height);
+        return;
+    }
+#endif
+
+    fused_tonemap_apply_p010_scalar(state, src_y, src_y_stride,
+                                    src_uv, src_uv_stride,
+                                    dst_y, dst_y_stride,
+                                    dst_u, dst_uv_stride, dst_v,
+                                    width, height);
+}
+
+
+/* --------------------------------------------------------------------------
+ * fused_tonemap_apply_p010_scalar - built-in-curve reference path (P010)
+ * -------------------------------------------------------------------------- */
+
+__attribute__((hot))
+void fused_tonemap_apply_p010_scalar(
+    const fused_hdr_internal_t *state,
+    const uint16_t *src_y,  int src_y_stride,
+    const uint16_t *src_uv, int src_uv_stride,
+    uint8_t *dst_y, int dst_y_stride,
+    uint8_t *dst_u, int dst_uv_stride,
+    uint8_t *dst_v,
+    int width, int height)
+{
+    int chroma_w = width  / 2;
+    int chroma_h = height / 2;
+
+    int src_y_pitch  = src_y_stride  / (int)sizeof(uint16_t);
+    int src_uv_pitch = src_uv_stride / (int)sizeof(uint16_t);
 
     for (int cy = 0; cy < chroma_h; cy++) {
         const uint16_t *suv = src_uv + cy * src_uv_pitch;

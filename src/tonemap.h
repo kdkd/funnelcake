@@ -80,4 +80,60 @@ void fused_tonemap_apply_p010(
     int width, int height);
 
 
+/* --------------------------------------------------------------------------
+ * Built-in-curve implementations behind the dispatch above.
+ *
+ * The scalar functions are the reference; SIMD kernels must match them bit
+ * for bit (the whole pipeline is integer LUTs and fixed-point dots, so
+ * exact parity is achievable and enforced by tests).
+ * -------------------------------------------------------------------------- */
+
+void fused_tonemap_apply_scalar(
+    const fused_hdr_internal_t *state,
+    const uint16_t *src_y,  int src_y_stride,
+    const uint16_t *src_u,  int src_uv_stride,
+    const uint16_t *src_v,
+    uint8_t *dst_y, int dst_y_stride,
+    uint8_t *dst_u, int dst_uv_stride,
+    uint8_t *dst_v,
+    int width, int height);
+
+void fused_tonemap_apply_p010_scalar(
+    const fused_hdr_internal_t *state,
+    const uint16_t *src_y,  int src_y_stride,
+    const uint16_t *src_uv, int src_uv_stride,
+    uint8_t *dst_y, int dst_y_stride,
+    uint8_t *dst_u, int dst_uv_stride,
+    uint8_t *dst_v,
+    int width, int height);
+
+#if defined(__x86_64__)
+
+/* AVX-512 (VBMI) kernels in tonemap_avx512.c.  Self-stubbed when the
+ * compiler lacks AVX-512 support: fused_tonemap_avx512_compiled() returns
+ * 0 and the entry points delegate to the scalar reference. */
+
+int fused_tonemap_avx512_compiled(void);
+
+void fused_tonemap_apply_avx512(
+    const fused_hdr_internal_t *state,
+    const uint16_t *src_y,  int src_y_stride,
+    const uint16_t *src_u,  int src_uv_stride,
+    const uint16_t *src_v,
+    uint8_t *dst_y, int dst_y_stride,
+    uint8_t *dst_u, int dst_uv_stride,
+    uint8_t *dst_v,
+    int width, int height);
+
+void fused_tonemap_apply_p010_avx512(
+    const fused_hdr_internal_t *state,
+    const uint16_t *src_y,  int src_y_stride,
+    const uint16_t *src_uv, int src_uv_stride,
+    uint8_t *dst_y, int dst_y_stride,
+    uint8_t *dst_u, int dst_uv_stride,
+    uint8_t *dst_v,
+    int width, int height);
+
+#endif /* __x86_64__ */
+
 #endif /* FUNNELCAKE_TONEMAP_H */

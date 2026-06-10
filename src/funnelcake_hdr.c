@@ -682,12 +682,19 @@ hdr_tail_done:
     memset(&ctx->output_1x, 0, sizeof(fused_scale_output_t));
 
     if (ctx->tonemap_1x) {
-        int y_stride  = stride_for(eff_w);
-        int uv_stride = stride_for(eff_w / 2);
-        int chroma_h  = eff_h / 2;
+        /* The 1:1 tone map reads the source frame directly and has no
+         * cascade divisor constraints, so it is NOT subject to
+         * crop-to-fit: it covers the full source frame even when the
+         * scaled outputs are cropped (src dims are already validated
+         * even, which is all the tone map needs). */
+        int w_1x = ctx->src_width;
+        int h_1x = ctx->src_height;
+        int y_stride  = stride_for(w_1x);
+        int uv_stride = stride_for(w_1x / 2);
+        int chroma_h  = h_1x / 2;
 
         void *py = NULL, *pu = NULL, *pv = NULL;
-        if (fused_alloc_aligned(&py, 32, (size_t)y_stride  * (size_t)eff_h)    != 0 ||
+        if (fused_alloc_aligned(&py, 32, (size_t)y_stride  * (size_t)h_1x)     != 0 ||
             fused_alloc_aligned(&pu, 32, (size_t)uv_stride * (size_t)chroma_h) != 0 ||
             fused_alloc_aligned(&pv, 32, (size_t)uv_stride * (size_t)chroma_h) != 0) {
             free(py); free(pu); free(pv);
@@ -699,8 +706,8 @@ hdr_tail_done:
             return FUSED_ERR_NO_STEPS;
         }
 
-        ctx->output_1x.width     = eff_w;
-        ctx->output_1x.height    = eff_h;
+        ctx->output_1x.width     = w_1x;
+        ctx->output_1x.height    = h_1x;
         ctx->output_1x.y_stride  = y_stride;
         ctx->output_1x.uv_stride = uv_stride;
         ctx->output_1x.plane_y   = (uint8_t *)py;
@@ -1050,7 +1057,7 @@ void fused_hdr_run(fused_hdr_ctx_t *ctx,
                 ctx->output_1x.plane_y, ctx->output_1x.y_stride,
                 ctx->output_1x.plane_u, ctx->output_1x.uv_stride,
                 ctx->output_1x.plane_v,
-                ctx->effective_width, ctx->effective_height);
+                ctx->src_width, ctx->src_height);
         } else {
             fused_tonemap_apply(state,
                 src_y, ctx->src_y_stride,
@@ -1059,7 +1066,7 @@ void fused_hdr_run(fused_hdr_ctx_t *ctx,
                 ctx->output_1x.plane_y, ctx->output_1x.y_stride,
                 ctx->output_1x.plane_u, ctx->output_1x.uv_stride,
                 ctx->output_1x.plane_v,
-                ctx->effective_width, ctx->effective_height);
+                ctx->src_width, ctx->src_height);
         }
     }
 }

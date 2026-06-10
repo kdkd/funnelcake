@@ -947,6 +947,60 @@ static void test_hdr_p010_tonemap_1x(void)
 }
 
 /* --------------------------------------------------------------------------
+ * 13b. test_hdr_tonemap_1x_not_cropped
+ *      tonemap_1x combined with a ladder that triggers crop-to-fit
+ *      (1920x1080 with a pow2 8x ladder crops the effective area to
+ *      1920x1072).  The 1:1 tone map reads the source directly, so its
+ *      output must cover the full source frame - including the rows the
+ *      scaled outputs crop away.
+ * -------------------------------------------------------------------------- */
+
+static void test_hdr_tonemap_1x_not_cropped(void)
+{
+    test_hdr_frame_t frame;
+    int r = test_hdr_frame_create(&frame, 1920, 1080, PATTERN_RANDOM, 0xC0FFEEu);
+    TEST_ASSERT(r == 0, "test_hdr_frame_create failed");
+
+    fused_hdr_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.src_width      = frame.width;
+    ctx.src_height     = frame.height;
+    ctx.src_y_stride   = frame.y_stride;
+    ctx.src_uv_stride  = frame.uv_stride;
+    ctx.src_format     = FUSED_PIX_I010;
+    ctx.src_transfer   = FUSED_TRC_PQ;
+    ctx.requested_flags = FUSED_SCALE_2X | FUSED_SCALE_4X | FUSED_SCALE_8X;
+    ctx.hdr_flags      = FUSED_SCALE_2X | FUSED_SCALE_4X | FUSED_SCALE_8X;
+    ctx.tonemap_1x     = 1;
+    suppress_log(&ctx);
+
+    int rc = fused_hdr_init(&ctx);
+    TEST_ASSERT(rc >= 0, "init should succeed");
+    /* The ladder is cropped... */
+    TEST_ASSERT_EQ(ctx.hdr_outputs[1].height, 536, "2x output height = 1072/2");
+    /* ...but the 1:1 tone map is not. */
+    TEST_ASSERT_EQ(ctx.output_1x.width,  1920, "output_1x.width = 1920");
+    TEST_ASSERT_EQ(ctx.output_1x.height, 1080, "output_1x.height = 1080");
+
+    fused_hdr_run(&ctx, frame.plane_y, frame.plane_u, frame.plane_v);
+
+    /* The bottom row (one of the rows crop-to-fit discards from the
+     * ladder) must have been written by the tone map. */
+    const uint8_t *last_row = ctx.output_1x.plane_y
+        + (size_t)(ctx.output_1x.height - 1) * (size_t)ctx.output_1x.y_stride;
+    int found_nonzero = 0;
+    for (int x = 0; x < ctx.output_1x.width && !found_nonzero; x++) {
+        if (last_row[x] != 0)
+            found_nonzero = 1;
+    }
+    TEST_ASSERT(found_nonzero, "last source row should be tone-mapped");
+
+    fused_hdr_free(&ctx);
+    test_hdr_frame_free(&frame);
+    TEST_PASS();
+}
+
+/* --------------------------------------------------------------------------
  * 14. test_hdr_p010_upscale
  *     P010 callers pass interleaved UV as src_u and NULL src_v. HDR upscale
  *     must deinterleave chroma before scaling rather than reading src_v.
@@ -1190,6 +1244,7 @@ void run_hdr_correctness_tests(void)
     RUN_TEST(test_hdr_double_free_safety);
     RUN_TEST(test_hdr_non_standard_correctness);
     RUN_TEST(test_hdr_p010_tonemap_1x);
+    RUN_TEST(test_hdr_tonemap_1x_not_cropped);
     RUN_TEST(test_hdr_p010_upscale);
 
     /* HDR upscale tests */

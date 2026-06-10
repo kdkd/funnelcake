@@ -210,6 +210,10 @@ static void hdr_bench_i010(const hdr_bench_entry_t *e)
             else                                      any_simd = 1;
         }
     }
+    if (ctx.output_1x.plane_y != NULL) {
+        if (ctx.output_1x.fallback) any_scalar = 1;
+        else                        any_simd = 1;
+    }
     const char *kernel_tag = (any_simd && !any_scalar) ? "SIMD  " :
                              (!any_simd && any_scalar)  ? "scalar" :
                                                           "mixed ";
@@ -300,12 +304,20 @@ static void hdr_bench_p010(const hdr_bench_entry_t *e)
             if (ctx.hdr_outputs[b].fallback) any_scalar = 1;
             else                              any_simd = 1;
         }
+        if (ctx.sdr_outputs[b].plane_y != NULL) {
+            if (ctx.sdr_outputs[b].fallback) any_scalar = 1;
+            else                              any_simd = 1;
+        }
     }
     for (int b = 0; b < FUSED_MAX_UPSCALE_STEPS; b++) {
         if (ctx.upscale_hdr_outputs[b].plane_y != NULL) {
             if (ctx.upscale_hdr_outputs[b].fallback) any_scalar = 1;
             else                                      any_simd = 1;
         }
+    }
+    if (ctx.output_1x.plane_y != NULL) {
+        if (ctx.output_1x.fallback) any_scalar = 1;
+        else                        any_simd = 1;
     }
     const char *kernel_tag = (any_simd && !any_scalar) ? "SIMD  " :
                              (!any_simd && any_scalar)  ? "scalar" :

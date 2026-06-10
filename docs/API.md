@@ -1067,15 +1067,24 @@ struct member. Zero-initialise before use.
 | `hdr_outputs[8]` | `fused_hdr_output_t` | 10-bit downscale outputs. Slots not in `achieved_hdr_flags` have NULL planes. |
 | `sdr_outputs[8]` | `fused_scale_output_t` | 8-bit tone-mapped downscale outputs. Slots not in `achieved_sdr_flags` have NULL planes. |
 | `output_1x` | `fused_scale_output_t` | 8-bit tone-mapped output at source resolution. Only valid if `tonemap_1x` was set. |
-| `upscale_hdr_outputs[6]` | `fused_hdr_output_t` | 10-bit upscale outputs, indexed by `FUSED_UP_IDX_*`. HDR only - no SDR or tone-mapping path is applied to upscale outputs. |
+| `upscale_hdr_outputs[6]` | `fused_hdr_output_t` | 10-bit upscale outputs, indexed by `FUSED_UP_IDX_*`. |
+| `upscale_sdr_flags` | `uint32_t` | Subset of `upscale_flags`: levels that should also produce an 8-bit tone-mapped SDR copy. |
+| `upscale_sdr_tail_1_5x` | `int` | 1 to also produce an SDR copy of the 1.5x tail (requires `upscale_tail_1_5x`). |
+| `achieved_upscale_sdr_flags` | `uint32_t` | SDR upscale copies that will be produced. |
+| `achieved_upscale_sdr_tail` | `int` | 1 if the SDR tail copy will be produced. |
+| `upscale_sdr_outputs[6]` | `fused_scale_output_t` | 8-bit tone-mapped upscale copies, indexed by `FUSED_UP_IDX_*`. Slots not achieved have NULL planes. |
 
 The `_internal` field is opaque; do not read or write it.
 
-**HDR upscale** produces 10-bit outputs only. Unlike the downscale path,
-there is no parallel SDR or tone-mapping stage on upscale: `hdr_flags`
-and `sdr_flags` do not affect upscale outputs. If you need an SDR
-tone-mapped upscale copy, apply it in a separate pass on the resulting
-`upscale_hdr_outputs` plane.
+**HDR upscale** always produces 10-bit outputs; `hdr_flags` and
+`sdr_flags` do not affect upscale outputs. To additionally get an SDR
+tone-mapped copy of an upscale level, set the level's bit in
+`upscale_sdr_flags` (and/or `upscale_sdr_tail_1_5x` for the tail). SDR
+copies are tone-mapped from the level's 10-bit planes at the upscaled
+resolution - the same scale-in-10-bit-then-tone-map order as the
+downscale SDR outputs - and use the shared `tonemap` configuration.
+Because the copy is made from the 10-bit output, each requested SDR
+level must also be present in `upscale_flags`.
 
 
 ## Input Pixel Formats

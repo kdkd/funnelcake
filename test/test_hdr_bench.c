@@ -57,8 +57,10 @@ typedef struct {
     int         want_sdr;     /* produce SDR (tone-mapped) outputs */
     int         is_p010;      /* use P010 format instead of I010 */
     int         tonemap_1x;   /* special: 1:1 tonemap only */
-    uint32_t    up_flags;     /* upscale flags (HDR only, no tonemapping) */
+    uint32_t    up_flags;     /* upscale flags (10-bit HDR outputs)       */
     int         up_tail;      /* 1.5x tail                                */
+    int         up_sdr;       /* also produce tone-mapped SDR copies of
+                               * every upscale level (and tail)           */
 } hdr_bench_entry_t;
 
 /* Label format:
@@ -76,73 +78,79 @@ static const hdr_bench_entry_t hdr_bench_configs[] = {
     /* Resolution sweeps -- I010 HDR-only downscale */
     { "640x360 I010 down:2x HDR",                   640,  360,
       FUSED_SCALE_2X,
-      1, 0, 0, 0, 0, 0 },
+      1, 0, 0, 0, 0, 0, 0 },
     { "960x540 I010 down:1.5x,3x HDR",              960,  540,
       FUSED_SCALE_1_5X | FUSED_SCALE_3X,
-      1, 0, 0, 0, 0, 0 },
+      1, 0, 0, 0, 0, 0, 0 },
     { "1280x720 I010 down:2x,4x HDR",              1280,  720,
       FUSED_SCALE_2X | FUSED_SCALE_4X,
-      1, 0, 0, 0, 0, 0 },
+      1, 0, 0, 0, 0, 0, 0 },
     { "1920x1080 I010 down:1.5x,3x,6x HDR",        1920, 1080,
       FUSED_SCALE_1_5X | FUSED_SCALE_3X | FUSED_SCALE_6X,
-      1, 0, 0, 0, 0, 0 },
+      1, 0, 0, 0, 0, 0, 0 },
     { "2560x1440 I010 down:2x,4x,8x HDR",          2560, 1440,
       FUSED_SCALE_2X | FUSED_SCALE_4X | FUSED_SCALE_8X,
-      1, 0, 0, 0, 0, 0 },
+      1, 0, 0, 0, 0, 0, 0 },
     { "3840x2160 I010 down:1.5x,3x,6x,12x HDR",    3840, 2160,
       FUSED_SCALE_1_5X | FUSED_SCALE_3X | FUSED_SCALE_6X | FUSED_SCALE_12X,
-      1, 0, 0, 0, 0, 0 },
+      1, 0, 0, 0, 0, 0, 0 },
 
     /* SDR-only (includes HDR->SDR tonemapping cost) */
     { "1920x1080 I010 down:1.5x,3x,6x tone",       1920, 1080,
       FUSED_SCALE_1_5X | FUSED_SCALE_3X | FUSED_SCALE_6X,
-      0, 1, 0, 0, 0, 0 },
+      0, 1, 0, 0, 0, 0, 0 },
     { "3840x2160 I010 down:1.5x,3x,6x,12x tone",   3840, 2160,
       FUSED_SCALE_1_5X | FUSED_SCALE_3X | FUSED_SCALE_6X | FUSED_SCALE_12X,
-      0, 1, 0, 0, 0, 0 },
+      0, 1, 0, 0, 0, 0, 0 },
 
     /* HDR + SDR (both output types produced, SDR is tonemapped) */
     { "1920x1080 I010 down:1.5x,3x,6x HDR+tone",   1920, 1080,
       FUSED_SCALE_1_5X | FUSED_SCALE_3X | FUSED_SCALE_6X,
-      1, 1, 0, 0, 0, 0 },
+      1, 1, 0, 0, 0, 0, 0 },
 
     /* P010 input format overhead measurement */
     { "3840x2160 P010 down:1.5x,3x,6x,12x HDR",    3840, 2160,
       FUSED_SCALE_1_5X | FUSED_SCALE_3X | FUSED_SCALE_6X | FUSED_SCALE_12X,
-      1, 0, 1, 0, 0, 0 },
+      1, 0, 1, 0, 0, 0, 0 },
 
     /* 1:1 tonemap only - no scaling */
     { "3840x2160 I010 tone 1x",                    3840, 2160,
       0,
-      0, 0, 0, 1, 0, 0 },
+      0, 0, 0, 1, 0, 0, 0 },
 
     /* HDR upscale-only (no tonemapping). */
     { "480x270 I010 up:2x HDR",                     480,  270,
-      0, 1, 0, 0, 0, FUSED_UPSCALE_2X, 0 },
+      0, 1, 0, 0, 0, FUSED_UPSCALE_2X, 0, 0 },
     { "480x270 I010 up:2x,4x HDR",                  480,  270,
-      0, 1, 0, 0, 0, FUSED_UPSCALE_2X|FUSED_UPSCALE_4X, 0 },
+      0, 1, 0, 0, 0, FUSED_UPSCALE_2X|FUSED_UPSCALE_4X, 0, 0 },
     { "960x540 I010 up:2x HDR",                     960,  540,
-      0, 1, 0, 0, 0, FUSED_UPSCALE_2X, 0 },
+      0, 1, 0, 0, 0, FUSED_UPSCALE_2X, 0, 0 },
     { "960x540 I010 up:2x,3x HDR",                  960,  540,
-      0, 1, 0, 0, 0, FUSED_UPSCALE_2X, 1 },
+      0, 1, 0, 0, 0, FUSED_UPSCALE_2X, 1, 0 },
     { "1920x1080 I010 up:2x HDR",                  1920, 1080,
-      0, 1, 0, 0, 0, FUSED_UPSCALE_2X, 0 },
+      0, 1, 0, 0, 0, FUSED_UPSCALE_2X, 0, 0 },
     { "1920x1080 I010 up:1.5x HDR",                1920, 1080,
-      0, 1, 0, 0, 0, 0,                1 },
+      0, 1, 0, 0, 0, 0,                1, 0 },
     { "240x136 I010 up:2x,4x,8x,16x HDR",           240,  136,
       0, 1, 0, 0, 0,
-      FUSED_UPSCALE_2X|FUSED_UPSCALE_4X|FUSED_UPSCALE_8X|FUSED_UPSCALE_16X, 0 },
+      FUSED_UPSCALE_2X|FUSED_UPSCALE_4X|FUSED_UPSCALE_8X|FUSED_UPSCALE_16X, 0, 0 },
     { "120x68 I010 up:2x,4x,8x,16x,32x HDR",        120,   68,
-      0, 1, 0, 0, 0, FUSED_UPSCALE_POW2_MASK, 0 },
+      0, 1, 0, 0, 0, FUSED_UPSCALE_POW2_MASK, 0, 0 },
+
+    /* Upscale with tone-mapped SDR copies (10-bit HDR + 8-bit SDR out) */
+    { "1920x1080 I010 up:2x HDR+tone",             1920, 1080,
+      0, 1, 0, 0, 0, FUSED_UPSCALE_2X, 0, 1 },
+    { "480x270 I010 up:2x,4x HDR+tone",             480,  270,
+      0, 1, 0, 0, 0, FUSED_UPSCALE_2X|FUSED_UPSCALE_4X, 0, 1 },
 
     /* HDR combined down + up - single-pass stress tests, HDR only */
     { "1920x1080 I010 down:2x up:2x HDR",          1920, 1080,
-      FUSED_SCALE_2X, 1, 0, 0, 0, FUSED_UPSCALE_2X, 0 },
+      FUSED_SCALE_2X, 1, 0, 0, 0, FUSED_UPSCALE_2X, 0, 0 },
     { "1920x1080 I010 down:1.5x,3x up:2x HDR",     1920, 1080,
-      FUSED_SCALE_1_5X|FUSED_SCALE_3X, 1, 0, 0, 0, FUSED_UPSCALE_2X, 0 },
+      FUSED_SCALE_1_5X|FUSED_SCALE_3X, 1, 0, 0, 0, FUSED_UPSCALE_2X, 0, 0 },
     { "1280x720 I010 down:2x,4x up:2x,4x HDR",     1280,  720,
       FUSED_SCALE_2X|FUSED_SCALE_4X, 1, 0, 0, 0,
-      FUSED_UPSCALE_2X|FUSED_UPSCALE_4X, 0 },
+      FUSED_UPSCALE_2X|FUSED_UPSCALE_4X, 0, 0 },
 };
 
 #define HDR_BENCH_CONFIG_COUNT ((int)(sizeof(hdr_bench_configs) / sizeof(hdr_bench_configs[0])))
@@ -183,6 +191,8 @@ static void hdr_bench_i010(const hdr_bench_entry_t *e)
     }
     ctx.upscale_flags     = e->up_flags;
     ctx.upscale_tail_1_5x = e->up_tail;
+    ctx.upscale_sdr_flags     = e->up_sdr ? e->up_flags : 0;
+    ctx.upscale_sdr_tail_1_5x = e->up_sdr ? e->up_tail : 0;
     suppress_log(&ctx);
 
     int rc = fused_hdr_init(&ctx);
@@ -207,6 +217,12 @@ static void hdr_bench_i010(const hdr_bench_entry_t *e)
     for (int b = 0; b < FUSED_MAX_UPSCALE_STEPS; b++) {
         if (ctx.upscale_hdr_outputs[b].plane_y != NULL) {
             if (ctx.upscale_hdr_outputs[b].fallback) any_scalar = 1;
+            else                                      any_simd = 1;
+        }
+    }
+    for (int b = 0; b < FUSED_MAX_UPSCALE_STEPS; b++) {
+        if (ctx.upscale_sdr_outputs[b].plane_y != NULL) {
+            if (ctx.upscale_sdr_outputs[b].fallback) any_scalar = 1;
             else                                      any_simd = 1;
         }
     }
@@ -288,6 +304,8 @@ static void hdr_bench_p010(const hdr_bench_entry_t *e)
     ctx.sdr_flags       = e->want_sdr ? e->flags : 0;
     ctx.upscale_flags     = e->up_flags;
     ctx.upscale_tail_1_5x = e->up_tail;
+    ctx.upscale_sdr_flags     = e->up_sdr ? e->up_flags : 0;
+    ctx.upscale_sdr_tail_1_5x = e->up_sdr ? e->up_tail : 0;
     suppress_log(&ctx);
 
     int rc = fused_hdr_init(&ctx);
@@ -312,6 +330,12 @@ static void hdr_bench_p010(const hdr_bench_entry_t *e)
     for (int b = 0; b < FUSED_MAX_UPSCALE_STEPS; b++) {
         if (ctx.upscale_hdr_outputs[b].plane_y != NULL) {
             if (ctx.upscale_hdr_outputs[b].fallback) any_scalar = 1;
+            else                                      any_simd = 1;
+        }
+    }
+    for (int b = 0; b < FUSED_MAX_UPSCALE_STEPS; b++) {
+        if (ctx.upscale_sdr_outputs[b].plane_y != NULL) {
+            if (ctx.upscale_sdr_outputs[b].fallback) any_scalar = 1;
             else                                      any_simd = 1;
         }
     }

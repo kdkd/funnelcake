@@ -478,14 +478,26 @@ typedef struct {
     fused_scale_output_t sdr_outputs[8];  /* 8-bit;  NULL planes if not in sdr_flags */
     fused_scale_output_t output_1x;       /* 8-bit tone-mapped at source res         */
 
-    /* Upscale configuration and results - HDR-only for this iteration.
-     * No tone-mapping is applied to upscale outputs; they are 10-bit HDR
-     * copies scaled from the 10-bit HDR source. */
+    /* Upscale configuration and results.  Upscale outputs are 10-bit HDR
+     * copies scaled from the 10-bit source.  Each achieved level (and the
+     * 1.5x tail) can additionally produce an 8-bit tone-mapped SDR copy:
+     * set the level's bit in upscale_sdr_flags (must be a subset of
+     * upscale_flags - the 10-bit output exists either way) and/or
+     * upscale_sdr_tail_1_5x (requires upscale_tail_1_5x).  SDR upscale
+     * copies are tone-mapped from the level's 10-bit planes at the
+     * upscaled resolution - the same scale-in-10-bit-then-tone-map order
+     * as the downscale SDR outputs. */
     uint32_t upscale_flags;             /* FUSED_UPSCALE_* contiguous prefix mask  */
     int      upscale_tail_1_5x;         /* 0 or 1: append 1.5x tail output         */
+    uint32_t upscale_sdr_flags;         /* subset of upscale_flags: also produce
+                                         * tone-mapped SDR copies of these levels  */
+    int      upscale_sdr_tail_1_5x;     /* 0 or 1: SDR copy of the 1.5x tail       */
     uint32_t achieved_upscale_flags;    /* written by init                         */
     int      achieved_upscale_tail;     /* written by init                         */
-    fused_hdr_output_t upscale_hdr_outputs[FUSED_MAX_UPSCALE_STEPS];
+    uint32_t achieved_upscale_sdr_flags;/* written by init                         */
+    int      achieved_upscale_sdr_tail; /* written by init                         */
+    fused_hdr_output_t   upscale_hdr_outputs[FUSED_MAX_UPSCALE_STEPS];
+    fused_scale_output_t upscale_sdr_outputs[FUSED_MAX_UPSCALE_STEPS];
 
     /* Internal - opaque, managed by init/free; do not read or write */
     void *_internal;

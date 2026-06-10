@@ -303,6 +303,71 @@ static void test_hdr_tonemap_1x(void)
 }
 
 /* --------------------------------------------------------------------------
+ * 9b. test_hdr_upscale_sdr_flags
+ *     upscale_sdr_flags must be a subset of upscale_flags, and the SDR
+ *     tail copy requires the HDR tail; valid requests allocate 8-bit
+ *     outputs at the upscaled dimensions.
+ * -------------------------------------------------------------------------- */
+
+static void test_hdr_upscale_sdr_flags(void)
+{
+    fused_hdr_ctx_t ctx;
+
+    /* (a) SDR level without the matching 10-bit level */
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.src_width      = 1920;
+    ctx.src_height     = 1080;
+    ctx.src_y_stride   = align_up_32(1920 * 2);
+    ctx.src_uv_stride  = align_up_32(960 * 2);
+    ctx.src_format     = FUSED_PIX_I010;
+    ctx.src_transfer   = FUSED_TRC_PQ;
+    ctx.upscale_flags     = FUSED_UPSCALE_2X;
+    ctx.upscale_sdr_flags = FUSED_UPSCALE_2X | FUSED_UPSCALE_4X;
+    suppress_log(&ctx);
+    TEST_ASSERT_EQ(fused_hdr_init(&ctx), FUSED_ERR_INVALID_FLAGS,
+                   "upscale_sdr_flags not subset -> FUSED_ERR_INVALID_FLAGS");
+
+    /* (b) SDR tail without the HDR tail */
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.src_width      = 1920;
+    ctx.src_height     = 1080;
+    ctx.src_y_stride   = align_up_32(1920 * 2);
+    ctx.src_uv_stride  = align_up_32(960 * 2);
+    ctx.src_format     = FUSED_PIX_I010;
+    ctx.src_transfer   = FUSED_TRC_PQ;
+    ctx.upscale_flags         = FUSED_UPSCALE_2X;
+    ctx.upscale_sdr_tail_1_5x = 1;
+    suppress_log(&ctx);
+    TEST_ASSERT_EQ(fused_hdr_init(&ctx), FUSED_ERR_INVALID_FLAGS,
+                   "SDR tail without HDR tail -> FUSED_ERR_INVALID_FLAGS");
+
+    /* (c) valid: SDR copy of the 2x level at upscaled dimensions */
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.src_width      = 1920;
+    ctx.src_height     = 1080;
+    ctx.src_y_stride   = align_up_32(1920 * 2);
+    ctx.src_uv_stride  = align_up_32(960 * 2);
+    ctx.src_format     = FUSED_PIX_I010;
+    ctx.src_transfer   = FUSED_TRC_PQ;
+    ctx.upscale_flags     = FUSED_UPSCALE_2X;
+    ctx.upscale_sdr_flags = FUSED_UPSCALE_2X;
+    suppress_log(&ctx);
+    int rc = fused_hdr_init(&ctx);
+    TEST_ASSERT(rc >= 0, "init should succeed");
+    TEST_ASSERT_EQ((int)ctx.achieved_upscale_sdr_flags, (int)FUSED_UPSCALE_2X,
+                   "achieved_upscale_sdr_flags = 2x");
+    TEST_ASSERT(ctx.upscale_sdr_outputs[0].plane_y != NULL,
+                "upscale_sdr_outputs[0].plane_y != NULL");
+    TEST_ASSERT_EQ(ctx.upscale_sdr_outputs[0].width,  3840,
+                   "SDR upscale width = 3840");
+    TEST_ASSERT_EQ(ctx.upscale_sdr_outputs[0].height, 2160,
+                   "SDR upscale height = 2160");
+
+    fused_hdr_free(&ctx);
+    TEST_PASS();
+}
+
+/* --------------------------------------------------------------------------
  * 10. test_hdr_flags_not_subset
  *     sdr_flags has bits not in requested_flags -> FUSED_ERR_INVALID_FLAGS
  * -------------------------------------------------------------------------- */
@@ -890,6 +955,7 @@ void run_hdr_validation_tests(void)
     RUN_TEST(test_hdr_sdr_only);
     RUN_TEST(test_hdr_hdr_only);
     RUN_TEST(test_hdr_tonemap_1x);
+    RUN_TEST(test_hdr_upscale_sdr_flags);
     RUN_TEST(test_hdr_flags_not_subset);
     RUN_TEST(test_hdr_invalid_format);
     RUN_TEST(test_hdr_invalid_transfer);

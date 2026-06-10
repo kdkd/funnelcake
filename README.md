@@ -16,8 +16,9 @@ prohibitively slow.
 The 8-bit SDR path accepts I420 planar (separate Y, U, V planes), 8-bit
 unsigned. The 10-bit HDR path accepts I010, P010, I210, and P210 formats
 and can produce both HDR and tone-mapped SDR outputs at each downscale
-step. Upscaling is available in both paths; upscale outputs on the HDR
-path are 10-bit only (no tone-mapping stage).
+step. Upscaling is available in both paths; HDR upscale outputs are
+10-bit, with an optional tone-mapped 8-bit SDR copy per upscale level
+(`upscale_sdr_flags`).
 
 
 ## How it works

@@ -1001,6 +1001,69 @@ static void test_hdr_tonemap_1x_not_cropped(void)
 }
 
 /* --------------------------------------------------------------------------
+ * 13c. test_hdr_upscale_sdr
+ *      Tone-mapped SDR copies of upscale outputs.  With a solid-color
+ *      source, every scaling step is exact (all blends of equal values),
+ *      so the SDR upscale copy must be uniform and bit-identical to the
+ *      tonemap_1x output of the same frame - both are the same tone map
+ *      of the same color, just at different resolutions.
+ * -------------------------------------------------------------------------- */
+
+static void test_hdr_upscale_sdr(void)
+{
+    test_hdr_frame_t frame;
+    int r = test_hdr_frame_create(&frame, 64, 64, PATTERN_SOLID, 0);
+    TEST_ASSERT(r == 0, "test_hdr_frame_create failed");
+
+    fused_hdr_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.src_width      = frame.width;
+    ctx.src_height     = frame.height;
+    ctx.src_y_stride   = frame.y_stride;
+    ctx.src_uv_stride  = frame.uv_stride;
+    ctx.src_format     = FUSED_PIX_I010;
+    ctx.src_transfer   = FUSED_TRC_PQ;
+    ctx.upscale_flags     = FUSED_UPSCALE_2X;
+    ctx.upscale_sdr_flags = FUSED_UPSCALE_2X;
+    ctx.tonemap_1x     = 1;
+    suppress_log(&ctx);
+
+    int rc = fused_hdr_init(&ctx);
+    TEST_ASSERT(rc >= 0, "init should succeed");
+    TEST_ASSERT_EQ(ctx.upscale_sdr_outputs[0].width,  128, "SDR up width = 128");
+    TEST_ASSERT_EQ(ctx.upscale_sdr_outputs[0].height, 128, "SDR up height = 128");
+
+    fused_hdr_run(&ctx, frame.plane_y, frame.plane_u, frame.plane_v);
+
+    const fused_scale_output_t *up = &ctx.upscale_sdr_outputs[0];
+    uint8_t want_y = ctx.output_1x.plane_y[0];
+    uint8_t want_u = ctx.output_1x.plane_u[0];
+    uint8_t want_v = ctx.output_1x.plane_v[0];
+
+    int bad = 0;
+    for (int y = 0; y < up->height && !bad; y++) {
+        const uint8_t *row = up->plane_y + (size_t)y * (size_t)up->y_stride;
+        for (int x = 0; x < up->width; x++) {
+            if (row[x] != want_y) { bad = 1; break; }
+        }
+    }
+    TEST_ASSERT(!bad, "SDR upscale luma uniform and equal to tonemap_1x");
+
+    for (int y = 0; y < up->height / 2 && !bad; y++) {
+        const uint8_t *ru = up->plane_u + (size_t)y * (size_t)up->uv_stride;
+        const uint8_t *rv = up->plane_v + (size_t)y * (size_t)up->uv_stride;
+        for (int x = 0; x < up->width / 2; x++) {
+            if (ru[x] != want_u || rv[x] != want_v) { bad = 1; break; }
+        }
+    }
+    TEST_ASSERT(!bad, "SDR upscale chroma uniform and equal to tonemap_1x");
+
+    fused_hdr_free(&ctx);
+    test_hdr_frame_free(&frame);
+    TEST_PASS();
+}
+
+/* --------------------------------------------------------------------------
  * 14. test_hdr_p010_upscale
  *     P010 callers pass interleaved UV as src_u and NULL src_v. HDR upscale
  *     must deinterleave chroma before scaling rather than reading src_v.
@@ -1245,6 +1308,7 @@ void run_hdr_correctness_tests(void)
     RUN_TEST(test_hdr_non_standard_correctness);
     RUN_TEST(test_hdr_p010_tonemap_1x);
     RUN_TEST(test_hdr_tonemap_1x_not_cropped);
+    RUN_TEST(test_hdr_upscale_sdr);
     RUN_TEST(test_hdr_p010_upscale);
 
     /* HDR upscale tests */

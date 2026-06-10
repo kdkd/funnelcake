@@ -579,6 +579,13 @@ typedef struct {
     /* Which outputs need tone mapping after scaling */
     uint32_t sdr_flags;
     int      tonemap_1x;
+
+    /* Achieved SDR upscale copies: bit k = pow2 level k (2^(k+1) x
+     * enlargement), bit FUSED_UP_IDX_TAIL = the 1.5x tail.  The run loop
+     * tone-maps upscale_hdr_outputs[k] into upscale_sdr_outputs[k] for
+     * each set bit. */
+    uint32_t upscale_sdr_levels;
+
     int      is_custom_lut;  /* 1 if using FUSED_TONEMAP_CUSTOM (skip RGB chroma path) */
 } fused_hdr_internal_t;
 

@@ -74,6 +74,7 @@
 # define fused_vaaddu_vv_u16m1(a, b, vl)       __riscv_vaaddu_vv_u16m1((a), (b), (vl))
 # define fused_vnclipu_wx_u8m1(s, sh, vl)      __riscv_vnclipu_wx_u8m1((s), (sh), (vl))
 # define fused_vnclipu_wx_u16m1(s, sh, vl)     __riscv_vnclipu_wx_u16m1((s), (sh), (vl))
+# define fused_vsmul_vx_i16m1(a, b, vl)        __riscv_vsmul_vx_i16m1((a), (b), (vl))
 #else
 /* v1.0+ - vxrm is a per-instruction argument; the global CSR write is a no-op. */
 # define FUSED_RVV_SET_VXRM_RNU()              ((void)0)
@@ -81,6 +82,7 @@
 # define fused_vaaddu_vv_u16m1(a, b, vl)       __riscv_vaaddu_vv_u16m1((a), (b), __RISCV_VXRM_RNU, (vl))
 # define fused_vnclipu_wx_u8m1(s, sh, vl)      __riscv_vnclipu_wx_u8m1((s), (sh), __RISCV_VXRM_RNU, (vl))
 # define fused_vnclipu_wx_u16m1(s, sh, vl)     __riscv_vnclipu_wx_u16m1((s), (sh), __RISCV_VXRM_RNU, (vl))
+# define fused_vsmul_vx_i16m1(a, b, vl)        __riscv_vsmul_vx_i16m1((a), (b), __RISCV_VXRM_RNU, (vl))
 #endif
 
 /* --------------------------------------------------------------------------

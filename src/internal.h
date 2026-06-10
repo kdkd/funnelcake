@@ -551,11 +551,14 @@ typedef struct {
     int16_t  pq_g_delta_cr[1024];   /* Cr code -> G' offset contribution */
     int16_t  pq_g_delta_cb[1024];   /* Cb code -> G' offset contribution */
 
-    /* Q15 coefficients defining the delta tables:
-     *   pq_*_delta[i] = (int16_t)(((i - 512) * coef + (1 << 14)) >> 15)
+    /* Q10 coefficients defining the delta tables:
+     *   pq_*_delta[i] = (int16_t)(((i - 512) * coef + (1 << 9)) >> 10)
      * SIMD kernels evaluate this exact integer form arithmetically
      * instead of gathering from the tables, so the coefficients are the
-     * single source of truth for scalar/SIMD bit-exactness. */
+     * single source of truth for scalar/SIMD bit-exactness.  Q10 keeps
+     * every coefficient inside int16, so the kernels evaluate the form
+     * as one 16-bit rounding multiply-high of (x << 5):
+     *   pmulhrsw / vqrdmulh / vsmul@RNU == ((x*32)*coef + 16384) >> 15. */
     int32_t  delta_coef_r;
     int32_t  delta_coef_b;
     int32_t  delta_coef_g_cr;

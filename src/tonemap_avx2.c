@@ -19,7 +19,7 @@
  * "several-x", not "order-of-magnitude", win over scalar; it exists for
  * the AVX2-only fleet where that still halves the dominant HDR cost.
  *
- * Everything else follows the scalar reference exactly: Q15 chroma
+ * Everything else follows the scalar reference exactly: Q10 chroma
  * deltas evaluated arithmetically from state->delta_coef_* (the same
  * integer form the scalar tables are generated from), index clamps and
  * the luma dot in 16-bit (modular; max value 65408), chroma-rate gamut
@@ -74,52 +74,31 @@ tm_lut16_avx2(const uint8_t *lut, __m256i idx_words)
 }
 
 /* -----------------------------------------------------------------------
- * Q15 delta evaluation for 16 chroma codes (words) -> 16 deltas (words).
- *   delta = ((code - 512) * coef + 16384) >> 15
+ * Q10 delta evaluation for 16 chroma codes (words) -> 16 deltas (words).
+ *
+ * pmulhrsw of (code - 512) << 5 by the Q10 coefficient computes
+ *   ((x*32) * coef + 16384) >> 15  ==  (x*coef + 512) >> 10
+ * which is exactly the scalar table definition, entirely in 16-bit.
  * ----------------------------------------------------------------------- */
 
 static inline __attribute__((always_inline)) __m256i
 tm_delta16_avx2(__m256i codes, __m256i coef)
 {
-    __m256i c512 = _mm256_set1_epi32(512);
-    __m256i bias = _mm256_set1_epi32(16384);
-    __m256i x0 = _mm256_sub_epi32(
-        _mm256_cvtepu16_epi32(_mm256_castsi256_si128(codes)), c512);
-    __m256i x1 = _mm256_sub_epi32(
-        _mm256_cvtepu16_epi32(_mm256_extracti128_si256(codes, 1)), c512);
-    __m256i d0 = _mm256_srai_epi32(
-        _mm256_add_epi32(_mm256_mullo_epi32(x0, coef), bias), 15);
-    __m256i d1 = _mm256_srai_epi32(
-        _mm256_add_epi32(_mm256_mullo_epi32(x1, coef), bias), 15);
-    /* values fit int16; packssdw is exact, vpermq fixes lane order */
-    return _mm256_permute4x64_epi64(_mm256_packs_epi32(d0, d1), 0xD8);
+    __m256i x = _mm256_slli_epi16(
+        _mm256_sub_epi16(codes, _mm256_set1_epi16(512)), 5);
+    return _mm256_mulhrs_epi16(x, coef);
 }
 
-/* dG needs the 32-bit sum of both contributions before narrowing. */
+/* dG = g_cr(Cr) + g_cb(Cb): each term rounds exactly like its scalar
+ * table entry, and the sum (magnitude < 1024) stays in 16-bit. */
 static inline __attribute__((always_inline)) __m256i
 tm_delta16_g_avx2(__m256i cb, __m256i cr, __m256i gcb, __m256i gcr)
 {
-    __m256i c512 = _mm256_set1_epi32(512);
-    __m256i bias = _mm256_set1_epi32(16384);
-    __m256i xb0 = _mm256_sub_epi32(
-        _mm256_cvtepu16_epi32(_mm256_castsi256_si128(cb)), c512);
-    __m256i xb1 = _mm256_sub_epi32(
-        _mm256_cvtepu16_epi32(_mm256_extracti128_si256(cb, 1)), c512);
-    __m256i xr0 = _mm256_sub_epi32(
-        _mm256_cvtepu16_epi32(_mm256_castsi256_si128(cr)), c512);
-    __m256i xr1 = _mm256_sub_epi32(
-        _mm256_cvtepu16_epi32(_mm256_extracti128_si256(cr, 1)), c512);
-    __m256i d0 = _mm256_add_epi32(
-        _mm256_srai_epi32(_mm256_add_epi32(
-            _mm256_mullo_epi32(xr0, gcr), bias), 15),
-        _mm256_srai_epi32(_mm256_add_epi32(
-            _mm256_mullo_epi32(xb0, gcb), bias), 15));
-    __m256i d1 = _mm256_add_epi32(
-        _mm256_srai_epi32(_mm256_add_epi32(
-            _mm256_mullo_epi32(xr1, gcr), bias), 15),
-        _mm256_srai_epi32(_mm256_add_epi32(
-            _mm256_mullo_epi32(xb1, gcb), bias), 15));
-    return _mm256_permute4x64_epi64(_mm256_packs_epi32(d0, d1), 0xD8);
+    __m256i c512 = _mm256_set1_epi16(512);
+    __m256i xb = _mm256_slli_epi16(_mm256_sub_epi16(cb, c512), 5);
+    __m256i xr = _mm256_slli_epi16(_mm256_sub_epi16(cr, c512), 5);
+    return _mm256_add_epi16(_mm256_mulhrs_epi16(xr, gcr),
+                            _mm256_mulhrs_epi16(xb, gcb));
 }
 
 /* -----------------------------------------------------------------------
@@ -250,12 +229,15 @@ tm_chunk_avx2(const fused_hdr_internal_t *state,
         cr = _mm256_and_si256(_mm256_loadu_si256((const __m256i *)sv), mask10);
     }
 
-    /* ---- Q15 deltas at chroma rate ---- */
-    __m256i dr = tm_delta16_avx2(cr, _mm256_set1_epi32(state->delta_coef_r));
-    __m256i db = tm_delta16_avx2(cb, _mm256_set1_epi32(state->delta_coef_b));
-    __m256i dg = tm_delta16_g_avx2(cb, cr,
-                                   _mm256_set1_epi32(state->delta_coef_g_cb),
-                                   _mm256_set1_epi32(state->delta_coef_g_cr));
+    /* ---- Q10 deltas at chroma rate ---- */
+    __m256i dr = tm_delta16_avx2(
+        cr, _mm256_set1_epi16((short)state->delta_coef_r));
+    __m256i db = tm_delta16_avx2(
+        cb, _mm256_set1_epi16((short)state->delta_coef_b));
+    __m256i dg = tm_delta16_g_avx2(
+        cb, cr,
+        _mm256_set1_epi16((short)state->delta_coef_g_cb),
+        _mm256_set1_epi16((short)state->delta_coef_g_cr));
 
     /* ---- expand to luma rate: 16 words -> 2x16 duplicated words ----
      * vpermq 0xD8 makes each 128-bit lane hold the right source words,

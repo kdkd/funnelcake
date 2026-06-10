@@ -18,7 +18,7 @@
  * resident (NEON has 32), so a vqtbl4q chain would reload four table
  * registers per 64-byte group per channel - far more memory traffic
  * than the lookups themselves.  Instead this kernel vectorizes all the
- * arithmetic (Q15 chroma deltas, index clamps, luma dot, chroma-rate
+ * arithmetic (Q10 chroma deltas, index clamps, luma dot, chroma-rate
  * gamut/encode dots) and performs the three byte lookups per pixel as
  * scalar L1 loads through small stack buffers.  Apple and Neoverse
  * cores sustain 3+ loads per cycle with deep out-of-order windows, so
@@ -26,7 +26,7 @@
  * same idiom the custom-LUT luma pass (tonemap_luma_neon) already uses.
  *
  * All arithmetic uses the scalar reference's widths and shifts: deltas
- * evaluated from the shared Q15 coefficients (state->delta_coef_*), the
+ * evaluated from the shared Q10 coefficients (state->delta_coef_*), the
  * luma dot in modular 16-bit (max value 65408), chroma dots in 32-bit.
  * Bit-exactness against fused_tonemap_apply_scalar is enforced by the
  * parity test.
@@ -46,47 +46,34 @@
 #include <arm_neon.h>
 
 /* -----------------------------------------------------------------------
- * Q15 delta evaluation for 8 chroma codes (one uint16x8) -> 8 deltas.
- *   delta = ((code - 512) * coef + 16384) >> 15
+ * Q10 delta evaluation for 8 chroma codes (one uint16x8) -> 8 deltas.
+ *
+ * vqrdmulh of (code - 512) << 5 by the Q10 coefficient computes
+ *   ((x*32) * coef + 16384) >> 15  ==  (x*coef + 512) >> 10
+ * which is exactly the scalar table definition, entirely in 16-bit.
+ * (The saturating case of vqrdmulh needs both operands at -32768;
+ * x << 5 never goes below -16384, so it cannot fire.)
  * ----------------------------------------------------------------------- */
 
 static inline __attribute__((always_inline)) int16x8_t
-tm_delta8_neon(uint16x8_t codes, int32x4_t coef)
+tm_delta8_neon(uint16x8_t codes, int16x8_t coef)
 {
-    int32x4_t c512 = vdupq_n_s32(512);
-    int32x4_t bias = vdupq_n_s32(16384);
-    int32x4_t x_lo = vsubq_s32(
-        vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(codes))), c512);
-    int32x4_t x_hi = vsubq_s32(
-        vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(codes))), c512);
-    int32x4_t d_lo = vshrq_n_s32(
-        vaddq_s32(vmulq_s32(x_lo, coef), bias), 15);
-    int32x4_t d_hi = vshrq_n_s32(
-        vaddq_s32(vmulq_s32(x_hi, coef), bias), 15);
-    return vcombine_s16(vmovn_s32(d_lo), vmovn_s32(d_hi));
+    int16x8_t x = vshlq_n_s16(
+        vsubq_s16(vreinterpretq_s16_u16(codes), vdupq_n_s16(512)), 5);
+    return vqrdmulhq_s16(x, coef);
 }
 
-/* dG needs the 32-bit sum of both contributions before narrowing. */
+/* dG = g_cr(Cr) + g_cb(Cb): each term rounds exactly like its scalar
+ * table entry, and the sum (magnitude < 1024) stays in 16-bit. */
 static inline __attribute__((always_inline)) int16x8_t
-tm_delta8_g_neon(uint16x8_t cb, uint16x8_t cr, int32x4_t gcb, int32x4_t gcr)
+tm_delta8_g_neon(uint16x8_t cb, uint16x8_t cr, int16x8_t gcb, int16x8_t gcr)
 {
-    int32x4_t c512 = vdupq_n_s32(512);
-    int32x4_t bias = vdupq_n_s32(16384);
-    int32x4_t xb_lo = vsubq_s32(
-        vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(cb))), c512);
-    int32x4_t xb_hi = vsubq_s32(
-        vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(cb))), c512);
-    int32x4_t xr_lo = vsubq_s32(
-        vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(cr))), c512);
-    int32x4_t xr_hi = vsubq_s32(
-        vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(cr))), c512);
-    int32x4_t d_lo = vaddq_s32(
-        vshrq_n_s32(vaddq_s32(vmulq_s32(xr_lo, gcr), bias), 15),
-        vshrq_n_s32(vaddq_s32(vmulq_s32(xb_lo, gcb), bias), 15));
-    int32x4_t d_hi = vaddq_s32(
-        vshrq_n_s32(vaddq_s32(vmulq_s32(xr_hi, gcr), bias), 15),
-        vshrq_n_s32(vaddq_s32(vmulq_s32(xb_hi, gcb), bias), 15));
-    return vcombine_s16(vmovn_s32(d_lo), vmovn_s32(d_hi));
+    int16x8_t c512 = vdupq_n_s16(512);
+    int16x8_t xb = vshlq_n_s16(
+        vsubq_s16(vreinterpretq_s16_u16(cb), c512), 5);
+    int16x8_t xr = vshlq_n_s16(
+        vsubq_s16(vreinterpretq_s16_u16(cr), c512), 5);
+    return vaddq_s16(vqrdmulhq_s16(xr, gcr), vqrdmulhq_s16(xb, gcb));
 }
 
 /* -----------------------------------------------------------------------
@@ -218,12 +205,15 @@ tm_chunk_neon(const fused_hdr_internal_t *state,
         cr = vandq_u16(vld1q_u16(sv), mask10);
     }
 
-    /* ---- Q15 deltas at chroma rate ---- */
-    int16x8_t dr = tm_delta8_neon(cr, vdupq_n_s32(state->delta_coef_r));
-    int16x8_t db = tm_delta8_neon(cb, vdupq_n_s32(state->delta_coef_b));
-    int16x8_t dg = tm_delta8_g_neon(cb, cr,
-                                    vdupq_n_s32(state->delta_coef_g_cb),
-                                    vdupq_n_s32(state->delta_coef_g_cr));
+    /* ---- Q10 deltas at chroma rate ---- */
+    int16x8_t dr = tm_delta8_neon(
+        cr, vdupq_n_s16((int16_t)state->delta_coef_r));
+    int16x8_t db = tm_delta8_neon(
+        cb, vdupq_n_s16((int16_t)state->delta_coef_b));
+    int16x8_t dg = tm_delta8_g_neon(
+        cb, cr,
+        vdupq_n_s16((int16_t)state->delta_coef_g_cb),
+        vdupq_n_s16((int16_t)state->delta_coef_g_cr));
 
     /* ---- expand to luma rate: zip with itself duplicates each word ---- */
     int16x8_t dr0 = vzip1q_s16(dr, dr), dr1 = vzip2q_s16(dr, dr);

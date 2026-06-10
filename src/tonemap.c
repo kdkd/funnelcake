@@ -349,20 +349,26 @@ void fused_tonemap_generate_luts(fused_hdr_internal_t *hdr,
         double g_cr = -(BT2020_KR / BT2020_KG) * NCL_CR_SCALE; /* -0.5714 */
         double g_cb = -(BT2020_KB / BT2020_KG) * NCL_CB_SCALE; /* -0.1646 */
 
-        /* Q15 coefficients are the canonical definition; tables and SIMD
-         * kernels both evaluate ((i-512)*coef + 16384) >> 15 so the two
-         * paths agree bit for bit. */
-        hdr->delta_coef_r    = (int32_t)floor(NCL_CR_SCALE * k * 32768.0 + 0.5);
-        hdr->delta_coef_b    = (int32_t)floor(NCL_CB_SCALE * k * 32768.0 + 0.5);
-        hdr->delta_coef_g_cr = (int32_t)floor(g_cr * k * 32768.0 + 0.5);
-        hdr->delta_coef_g_cb = (int32_t)floor(g_cb * k * 32768.0 + 0.5);
+        /* Q10 coefficients are the canonical definition; tables and SIMD
+         * kernels both evaluate ((i-512)*coef + 512) >> 10 so the two
+         * paths agree bit for bit.  Q10 keeps even the largest
+         * coefficient (1.8814, full range) inside int16, which lets the
+         * SIMD kernels evaluate the whole delta as one 16-bit rounding
+         * multiply-high (pmulhrsw / vqrdmulh / vsmul) of (x << 5) by the
+         * coefficient:
+         *   ((x*32) * coef + 16384) >> 15  ==  (x*coef + 512) >> 10
+         * exactly, for either sign. */
+        hdr->delta_coef_r    = (int32_t)floor(NCL_CR_SCALE * k * 1024.0 + 0.5);
+        hdr->delta_coef_b    = (int32_t)floor(NCL_CB_SCALE * k * 1024.0 + 0.5);
+        hdr->delta_coef_g_cr = (int32_t)floor(g_cr * k * 1024.0 + 0.5);
+        hdr->delta_coef_g_cb = (int32_t)floor(g_cb * k * 1024.0 + 0.5);
 
         for (int i = 0; i < 1024; i++) {
             int x = i - 512;
-            hdr->pq_r_delta[i]    = (int16_t)((x * hdr->delta_coef_r    + 16384) >> 15);
-            hdr->pq_b_delta[i]    = (int16_t)((x * hdr->delta_coef_b    + 16384) >> 15);
-            hdr->pq_g_delta_cr[i] = (int16_t)((x * hdr->delta_coef_g_cr + 16384) >> 15);
-            hdr->pq_g_delta_cb[i] = (int16_t)((x * hdr->delta_coef_g_cb + 16384) >> 15);
+            hdr->pq_r_delta[i]    = (int16_t)((x * hdr->delta_coef_r    + 512) >> 10);
+            hdr->pq_b_delta[i]    = (int16_t)((x * hdr->delta_coef_b    + 512) >> 10);
+            hdr->pq_g_delta_cr[i] = (int16_t)((x * hdr->delta_coef_g_cr + 512) >> 10);
+            hdr->pq_g_delta_cb[i] = (int16_t)((x * hdr->delta_coef_g_cb + 512) >> 10);
         }
     }
 

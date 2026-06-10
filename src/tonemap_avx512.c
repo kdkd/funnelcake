@@ -15,7 +15,7 @@
  * The scalar pipeline was deliberately restructured so this kernel is
  * one big in-register table lookup:
  *
- *   per chroma sample:  dR, dB, dG = Q15 linear functions of (Cb, Cr)
+ *   per chroma sample:  dR, dB, dG = Q10 linear functions of (Cb, Cr)
  *   per luma pixel:     R'G'B' = clamp(Y' + d{R,G,B}) -> pq_to_sdr[1024]
  *                       Y_out  = (67r + 174g + 15b + 128) >> 8
  *   per 2x2 block:      gamut rows + BT.709 encode dots on the top-left
@@ -28,7 +28,7 @@
  * per 64 lookups per channel.
  *
  * The chroma deltas are NOT gathered: they are evaluated arithmetically
- * from the same Q15 coefficients the scalar LUT generator uses
+ * from the same Q10 coefficients the scalar LUT generator uses
  * (state->delta_coef_*), which is both cheaper than a 16-bit gather and
  * the mechanism that keeps scalar and SIMD bit-exact.  All remaining
  * arithmetic uses the same widths and shifts as the scalar reference:
@@ -139,27 +139,6 @@ tm_lut_1024(const __m512i *t, __m512i idx_lo, __m512i idx_hi)
     __m512i m03 = _mm512_mask_blend_epi8(b1, m01, m23);
     __m512i m47 = _mm512_mask_blend_epi8(b1, m45, m67);
     return _mm512_mask_blend_epi8(b2, m03, m47);
-}
-
-/* -----------------------------------------------------------------------
- * Q15 delta evaluation at chroma rate.
- *
- * x32_{lo,hi} hold (code - 512) for 32 chroma samples as dwords.
- * Returns the 32 deltas packed back to words:
- *   delta = (x * coef + 16384) >> 15   (identical to the scalar tables)
- * ----------------------------------------------------------------------- */
-
-static inline __attribute__((always_inline)) __m512i
-tm_delta_q15(__m512i x32_lo, __m512i x32_hi, __m512i coef)
-{
-    __m512i bias = _mm512_set1_epi32(16384);
-    __m512i d_lo = _mm512_srai_epi32(
-        _mm512_add_epi32(_mm512_mullo_epi32(x32_lo, coef), bias), 15);
-    __m512i d_hi = _mm512_srai_epi32(
-        _mm512_add_epi32(_mm512_mullo_epi32(x32_hi, coef), bias), 15);
-    return _mm512_inserti64x4(
-        _mm512_castsi256_si512(_mm512_cvtepi32_epi16(d_lo)),
-        _mm512_cvtepi32_epi16(d_hi), 1);
 }
 
 /* -----------------------------------------------------------------------
@@ -349,39 +328,26 @@ tm_chunk_avx512(const fused_hdr_internal_t *state,
     cb = _mm512_and_si512(cb, mask10);
     cr = _mm512_and_si512(cr, mask10);
 
-    /* ---- Q15 deltas at chroma rate ---- */
-    __m512i c512 = _mm512_set1_epi32(512);
-    __m512i xb_lo = _mm512_sub_epi32(
-        _mm512_cvtepu16_epi32(_mm512_castsi512_si256(cb)), c512);
-    __m512i xb_hi = _mm512_sub_epi32(
-        _mm512_cvtepu16_epi32(_mm512_extracti64x4_epi64(cb, 1)), c512);
-    __m512i xr_lo = _mm512_sub_epi32(
-        _mm512_cvtepu16_epi32(_mm512_castsi512_si256(cr)), c512);
-    __m512i xr_hi = _mm512_sub_epi32(
-        _mm512_cvtepu16_epi32(_mm512_extracti64x4_epi64(cr, 1)), c512);
+    /* ---- Q10 deltas at chroma rate ----
+     * x = code - 512 fits int16, and pmulhrsw of (x << 5) by the Q10
+     * coefficient computes ((x*32)*coef + 16384) >> 15, which equals the
+     * scalar table definition (x*coef + 512) >> 10 exactly - one shift
+     * and one multiply replace the whole widened 32-bit evaluation. */
+    __m512i c512 = _mm512_set1_epi16(512);
+    __m512i xb = _mm512_slli_epi16(_mm512_sub_epi16(cb, c512), 5);
+    __m512i xr = _mm512_slli_epi16(_mm512_sub_epi16(cr, c512), 5);
 
-    __m512i dr = tm_delta_q15(xr_lo, xr_hi,
-                              _mm512_set1_epi32(state->delta_coef_r));
-    __m512i db = tm_delta_q15(xb_lo, xb_hi,
-                              _mm512_set1_epi32(state->delta_coef_b));
-    /* dG = g_cr(Cr) + g_cb(Cb), summed in 32-bit before packing exactly
-     * like the scalar int addition of the two table values. */
-    __m512i bias = _mm512_set1_epi32(16384);
-    __m512i gcr  = _mm512_set1_epi32(state->delta_coef_g_cr);
-    __m512i gcb  = _mm512_set1_epi32(state->delta_coef_g_cb);
-    __m512i dg_lo = _mm512_add_epi32(
-        _mm512_srai_epi32(_mm512_add_epi32(
-            _mm512_mullo_epi32(xr_lo, gcr), bias), 15),
-        _mm512_srai_epi32(_mm512_add_epi32(
-            _mm512_mullo_epi32(xb_lo, gcb), bias), 15));
-    __m512i dg_hi = _mm512_add_epi32(
-        _mm512_srai_epi32(_mm512_add_epi32(
-            _mm512_mullo_epi32(xr_hi, gcr), bias), 15),
-        _mm512_srai_epi32(_mm512_add_epi32(
-            _mm512_mullo_epi32(xb_hi, gcb), bias), 15));
-    __m512i dg = _mm512_inserti64x4(
-        _mm512_castsi256_si512(_mm512_cvtepi32_epi16(dg_lo)),
-        _mm512_cvtepi32_epi16(dg_hi), 1);
+    __m512i dr = _mm512_mulhrs_epi16(
+        xr, _mm512_set1_epi16((short)state->delta_coef_r));
+    __m512i db = _mm512_mulhrs_epi16(
+        xb, _mm512_set1_epi16((short)state->delta_coef_b));
+    /* dG = g_cr(Cr) + g_cb(Cb): each term rounds exactly like its scalar
+     * table entry, and the sum (magnitude < 1024) stays in 16-bit. */
+    __m512i dg = _mm512_add_epi16(
+        _mm512_mulhrs_epi16(
+            xr, _mm512_set1_epi16((short)state->delta_coef_g_cr)),
+        _mm512_mulhrs_epi16(
+            xb, _mm512_set1_epi16((short)state->delta_coef_g_cb)));
 
     /* ---- expand deltas to luma rate ---- */
     __m512i dup_lo = _mm512_load_si512((const void *)idx_dup_lo);

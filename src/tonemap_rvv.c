@@ -34,7 +34,7 @@
  *    fused_tm_block tail loop.
  *
  * All arithmetic uses the scalar reference's widths and shifts: deltas
- * evaluated from the shared Q15 coefficients (state->delta_coef_*), the
+ * evaluated from the shared Q10 coefficients (state->delta_coef_*), the
  * luma dot in 16-bit (max value 65408), chroma dots in 32-bit.
  * Bit-exactness against fused_tonemap_apply_scalar is enforced by the
  * parity test.
@@ -55,39 +55,37 @@
 #if defined(__riscv) && (__riscv_xlen == 64)
 
 /* -----------------------------------------------------------------------
- * Q15 delta evaluation for one chroma-rate vector of 10-bit codes:
- *   delta = ((code - 512) * coef + 16384) >> 15
+ * Q10 delta evaluation for one chroma-rate vector of 10-bit codes.
+ *
+ * vsmul (vxrm = RNU) of (code - 512) << 5 by the Q10 coefficient computes
+ *   ((x*32) * coef + 16384) >> 15  ==  (x*coef + 512) >> 10
+ * which is exactly the scalar table definition, entirely at e16 - no
+ * widening to 32-bit.  (vsmul's saturating case needs both operands at
+ * -32768; x << 5 never goes below -16384, so it cannot fire.)
  * ----------------------------------------------------------------------- */
 
-static inline vint16m1_t tm_delta_rvv(vuint16m1_t code, int32_t coef,
+static inline vint16m1_t tm_delta_rvv(vuint16m1_t code, int16_t coef,
                                       size_t vl)
 {
-    vint32m2_t x = __riscv_vsub_vx_i32m2(
-        __riscv_vreinterpret_v_u32m2_i32m2(__riscv_vzext_vf2_u32m2(code, vl)),
-        512, vl);
-    vint32m2_t d = __riscv_vsra_vx_i32m2(
-        __riscv_vadd_vx_i32m2(__riscv_vmul_vx_i32m2(x, coef, vl), 16384, vl),
-        15, vl);
-    return __riscv_vncvt_x_x_w_i16m1(d, vl);
+    vint16m1_t x = __riscv_vsll_vx_i16m1(
+        __riscv_vsub_vx_i16m1(
+            __riscv_vreinterpret_v_u16m1_i16m1(code), 512, vl), 5, vl);
+    return fused_vsmul_vx_i16m1(x, coef, vl);
 }
 
-/* dG sums its two Q15 terms in 32-bit before narrowing. */
+/* dG = g_cr(Cr) + g_cb(Cb): each term rounds exactly like its scalar
+ * table entry, and the sum (magnitude < 1024) stays in 16-bit. */
 static inline vint16m1_t tm_delta_g_rvv(vuint16m1_t cb, vuint16m1_t cr,
-                                        int32_t gcb, int32_t gcr, size_t vl)
+                                        int16_t gcb, int16_t gcr, size_t vl)
 {
-    vint32m2_t xb = __riscv_vsub_vx_i32m2(
-        __riscv_vreinterpret_v_u32m2_i32m2(__riscv_vzext_vf2_u32m2(cb, vl)),
-        512, vl);
-    vint32m2_t xr = __riscv_vsub_vx_i32m2(
-        __riscv_vreinterpret_v_u32m2_i32m2(__riscv_vzext_vf2_u32m2(cr, vl)),
-        512, vl);
-    vint32m2_t tb = __riscv_vsra_vx_i32m2(
-        __riscv_vadd_vx_i32m2(__riscv_vmul_vx_i32m2(xb, gcb, vl), 16384, vl),
-        15, vl);
-    vint32m2_t tr = __riscv_vsra_vx_i32m2(
-        __riscv_vadd_vx_i32m2(__riscv_vmul_vx_i32m2(xr, gcr, vl), 16384, vl),
-        15, vl);
-    return __riscv_vncvt_x_x_w_i16m1(__riscv_vadd_vv_i32m2(tr, tb, vl), vl);
+    vint16m1_t xb = __riscv_vsll_vx_i16m1(
+        __riscv_vsub_vx_i16m1(
+            __riscv_vreinterpret_v_u16m1_i16m1(cb), 512, vl), 5, vl);
+    vint16m1_t xr = __riscv_vsll_vx_i16m1(
+        __riscv_vsub_vx_i16m1(
+            __riscv_vreinterpret_v_u16m1_i16m1(cr), 512, vl), 5, vl);
+    return __riscv_vadd_vv_i16m1(fused_vsmul_vx_i16m1(xr, gcr, vl),
+                                 fused_vsmul_vx_i16m1(xb, gcb, vl), vl);
 }
 
 /* -----------------------------------------------------------------------
@@ -200,11 +198,12 @@ tm_chunk_rvv(const fused_hdr_internal_t *state,
     cb = __riscv_vand_vx_u16m1(cb, 0x3FF, vl);
     cr = __riscv_vand_vx_u16m1(cr, 0x3FF, vl);
 
-    /* ---- Q15 deltas at chroma rate ---- */
-    vint16m1_t dr = tm_delta_rvv(cr, state->delta_coef_r, vl);
-    vint16m1_t db = tm_delta_rvv(cb, state->delta_coef_b, vl);
-    vint16m1_t dg = tm_delta_g_rvv(cb, cr, state->delta_coef_g_cb,
-                                   state->delta_coef_g_cr, vl);
+    /* ---- Q10 deltas at chroma rate ---- */
+    vint16m1_t dr = tm_delta_rvv(cr, (int16_t)state->delta_coef_r, vl);
+    vint16m1_t db = tm_delta_rvv(cb, (int16_t)state->delta_coef_b, vl);
+    vint16m1_t dg = tm_delta_g_rvv(cb, cr,
+                                   (int16_t)state->delta_coef_g_cb,
+                                   (int16_t)state->delta_coef_g_cr, vl);
 
     /* ---- both rows: even/odd luma streams share the deltas as-is ---- */
     vuint8mf2_t r0e = __riscv_vundefined_u8mf2();
@@ -265,6 +264,10 @@ tm_frame_rvv(const fused_hdr_internal_t *state,
 
     int src_y_pitch  = src_y_stride  / (int)sizeof(uint16_t);
     int src_uv_pitch = src_uv_stride / (int)sizeof(uint16_t);
+
+    /* vsmul in the delta evaluation rounds per vxrm; on v0.11 intrinsics
+     * that is a global CSR (no-op on v1.0, where it rides the intrinsic). */
+    FUSED_RVV_SET_VXRM_RNU();
 
     for (int cy = 0; cy < chroma_h; cy++) {
         const uint16_t *su  = src_u  ? src_u  + cy * src_uv_pitch : 0;

@@ -288,7 +288,7 @@ else ifeq ($(UNAME_M),arm64)
               src/kernels_upscale_neon.c src/tonemap_neon.c
 else ifeq ($(UNAME_M),riscv64)
   LIB_SRCS += src/kernels_rvv.c src/kernels_hdr_rvv.c \
-              src/kernels_upscale_rvv.c
+              src/kernels_upscale_rvv.c src/tonemap_rvv.c
   # LTO link must re-process the RVV intrinsic IR with the V extension
   # available; otherwise lto1 errors out with "target specific builtin
   # not available".  Adding -march=rv64gcv to the link line satisfies it
@@ -413,7 +413,7 @@ else ifeq ($(UNAME_M),arm64)
 else ifeq ($(UNAME_M),riscv64)
   ASM_ARCH_CFLAGS = -march=rv64gcv
   ASM_SRCS        = src/kernels_rvv.c src/kernels_hdr_rvv.c \
-                    src/kernels_upscale_rvv.c
+                    src/kernels_upscale_rvv.c src/tonemap_rvv.c
 endif
 
 ASM_CFLAGS = $(CFLAGS_BASE) $(LIB_OPT) $(TUNE_CFLAGS) $(ASM_ARCH_CFLAGS) -S -fverbose-asm
@@ -659,6 +659,9 @@ src/kernels_hdr_rvv.o: src/kernels_hdr_rvv.c
 	$(CC) $(LIB_CFLAGS) -march=rv64gcv -c -o $@ $<
 
 src/kernels_upscale_rvv.o: src/kernels_upscale_rvv.c
+	$(CC) $(LIB_CFLAGS) -march=rv64gcv -c -o $@ $<
+
+src/tonemap_rvv.o: src/tonemap_rvv.c
 	$(CC) $(LIB_CFLAGS) -march=rv64gcv -c -o $@ $<
 
 # Test source files use TEST_CFLAGS (O2)

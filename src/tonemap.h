@@ -308,4 +308,36 @@ void fused_tonemap_apply_p010_neon(
 
 #endif /* __aarch64__ */
 
+#if defined(__riscv) && (__riscv_xlen == 64)
+
+/* RVV kernels in tonemap_rvv.c (compiled with -march=rv64gcv; selected
+ * at runtime behind has_rvv).  The luma pass for the custom-LUT path
+ * also lives there because the dispatcher TU is not built with V. */
+
+void fused_tonemap_apply_rvv(
+    const fused_hdr_internal_t *state,
+    const uint16_t *src_y,  int src_y_stride,
+    const uint16_t *src_u,  int src_uv_stride,
+    const uint16_t *src_v,
+    uint8_t *dst_y, int dst_y_stride,
+    uint8_t *dst_u, int dst_uv_stride,
+    uint8_t *dst_v,
+    int width, int height);
+
+void fused_tonemap_apply_p010_rvv(
+    const fused_hdr_internal_t *state,
+    const uint16_t *src_y,  int src_y_stride,
+    const uint16_t *src_uv, int src_uv_stride,
+    uint8_t *dst_y, int dst_y_stride,
+    uint8_t *dst_u, int dst_uv_stride,
+    uint8_t *dst_v,
+    int width, int height);
+
+void fused_tonemap_luma_rvv(const uint8_t *lut_y,
+                            const uint16_t *src_y, int src_y_stride,
+                            uint8_t *dst_y, int dst_y_stride,
+                            int width, int height);
+
+#endif /* __riscv && __riscv_xlen == 64 */
+
 #endif /* FUNNELCAKE_TONEMAP_H */

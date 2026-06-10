@@ -572,6 +572,11 @@ void fused_tonemap_apply(
             tonemap_luma_neon(lut_y, src_y, src_y_stride, dst_y, dst_y_stride,
                               width, height);
         } else
+#elif defined(__riscv) && (__riscv_xlen == 64)
+        if (fused_detect_cpu()->has_rvv) {
+            fused_tonemap_luma_rvv(lut_y, src_y, src_y_stride,
+                                   dst_y, dst_y_stride, width, height);
+        } else
 #endif
         {
             for (int y = 0; y < height; y++) {
@@ -623,6 +628,15 @@ void fused_tonemap_apply(
                                  dst_y, dst_y_stride,
                                  dst_u, dst_uv_stride, dst_v,
                                  width, height);
+        return;
+    }
+#elif defined(__riscv) && (__riscv_xlen == 64)
+    if (fused_detect_cpu()->has_rvv) {
+        fused_tonemap_apply_rvv(state, src_y, src_y_stride,
+                                src_u, src_uv_stride, src_v,
+                                dst_y, dst_y_stride,
+                                dst_u, dst_uv_stride, dst_v,
+                                width, height);
         return;
     }
 #endif
@@ -718,6 +732,11 @@ void fused_tonemap_apply_p010(
             tonemap_luma_neon(lut_y, src_y, src_y_stride, dst_y, dst_y_stride,
                               width, height);
         } else
+#elif defined(__riscv) && (__riscv_xlen == 64)
+        if (fused_detect_cpu()->has_rvv) {
+            fused_tonemap_luma_rvv(lut_y, src_y, src_y_stride,
+                                   dst_y, dst_y_stride, width, height);
+        } else
 #endif
         {
             for (int y = 0; y < height; y++) {
@@ -763,6 +782,15 @@ void fused_tonemap_apply_p010(
                                       dst_y, dst_y_stride,
                                       dst_u, dst_uv_stride, dst_v,
                                       width, height);
+        return;
+    }
+#elif defined(__riscv) && (__riscv_xlen == 64)
+    if (fused_detect_cpu()->has_rvv) {
+        fused_tonemap_apply_p010_rvv(state, src_y, src_y_stride,
+                                     src_uv, src_uv_stride,
+                                     dst_y, dst_y_stride,
+                                     dst_u, dst_uv_stride, dst_v,
+                                     width, height);
         return;
     }
 #endif

@@ -277,7 +277,7 @@ LIB_SRCS = src/funnelcake.c src/funnelcake_hdr.c src/log.c src/detect.c \
 # Platform-specific SIMD kernels (SDR + HDR + upscale)
 ifeq ($(UNAME_M),x86_64)
   LIB_SRCS += src/kernels_avx2.c src/kernels_hdr_avx2.c \
-              src/kernels_upscale_avx2.c \
+              src/kernels_upscale_avx2.c src/tonemap_avx2.c \
               src/kernels_avx512.c src/kernels_hdr_avx512.c \
               src/kernels_upscale_avx512.c src/tonemap_avx512.c
 else ifeq ($(UNAME_M),aarch64)
@@ -389,7 +389,7 @@ visual: funnelcake_test
 ifeq ($(UNAME_M),x86_64)
   ASM_ARCH_CFLAGS = -mavx2
   ASM_SRCS        = src/kernels_avx2.c src/kernels_hdr_avx2.c \
-                    src/kernels_upscale_avx2.c
+                    src/kernels_upscale_avx2.c src/tonemap_avx2.c
   # AVX-512 kernels join the asm set only when the compiler can build them
   # for real (stub assembly is just delegation jumps - nothing to inspect).
   # The target-specific variable below swaps in the AVX-512 flag set for
@@ -586,6 +586,9 @@ src/kernels_scalar.o: src/kernels_scalar.c
 	$(CC) $(LIB_CFLAGS) $(SCALAR_CFLAGS) -c -o $@ $<
 
 src/kernels_avx2.o: src/kernels_avx2.c
+	$(CC) $(LIB_CFLAGS) -mavx2 -c -o $@ $<
+
+src/tonemap_avx2.o: src/tonemap_avx2.c
 	$(CC) $(LIB_CFLAGS) -mavx2 -c -o $@ $<
 
 # AVX-512 kernels: $(AVX512_KERNEL_CFLAGS) is the probed flag set, or empty

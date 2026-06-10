@@ -177,8 +177,8 @@ for a longer discussion.
 
 The bench suite does not include a libswscale HDR comparison path, so HDR
 numbers are funnelcake's absolute time only. Tone-mapping benchmarks are
-omitted while the tone mapping pipeline (correctness rewrite and x86 SIMD
-landed, NEON/RVV pending) is still settling.
+omitted while the tone mapping pipeline (correctness rewrite plus x86 and
+NEON SIMD landed, RVV pending) is still settling.
 
 **x86_64 / AVX2 & AVX-512**
 

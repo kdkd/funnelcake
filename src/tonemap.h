@@ -282,4 +282,30 @@ void fused_tonemap_apply_p010_avx2(
 
 #endif /* __x86_64__ */
 
+#if defined(__aarch64__)
+
+/* NEON kernels in tonemap_neon.c (NEON is baseline on aarch64; selected
+ * at runtime behind has_neon). */
+
+void fused_tonemap_apply_neon(
+    const fused_hdr_internal_t *state,
+    const uint16_t *src_y,  int src_y_stride,
+    const uint16_t *src_u,  int src_uv_stride,
+    const uint16_t *src_v,
+    uint8_t *dst_y, int dst_y_stride,
+    uint8_t *dst_u, int dst_uv_stride,
+    uint8_t *dst_v,
+    int width, int height);
+
+void fused_tonemap_apply_p010_neon(
+    const fused_hdr_internal_t *state,
+    const uint16_t *src_y,  int src_y_stride,
+    const uint16_t *src_uv, int src_uv_stride,
+    uint8_t *dst_y, int dst_y_stride,
+    uint8_t *dst_u, int dst_uv_stride,
+    uint8_t *dst_v,
+    int width, int height);
+
+#endif /* __aarch64__ */
+
 #endif /* FUNNELCAKE_TONEMAP_H */

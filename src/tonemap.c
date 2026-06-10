@@ -616,6 +616,15 @@ void fused_tonemap_apply(
                                  width, height);
         return;
     }
+#elif defined(__aarch64__)
+    if (fused_detect_cpu()->has_neon) {
+        fused_tonemap_apply_neon(state, src_y, src_y_stride,
+                                 src_u, src_uv_stride, src_v,
+                                 dst_y, dst_y_stride,
+                                 dst_u, dst_uv_stride, dst_v,
+                                 width, height);
+        return;
+    }
 #endif
 
     fused_tonemap_apply_scalar(state, src_y, src_y_stride,
@@ -741,6 +750,15 @@ void fused_tonemap_apply_p010(
     }
     if (fused_detect_cpu()->has_avx2) {
         fused_tonemap_apply_p010_avx2(state, src_y, src_y_stride,
+                                      src_uv, src_uv_stride,
+                                      dst_y, dst_y_stride,
+                                      dst_u, dst_uv_stride, dst_v,
+                                      width, height);
+        return;
+    }
+#elif defined(__aarch64__)
+    if (fused_detect_cpu()->has_neon) {
+        fused_tonemap_apply_p010_neon(state, src_y, src_y_stride,
                                       src_uv, src_uv_stride,
                                       dst_y, dst_y_stride,
                                       dst_u, dst_uv_stride, dst_v,

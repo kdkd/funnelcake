@@ -282,10 +282,10 @@ ifeq ($(UNAME_M),x86_64)
               src/kernels_upscale_avx512.c src/tonemap_avx512.c
 else ifeq ($(UNAME_M),aarch64)
   LIB_SRCS += src/kernels_neon.c src/kernels_hdr_neon.c \
-              src/kernels_upscale_neon.c
+              src/kernels_upscale_neon.c src/tonemap_neon.c
 else ifeq ($(UNAME_M),arm64)
   LIB_SRCS += src/kernels_neon.c src/kernels_hdr_neon.c \
-              src/kernels_upscale_neon.c
+              src/kernels_upscale_neon.c src/tonemap_neon.c
 else ifeq ($(UNAME_M),riscv64)
   LIB_SRCS += src/kernels_rvv.c src/kernels_hdr_rvv.c \
               src/kernels_upscale_rvv.c
@@ -405,11 +405,11 @@ ifeq ($(UNAME_M),x86_64)
 else ifeq ($(UNAME_M),aarch64)
   ASM_ARCH_CFLAGS =
   ASM_SRCS        = src/kernels_neon.c src/kernels_hdr_neon.c \
-                    src/kernels_upscale_neon.c
+                    src/kernels_upscale_neon.c src/tonemap_neon.c
 else ifeq ($(UNAME_M),arm64)
   ASM_ARCH_CFLAGS =
   ASM_SRCS        = src/kernels_neon.c src/kernels_hdr_neon.c \
-                    src/kernels_upscale_neon.c
+                    src/kernels_upscale_neon.c src/tonemap_neon.c
 else ifeq ($(UNAME_M),riscv64)
   ASM_ARCH_CFLAGS = -march=rv64gcv
   ASM_SRCS        = src/kernels_rvv.c src/kernels_hdr_rvv.c \
@@ -608,6 +608,9 @@ src/tonemap_avx512.o: src/tonemap_avx512.c
 	$(CC) $(LIB_CFLAGS) $(AVX512_KERNEL_CFLAGS) -c -o $@ $<
 
 src/kernels_neon.o: src/kernels_neon.c
+	$(CC) $(LIB_CFLAGS) -c -o $@ $<
+
+src/tonemap_neon.o: src/tonemap_neon.c
 	$(CC) $(LIB_CFLAGS) -c -o $@ $<
 
 # Library source files use LIB_CFLAGS (O3)

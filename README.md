@@ -179,7 +179,11 @@ The bench suite does not include a libswscale HDR comparison path, so HDR
 numbers are funnelcake's absolute time only. Rows marked `tone` produce
 tone-mapped 8-bit SDR outputs at every ladder step, `HDR+tone` produces
 both the 10-bit HDR and the tone-mapped SDR output at each step, and
-`tone 1x` is a source-resolution tone map with no scaling. All of them
+`tone 1x` is a source-resolution tone map with no scaling. Note that
+`tone` rows tone-map each output at its own resolution *after* scaling -
+a full 4K ladder tone-maps only ~59% as many pixels as `tone 1x` does,
+which is why the 1:1 row costs more than a ladder despite doing no
+scaling work. All of them
 run the full tone-mapping pipeline (PQ-domain tone curve, BT.2020 NCL
 reconstruction, BT.2020→BT.709 gamut conversion, BT.709 re-encode)
 through the SIMD kernels - AVX-512, AVX2, NEON, and RVV all have

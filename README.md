@@ -108,12 +108,12 @@ core and AVX2 is the faster choice anyway.
 
 | Workload | Graviton 4 (Neoverse V2) | Apple M3 Ultra | Raspberry Pi 5 |
 |---|---|---|---|
-| 640×360 down:2x                   |   13 µs (13.2×) |   22 µs  (2.6×) |   26 µs (10.4×) |
-| 960×540 down:1.5x,3x              |   86 µs  (8.7×) |   47 µs  (6.1×) |  170 µs  (8.3×) |
-| 1280×720 down:2x,4x               |   68 µs (14.5×) |   47 µs  (7.6×) |  141 µs (12.5×) |
-| 1920×1080 down:1.5x,3x,6x         |  393 µs (16.2×) |  126 µs (11.3×) |  940 µs (14.0×) |
-| 2560×1440 down:2x,4x,8x           |  302 µs (17.1×) |  240 µs  (7.7×) | 1139 µs  (8.2×) |
-| 3840×2160 down:1.5x,3x,6x,12x     | 1774 µs (15.7×) |  561 µs (12.0×) | 5032 µs (11.2×) |
+| 640×360 down:2x                   |   14 µs (11.7×) |   18 µs  (3.2×) |   46 µs  (5.8×) |
+| 960×540 down:1.5x,3x              |   86 µs  (8.7×) |   38 µs  (7.6×) |  167 µs  (8.4×) |
+| 1280×720 down:2x,4x               |   74 µs (13.3×) |   49 µs  (7.3×) |  165 µs (10.7×) |
+| 1920×1080 down:1.5x,3x,6x         |  391 µs (16.4×) |  126 µs (11.3×) |  936 µs (13.9×) |
+| 2560×1440 down:2x,4x,8x           |  371 µs (13.9×) |  244 µs  (7.5×) | 1274 µs  (7.4×) |
+| 3840×2160 down:1.5x,3x,6x,12x     | 1769 µs (15.7×) |  561 µs (11.7×) | 4780 µs (11.8×) |
 
 ### SDR upscale v.s. libswscale
 
@@ -139,14 +139,14 @@ whole-call timing on that system.
 
 | Workload | Graviton 4 (Neoverse V2) | Apple M3 Ultra | Raspberry Pi 5 |
 |---|---|---|---|
-| 480×270 up:2x                   |   21 µs (22.0×) |   18 µs  (8.6×) |   71 µs (11.1×) |
-| 480×270 up:2x,4x                |  107 µs (16.2×) |   89 µs  (6.2×) |  366 µs  (8.6×) |
-| 960×540 up:2x                   |   88 µs (22.8×) |   71 µs  (8.5×) |  307 µs (10.3×) |
-| 960×540 up:2x,3x                | 1003 µs  (5.4×) |  309 µs  (5.3×) | 1933 µs  (4.7×) |
-| 1920×1080 up:2x                 |  360 µs (21.0×) |  276 µs  (8.5×) | 1677 µs  (7.6×) |
-| 1920×1080 up:1.5x               |  909 µs  (5.8×) |  238 µs  (6.9×) | 1727 µs  (4.9×) |
-| 240×136 up:2x,4x,8x,16x         |  480 µs (10.3×) |  382 µs  (3.7×) | 2053 µs  (4.8×) |
-| 120×68 up:2x,4x,8x,16x,32x      |  480 µs  (9.3×) |  386 µs  (3.2×) | 2063 µs  (4.5×) |
+| 480×270 up:2x                   |   20 µs (22.6×) |   15 µs (10.3×) |   67 µs (11.8×) |
+| 480×270 up:2x,4x                |  102 µs (16.9×) |   74 µs  (7.5×) |  369 µs  (8.5×) |
+| 960×540 up:2x                   |   84 µs (23.8×) |   59 µs (10.2×) |  306 µs (10.3×) |
+| 960×540 up:2x,3x                | 1037 µs  (5.3×) |  305 µs  (5.5×) | 2214 µs  (4.1×) |
+| 1920×1080 up:2x                 |  329 µs (23.1×) |  225 µs (10.4×) | 1424 µs  (8.9×) |
+| 1920×1080 up:1.5x               |  909 µs  (5.8×) |  246 µs  (6.7×) | 1753 µs  (4.8×) |
+| 240×136 up:2x,4x,8x,16x         |  453 µs (10.9×) |  314 µs  (4.4×) | 1867 µs  (5.3×) |
+| 120×68 up:2x,4x,8x,16x,32x      |  459 µs  (9.7×) |  317 µs  (3.8×) | 1878 µs  (4.9×) |
 
 On x86 the 1.5× upscale tail remains slower per byte than the pure 2× steps:
 AVX2 has no 3-way interleaved store, so assembling the 2 to 3 output costs
@@ -169,9 +169,9 @@ for a longer discussion.
 
 | Workload | Graviton 4 (Neoverse V2) | Apple M3 Ultra | Raspberry Pi 5 |
 |---|---|---|---|
-| 1920×1080 down:2x up:2x             |  454 µs (20.0×) |  345 µs (8.2×) | 2031 µs (7.4×) |
-| 1920×1080 down:1.5x,3x up:2x        |  695 µs (15.5×) |  393 µs (8.9×) | 2585 µs (7.1×) |
-| 1280×720 down:2x,4x up:2x,4x        |  891 µs (15.4×) |  724 µs (5.8×) | 3886 µs (6.2×) |
+| 1920×1080 down:2x up:2x             |  441 µs (20.5×) |  292 µs (9.7×) | 1889 µs (8.0×) |
+| 1920×1080 down:1.5x,3x up:2x        |  670 µs (16.1×) |  343 µs (10.1×) | 2369 µs (7.8×) |
+| 1280×720 down:2x,4x up:2x,4x        |  840 µs (16.3×) |  690 µs (6.0×) | 3483 µs (6.9×) |
 
 ### HDR10 (10-bit PQ / HLG)
 
@@ -194,11 +194,11 @@ NEON SIMD landed, RVV pending) is still settling.
 
 | Workload | Graviton 4 | Apple M3 Ultra | Raspberry Pi 5 |
 |---|---|---|---|
-| 1920×1080 I010 down:1.5x,3x,6x        |  409 µs |  234 µs |  2147 µs |
-| 3840×2160 I010 down:1.5x,3x,6x,12x    | 3020 µs | 1193 µs | 11790 µs |
-| 3840×2160 P010 down:1.5x,3x,6x,12x    | 3566 µs | 1420 µs | 13417 µs |
-| 1920×1080 I010 up:2x                  |  701 µs |  626 µs |  3393 µs |
-| 1920×1080 I010 down:1.5x,3x up:2x     | 1391 µs |  871 µs |  5500 µs |
+| 1920×1080 I010 down:1.5x,3x,6x        |  693 µs |  237 µs |  2160 µs |
+| 3840×2160 I010 down:1.5x,3x,6x,12x    | 3066 µs | 1281 µs | 10708 µs |
+| 3840×2160 P010 down:1.5x,3x,6x,12x    | 3389 µs | 1509 µs | 12379 µs |
+| 1920×1080 I010 up:2x                  |  787 µs |  510 µs |  3068 µs |
+| 1920×1080 I010 down:1.5x,3x up:2x     | 1421 µs |  758 µs |  5140 µs |
 
 The P010 row uses the Y + interleaved-UV layout that most HEVC Main10
 encoders emit natively; the P010 vs I010 gap on the matching 4K
@@ -219,7 +219,7 @@ Zen 5 column above the HDR rows run much closer to their SDR twins
 
 The Graviton 4 column deserves calling out explicitly. Against
 libswscale on the same hardware, funnelcake's SDR speedups on Graviton
-cluster around **15–22× on the pow2 workloads** - the 2× upscales,
+cluster around **14–24× on the pow2 workloads** - the 2× upscales,
 downscale ladders from 1080p through 4K, and single-pass combined
 down+up calls. For comparison, the same set of workloads sits around
 6–12× on Apple M3 Ultra, 7–14× on Raspberry Pi 5, and 5–14× on the
@@ -235,16 +235,16 @@ The most dramatic rows:
   `1920×1080 up:2x`): **21–23×** faster than libswscale.
 - **Single-pass combined downscale + upscale**
   (`1920×1080 down:2x up:2x`, `down:1.5x,3x up:2x`,
-  `1280×720 down:2x,4x up:2x,4x`): **15–20×** faster.
-- **Downscale ladders** at 1080p through 4K: **15–17×** faster against
-  independent libswscale, still **~7×** faster even against libswscale's
-  cascade mode.
+  `1280×720 down:2x,4x up:2x,4x`): **16–21×** faster.
+- **Downscale ladders** at 1080p through 4K: **14–16×** faster against
+  independent libswscale, still **~7–10×** faster even against
+  libswscale's cascade mode.
 
 In absolute numbers, a `c8g.2xlarge` instance (one Graviton 4 vCPU)
 processes a 1920×1080 thirds-family downscale ladder
-(`down:1.5x,3x,6x`) in **393 µs**, a complete 4K thirds ladder
+(`down:1.5x,3x,6x`) in **391 µs**, a complete 4K thirds ladder
 (`down:1.5x,3x,6x,12x`) in **1.77 ms**, and a combined 1080p
-downscale + 2× upscale in **454 µs**. At 60 fps each of those consumes
+downscale + 2× upscale in **441 µs**. At 60 fps each of those consumes
 less than 11% of a single core's frame budget - meaning a single
 Graviton 4 core can run the 1080p ladder for **~42 live streams** in
 parallel, or the full 4K ladder for **~9 streams**, with headroom left
@@ -327,9 +327,9 @@ wider memory buses or multi-channel striping, not a better kernel:
   source and into the first output level; on M3 Ultra these run close
   to the ~60 GB/s single-core ceiling of the unified memory system.
 - **Small-source workloads on CPUs with very fast memory subsystems**:
-  e.g. `640×360 down:2x` on Apple Silicon completes in ~22 µs - an
+  e.g. `640×360 down:2x` on Apple Silicon completes in ~18 µs - an
   absolute time where libswscale is *also* memory-bound, so the relative
-  speedup in the table (2.6×) understates how much work funnelcake is
+  speedup in the table (3.2×) understates how much work funnelcake is
   doing and really just reflects that both libraries are waiting on
   the same DRAM.
 

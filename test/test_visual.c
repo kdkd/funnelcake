@@ -176,6 +176,10 @@ static int run_hdr_visual_config(const char *label,
     ctx.hdr_flags       = 0;      /* No HDR output (PNG can't display HDR) */
     ctx.sdr_flags       = flags;  /* SDR tone-mapped output for visual verification */
     ctx.tonemap.curve   = FUSED_TONEMAP_HABLE;
+    /* Sources (zscale samples and synthetic fixtures) are limited range -
+     * the default.  The PNG export pipeline runs with -color_range pc, so
+     * ask for full-range SDR output. */
+    ctx.tonemap.dst_range = FUSED_RANGE_FULL;
     suppress_hdr_log(&ctx);
 
     int rc = fused_hdr_init(&ctx);
@@ -492,6 +496,8 @@ void run_visual_tests(void)
             ctx.hdr_flags       = flags;
             ctx.sdr_flags       = flags;
             ctx.tonemap.curve   = FUSED_TONEMAP_HABLE;
+            /* SDR .mov export below is tagged -color_range pc */
+            ctx.tonemap.dst_range = FUSED_RANGE_FULL;
             suppress_hdr_log(&ctx);
 
             int rc = fused_hdr_init(&ctx);

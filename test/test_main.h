@@ -109,6 +109,7 @@ void run_visual_tests(void);
 void run_bench_tests(const char *filter);
 void run_hdr_validation_tests(void);
 void run_hdr_correctness_tests(void);
+void run_tonemap_tests(void);
 void run_hdr_bench_tests(const char *filter);
 void run_swscale_bench_tests(const char *filter);
 

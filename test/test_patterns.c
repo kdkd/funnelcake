@@ -235,7 +235,9 @@ static uint32_t xorshift32_16(uint32_t state, uint16_t *val)
 
 /* --------------------------------------------------------------------------
  * PQ (ST 2084) inverse EOTF
- * Map linear luminance L (nits) to PQ code value 0-1023.
+ * Map linear luminance L (nits) to a limited-range 10-bit PQ code
+ * (Y 64..940), matching what real HDR10 streams and the ffmpeg/zscale
+ * sample files carry.
  * -------------------------------------------------------------------------- */
 
 #include <math.h>
@@ -255,9 +257,9 @@ static uint16_t linear_to_pq(double L)
     double num = c1 + c2 * Ym1;
     double den = 1.0 + c3 * Ym1;
     double E = pow(num / den, m2);
-    int code = (int)(E * 1023.0 + 0.5);
-    if (code < 0)    code = 0;
-    if (code > 1023) code = 1023;
+    int code = 64 + (int)(E * 876.0 + 0.5);   /* limited range */
+    if (code < 64)  code = 64;
+    if (code > 940) code = 940;
     return (uint16_t)code;
 }
 
@@ -507,41 +509,39 @@ static void fill_hdr_pq_colorbars(test_hdr_frame_t *f)
         /* Black   */ {   0.0,   0.0,   0.0 },
     };
 
-    /* BT.2020 non-constant-luminance YCbCr coefficients (from BT.2020 spec):
-     * Y  =  0.2627*R + 0.6780*G + 0.0593*B
-     * Cb = (B - Y) / 1.8814  (scaled to [-0.5, 0.5])
-     * Cr = (R - Y) / 1.4746  (scaled to [-0.5, 0.5]) */
+    /* BT.2020 non-constant-luminance YCbCr (from BT.2020 spec), entirely
+     * in the gamma (PQ signal) domain, like real HDR10 streams:
+     * Y' =  0.2627*R' + 0.6780*G' + 0.0593*B'   (R' = PQ(R), etc.)
+     * Cb = (B' - Y') / 1.8814  (scaled to [-0.5, 0.5])
+     * Cr = (R' - Y') / 1.4746  (scaled to [-0.5, 0.5]) */
 
     /* Pre-compute Y/Cb/Cr for each bar in PQ domain */
     uint16_t bar_y[8], bar_cb[8], bar_cr[8];
     for (int i = 0; i < 8; i++) {
         double R = bars[i].r, G = bars[i].g, B = bars[i].b;
 
-        /* Linear light Y (nits) */
-        double Y_lin = 0.2627 * R + 0.6780 * G + 0.0593 * B;
+        /* PQ-encode each component, then take the NCL weighted sum for
+         * luma.  Codes are limited range, so the normalized signal is
+         * (code - 64) / 876. */
+        double R_pq = ((double)linear_to_pq(R) - 64.0) / 876.0;
+        double G_pq = ((double)linear_to_pq(G) - 64.0) / 876.0;
+        double B_pq = ((double)linear_to_pq(B) - 64.0) / 876.0;
+        double Y_pq = 0.2627 * R_pq + 0.6780 * G_pq + 0.0593 * B_pq;
 
-        /* PQ-encode the luma */
-        bar_y[i] = linear_to_pq(Y_lin);
-
-        /* Chroma: compute Cb/Cr from linear-light components.
-         * Apply PQ to each component, then compute chroma difference
-         * in the PQ domain (this is the non-constant-luminance approach
-         * used by HDR10 in practice). */
-        double Y_pq = (double)bar_y[i] / 1023.0;
-        double R_pq = (double)linear_to_pq(R) / 1023.0;
-        double B_pq = (double)linear_to_pq(B) / 1023.0;
+        bar_y[i] = (uint16_t)(64 + (int)(Y_pq * 876.0 + 0.5));
+        Y_pq = ((double)bar_y[i] - 64.0) / 876.0;   /* re-read quantized Y' */
 
         /* Cb = (B' - Y') / 1.8814, Cr = (R' - Y') / 1.4746
-         * Scale to 10-bit [0, 1023] centered at 512 */
+         * Quantize to limited-range 10-bit chroma (center 512, span 896) */
         double Cb = (B_pq - Y_pq) / 1.8814;
         double Cr = (R_pq - Y_pq) / 1.4746;
 
-        int cb_code = (int)(Cb * 1023.0 + 512.0 + 0.5);
-        int cr_code = (int)(Cr * 1023.0 + 512.0 + 0.5);
-        if (cb_code < 0) cb_code = 0;
-        if (cb_code > 1023) cb_code = 1023;
-        if (cr_code < 0) cr_code = 0;
-        if (cr_code > 1023) cr_code = 1023;
+        int cb_code = (int)(Cb * 896.0 + 512.0 + 0.5);
+        int cr_code = (int)(Cr * 896.0 + 512.0 + 0.5);
+        if (cb_code < 64) cb_code = 64;
+        if (cb_code > 960) cb_code = 960;
+        if (cr_code < 64) cr_code = 64;
+        if (cr_code > 960) cr_code = 960;
         bar_cb[i] = (uint16_t)cb_code;
         bar_cr[i] = (uint16_t)cr_code;
     }

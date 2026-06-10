@@ -303,6 +303,7 @@ LIB_OBJS = $(LIB_SRCS:.c=.o)
 TEST_SRCS = test/test_main.c test/test_validation.c test/test_correctness.c \
             test/test_patterns.c test/test_visual.c test/test_bench.c \
             test/test_hdr_validation.c test/test_hdr_correctness.c \
+            test/test_tonemap.c \
             test/test_hdr_bench.c test/test_swscale_bench.c \
             test/test_parity.c
 TEST_OBJS = $(TEST_SRCS:.c=.o)

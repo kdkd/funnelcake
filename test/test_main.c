@@ -128,6 +128,9 @@ int main(int argc, char *argv[])
         printf("\n=== HDR Correctness tests ===\n");
         run_hdr_correctness_tests();
 
+        printf("\n=== Tone mapping tests ===\n");
+        run_tonemap_tests();
+
         printf("\n=== Parity tests (scalar vs SIMD) ===\n");
         run_parity_tests();
     }

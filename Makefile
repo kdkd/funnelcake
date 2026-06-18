@@ -26,7 +26,7 @@ endif
 # --- Versioning and install layout ---
 # VERSION is the project version string used in funnelcake.pc and elsewhere.
 # Bump this whenever you cut a release (see README.md, "Release process").
-VERSION    ?= 0.1.0
+VERSION    ?= 0.1.1
 
 # SOVERSION is the shared-library major version. Bump only on ABI breaks.
 SOVERSION  ?= 1

@@ -593,6 +593,22 @@ fused_scaler_free(&scaler);
 ```
 
 
+## Language bindings
+
+Idiomatic bindings for the full SDR + HDR API live under
+**[bindings/](bindings/)**, each with its own README covering build and usage:
+
+| Language | Location | Notes |
+|----------|----------|-------|
+| Go       | [bindings/go](bindings/go/API-GO.md)         | cgo |
+| Rust     | [bindings/rust](bindings/rust/API-RUST.md)   | no `bindgen` dependency |
+| Python   | [bindings/python](bindings/python/API-PYTHON.md) | stdlib `ctypes`, no third-party deps |
+| Java     | [bindings/java](bindings/java/API-JAVA.md)   | Foreign Function & Memory API — requires **JDK 22+** |
+
+They are opt-in and never built by a plain `make`; see each binding's docs (and
+the `bindings-<lang>` / `test-<lang>` Makefile targets).
+
+
 ## Releases
 
 ### Cutting a new release

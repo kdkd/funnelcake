@@ -270,9 +270,16 @@ ifeq ($(UNAME_M),x86_64)
 endif
 
 # Library sources (always compiled)
+#
+# bindings_support.c holds the small helper surface used by the language
+# bindings (aligned alloc, stride math, ctx-sizeof guards). It is standalone
+# utility code that the scaler/HDR paths never call, so including it does not
+# change any library output or behavior - it just means a single installed
+# libfunnelcake + headers is enough to build a binding (no separate helper lib).
+# Raw C users linking the static archive get these objects dropped as unused.
 LIB_SRCS = src/funnelcake.c src/funnelcake_hdr.c src/log.c src/detect.c \
            src/kernels_scalar.c src/kernels_hdr_scalar.c src/tonemap.c \
-           src/kernels_upscale_scalar.c
+           src/kernels_upscale_scalar.c src/bindings_support.c
 
 # Platform-specific SIMD kernels (SDR + HDR + upscale)
 ifeq ($(UNAME_M),x86_64)
@@ -308,8 +315,19 @@ TEST_SRCS = test/test_main.c test/test_validation.c test/test_correctness.c \
             test/test_parity.c
 TEST_OBJS = $(TEST_SRCS:.c=.o)
 
+# Go toolchain for the bindings targets (override with `make GO=go1.23`).
+GO ?= go
+
+# Java toolchain for the bindings targets. FFM requires a JDK >= 22; tested on
+# JDK 25. Override e.g. `make JAVA=/opt/.../bin/java JAVAC=/opt/.../bin/javac`.
+JAVA  ?= java
+JAVAC ?= javac
+
+# Rust toolchain for the bindings targets (override with `make CARGO=cargo`).
+CARGO ?= cargo
+
 # Default target
-.PHONY: all lib shared test bench bench-sdr bench-hdr bench-swscale visual asm fetch-samples clean pgo pgo-clean install
+.PHONY: all lib shared test bench bench-sdr bench-hdr bench-swscale visual asm fetch-samples clean pgo pgo-clean install bindings-go test-go bindings-java test-java bindings-rust test-rust bindings-python test-python
 
 all: lib
 
@@ -348,6 +366,7 @@ install: lib shared funnelcake.pc
 	$(INSTALL) -m 755 $(SHLIB) $(DESTDIR)$(LIBDIR)/
 	ln -sf $(SHLIB) $(DESTDIR)$(LIBDIR)/$(SHLIB_LINK)
 	$(INSTALL) -m 644 include/funnelcake.h $(DESTDIR)$(INCLUDEDIR)/
+	$(INSTALL) -m 644 include/funnelcake_helpers.h $(DESTDIR)$(INCLUDEDIR)/
 	$(INSTALL) -m 644 funnelcake.pc $(DESTDIR)$(PKGCONFDIR)/
 
 funnelcake_test: $(TEST_OBJS) libfunnelcake.a
@@ -371,6 +390,89 @@ bench-swscale: funnelcake_test
 visual: funnelcake_test
 	@mkdir -p output
 	./funnelcake_test --visual
+
+# --- Language bindings (opt-in; not built by `all` or `test`) ---
+# The Go binding statically links the in-tree libfunnelcake.a (which now carries
+# the binding helpers too), so it depends on `lib`.
+GO_BINDING_DIR = bindings/go
+
+bindings-go: lib
+	@command -v $(GO) >/dev/null 2>&1 || { \
+	  echo "Error: '$(GO)' not found in PATH; install Go (>=1.23) to build the Go binding"; exit 1; }
+	cd $(GO_BINDING_DIR) && CGO_ENABLED=1 $(GO) build ./...
+
+test-go: bindings-go
+	cd $(GO_BINDING_DIR) && CGO_ENABLED=1 $(GO) vet ./... && CGO_ENABLED=1 $(GO) test ./...
+
+# --- Java binding (FFM / Panama; opt-in) ---
+# Unlike Go (static cgo), the Java binding loads the shared library at runtime
+# via the Foreign Function & Memory API. The binding helpers now live in the
+# core libfunnelcake, so only that one shared lib is needed; it is built into
+# bindings/java/ under a plain name so the JVM can find it by directory.
+JAVA_BINDING_DIR = bindings/java
+JAVA_SRC_DIR     = $(JAVA_BINDING_DIR)/src
+JAVA_CLASS_DIR   = $(JAVA_BINDING_DIR)/classes
+JAVA_SOURCES     = $(wildcard $(JAVA_SRC_DIR)/org/your/funnelcake/*.java)
+
+# Plain (unversioned) shared-library naming for the bindings that load by path
+# (Java FFM, Python ctypes). Shared between those two targets.
+ifeq ($(UNAME_S),Darwin)
+  BIND_LIBEXT        = dylib
+  BIND_SHLIB_LDFLAGS = -dynamiclib
+else
+  BIND_LIBEXT        = so
+  BIND_SHLIB_LDFLAGS = -shared
+endif
+
+JAVA_CORE_LIB = $(JAVA_BINDING_DIR)/libfunnelcake.$(BIND_LIBEXT)
+
+$(JAVA_CORE_LIB): $(LIB_OBJS)
+	$(CC) $(BIND_SHLIB_LDFLAGS) $(LINK_MARCH) -o $@ $^ $(LDFLAGS)
+
+bindings-java: $(JAVA_CORE_LIB)
+	@command -v $(JAVAC) >/dev/null 2>&1 || { \
+	  echo "Error: '$(JAVAC)' not found in PATH; install a JDK >= 22 (FFM) to build the Java binding"; exit 1; }
+	@mkdir -p $(JAVA_CLASS_DIR)
+	$(JAVAC) -d $(JAVA_CLASS_DIR) $(JAVA_SOURCES)
+
+test-java: bindings-java
+	$(JAVA) --enable-native-access=ALL-UNNAMED \
+	    -Dfunnelcake.libdir=$(CURDIR)/$(JAVA_BINDING_DIR) \
+	    -cp $(JAVA_CLASS_DIR) org.your.funnelcake.FunnelcakeTest
+
+# --- Rust binding (opt-in) ---
+# Static-links the in-tree libfunnelcake.a (so it depends on `lib`), which now
+# contains the binding helpers. No crates.io deps.
+RUST_BINDING_DIR = bindings/rust
+
+bindings-rust: lib
+	@command -v $(CARGO) >/dev/null 2>&1 || { \
+	  echo "Error: '$(CARGO)' not found in PATH; install Rust (https://rustup.rs) to build the Rust binding"; exit 1; }
+	cd $(RUST_BINDING_DIR) && $(CARGO) build
+
+test-rust: lib
+	@command -v $(CARGO) >/dev/null 2>&1 || { \
+	  echo "Error: '$(CARGO)' not found in PATH; install Rust (https://rustup.rs) to build the Rust binding"; exit 1; }
+	cd $(RUST_BINDING_DIR) && $(CARGO) test
+
+# --- Python binding (ctypes; opt-in) ---
+# Pure-Python (stdlib ctypes), so nothing to compile beyond the one shared lib
+# it loads at runtime: the core scaler (which now also carries the binding
+# helpers), built into bindings/python/ under a plain name.
+PYTHON ?= python3
+PYTHON_BINDING_DIR = bindings/python
+PY_CORE_LIB = $(PYTHON_BINDING_DIR)/libfunnelcake.$(BIND_LIBEXT)
+
+$(PY_CORE_LIB): $(LIB_OBJS)
+	$(CC) $(BIND_SHLIB_LDFLAGS) $(LINK_MARCH) -o $@ $^ $(LDFLAGS)
+
+bindings-python: $(PY_CORE_LIB)
+	@command -v $(PYTHON) >/dev/null 2>&1 || { \
+	  echo "Error: '$(PYTHON)' not found in PATH; install Python 3.8+ to use the Python binding"; exit 1; }
+
+test-python: bindings-python
+	FUNNELCAKE_LIBDIR=$(CURDIR)/$(PYTHON_BINDING_DIR) PYTHONPATH=$(CURDIR)/$(PYTHON_BINDING_DIR) \
+	    $(PYTHON) -m unittest discover -s $(PYTHON_BINDING_DIR) -p 'test_*.py' -v
 
 # --- Assembly inspection ---
 # `make asm` emits annotated assembly for this host's SIMD kernels next to the
@@ -521,6 +623,12 @@ clean:
 	rm -f src/*.profraw default.profdata
 	rm -f src/*.S
 	rm -rf output/*
+	rm -f $(GO_BINDING_DIR)/*.test $(GO_BINDING_DIR)/*.o
+	rm -f $(JAVA_BINDING_DIR)/*.dylib $(JAVA_BINDING_DIR)/*.so
+	rm -rf $(JAVA_BINDING_DIR)/classes
+	rm -rf $(RUST_BINDING_DIR)/target
+	rm -f $(PYTHON_BINDING_DIR)/*.dylib $(PYTHON_BINDING_DIR)/*.so
+	rm -rf $(PYTHON_BINDING_DIR)/funnelcake/__pycache__ $(PYTHON_BINDING_DIR)/__pycache__
 
 # --- Profile-Guided Optimization ---
 # Usage: make pgo [TUNE=znver2] [LTO=1]
@@ -615,6 +723,10 @@ src/tonemap_neon.o: src/tonemap_neon.c
 
 # Library source files use LIB_CFLAGS (O3)
 src/funnelcake.o: src/funnelcake.c
+	$(CC) $(LIB_CFLAGS) -c -o $@ $<
+
+# Binding helper surface (standalone utilities; not on any scaling path).
+src/bindings_support.o: src/bindings_support.c include/funnelcake_helpers.h include/funnelcake.h
 	$(CC) $(LIB_CFLAGS) -c -o $@ $<
 
 src/log.o: src/log.c

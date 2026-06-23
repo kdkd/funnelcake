@@ -1,0 +1,12 @@
+[package]
+name = "funnelcake"
+version = "0.1.0"
+edition = "2021"
+license = "BSD-2-Clause-Patent"
+description = "Rust bindings for the funnelcake SIMD YUV scaler and HDR tone-mapper"
+links = "funnelcake"
+publish = false
+
+[lib]
+name = "funnelcake"
+path = "src/lib.rs"

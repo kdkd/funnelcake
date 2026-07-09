@@ -195,15 +195,15 @@ bit.
 
 | Workload | Ryzen 9955HX (AVX-512) | Epyc 7302 (AVX2) | Xeon 6132 (AVX2) | Xeon E5v4 (AVX2) |
 |---|---|---|---|---|
-| 1920×1080 I010 down:1.5x,3x,6x        |   88 µs |  395 µs |  441 µs |  664 µs |
-| 3840×2160 I010 down:1.5x,3x,6x,12x    |  707 µs | 2682 µs | 2875 µs | 3976 µs |
-| 3840×2160 P010 down:1.5x,3x,6x,12x    | 1061 µs | 3392 µs | 3830 µs | 5510 µs |
-| 1920×1080 I010 up:2x                  |  475 µs | 1899 µs | 2080 µs | 1917 µs |
-| 1920×1080 I010 down:1.5x,3x up:2x     |  648 µs | 2542 µs | 2792 µs | 3035 µs |
-| 1920×1080 I010 down:1.5x,3x,6x tone   |  395 µs | 3436 µs | 5008 µs | 4458 µs |
-| 3840×2160 I010 down:1.5x,3x,6x,12x tone | 1913 µs | 17356 µs | 21690 µs | 15036 µs |
-| 1920×1080 I010 down:1.5x,3x,6x HDR+tone |  384 µs | 3424 µs | 4992 µs | 2950 µs |
-| 3840×2160 I010 tone 1x                | 2160 µs | 21020 µs | 30426 µs | 13845 µs |
+| 1920×1080 I010 down:1.5x,3x,6x        |   88 µs |  264 µs |  391 µs |  668 µs |
+| 3840×2160 I010 down:1.5x,3x,6x,12x    |  707 µs | 2788 µs | 2930 µs | 3619 µs |
+| 3840×2160 P010 down:1.5x,3x,6x,12x    | 1061 µs | 3495 µs | 3804 µs | 5513 µs |
+| 1920×1080 I010 up:2x                  |  475 µs | 2055 µs | 2087 µs | 2189 µs |
+| 1920×1080 I010 down:1.5x,3x up:2x     |  648 µs | 2658 µs | 2646 µs | 3305 µs |
+| 1920×1080 I010 down:1.5x,3x,6x tone   |  395 µs | 3290 µs | 5132 µs | 2538 µs |
+| 3840×2160 I010 down:1.5x,3x,6x,12x tone | 1913 µs | 15433 µs | 23328 µs | 12412 µs |
+| 1920×1080 I010 down:1.5x,3x,6x HDR+tone |  384 µs | 3285 µs | 5149 µs | 2555 µs |
+| 3840×2160 I010 tone 1x                | 2160 µs | 20753 µs | 33405 µs | 14348 µs |
 
 **aarch64 / NEON**
 
@@ -221,15 +221,17 @@ bit.
 
 The P010 row uses the Y + interleaved-UV layout that most HEVC Main10
 encoders emit natively; the P010 vs I010 gap on the matching 4K
-workload (e.g. 3392 vs 2682 µs on Epyc 7302) is the on-the-fly UV
+workload (e.g. 3495 vs 2788 µs on Epyc 7302) is the on-the-fly UV
 deinterleave cost, not a fundamental difference in scaling work.
 
 The AVX2 and NEON HDR kernels are roughly 2–4× slower per byte than
 their SDR counterparts primarily because 10-bit samples halve the
-number of pixels per SIMD register. AVX2 must also widen weighted
-blends into the 32-bit domain; NEON instead expresses the exact blend
-as a signed difference and uses its saturating rounding multiply-high
-instruction in 16-bit lanes. The AVX-512 HDR kernels claw most of the
+number of pixels per SIMD register. Both now express the common weighted
+blend as a signed difference followed by a saturating rounding
+multiply-high in 16-bit lanes. AVX2 retains a widened multiply-add variant
+for the dense 12× pipeline, where mixing the two formulations balances the
+execution ports better than issuing only multiply-high instructions. The
+AVX-512 HDR kernels claw most of the
 lane-count penalty back: a 512-bit register restores
 the lane count a 256-bit register has for 8-bit samples, so on the
 Zen 5 column above the HDR rows run much closer to their SDR twins

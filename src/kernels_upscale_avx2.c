@@ -39,8 +39,8 @@
  *
  * HDR (10-bit) path uses the same structural approach with uint16_t data:
  *   - Horizontal/vertical 2x: _mm_avg_epu16 (128-bit) / _mm256_avg_epu16
- *   - Vertical 1.5x blend: _mm256_madd_epi16 with interleaved (a, b)
- *     pairs and weights {85, 171, ...} for single-instruction u16×u16->u32
+ *   - Vertical 1.5x blend: exact signed-difference _mm256_mulhrs_epi16,
+ *     replacing the widened interleave/madd/round/pack sequence
  *   - Horizontal 1.5x: 128-bit SSE, 4 pairs per iter, using madd_epi16
  *     and pshufb with u16-aware byte masks to produce 12 dst u16 per iter
  *
@@ -1129,37 +1129,23 @@ static void up_2x_plane_avx2_u16(const uint16_t *src, int src_w, int src_h,
 
 /* ---- Vertical 85/171 blend of two HDR rows ----
  *
- * Uses _mm256_madd_epi16(interleaved_ab, {85,171,85,171,...}) to compute
- * 85*a + 171*b at 32-bit precision in a single instruction per 8 pairs. */
+ * (85*a + 171*b + 128)>>8 is exactly
+ * a + round((b-a)*171/256).  The 10-bit signed difference fits i16, so
+ * vpmulhrsw evaluates the rounded fraction directly without widening. */
 static inline void up_vblend_21_row_avx2_u16(const uint16_t *a_row,
                                              const uint16_t *b_row,
                                              int w, uint16_t *out)
 {
     int x = 0;
-    const __m256i weights = _mm256_set1_epi32((171 << 16) | 85);
-    const __m256i r128    = _mm256_set1_epi32(128);
+    const __m256i scale = _mm256_set1_epi16(171 * 128);
 
     for (; x + 16 <= w; x += 16) {
         __m256i av = _mm256_loadu_si256((const __m256i *)(a_row + x));
         __m256i bv = _mm256_loadu_si256((const __m256i *)(b_row + x));
-
-        /* Interleave a and b at u16 granularity.  unpacklo/hi are per-lane
-         * and so is madd_epi16 and packus_epi32, so the per-lane pipeline
-         * stays consistent and no cross-lane permute is needed. */
-        __m256i ab_lo = _mm256_unpacklo_epi16(av, bv);
-        __m256i ab_hi = _mm256_unpackhi_epi16(av, bv);
-
-        /* madd_epi16 pair-sums adjacent i16 products into i32 results. */
-        __m256i m_lo = _mm256_madd_epi16(ab_lo, weights);
-        __m256i m_hi = _mm256_madd_epi16(ab_hi, weights);
-
-        m_lo = _mm256_srli_epi32(_mm256_add_epi32(m_lo, r128), 8);
-        m_hi = _mm256_srli_epi32(_mm256_add_epi32(m_hi, r128), 8);
-
-        /* Pack i32 -> u16.  packus_epi32 is per-lane, matching the
-         * per-lane unpacklo/hi above -> linear result. */
-        __m256i packed = _mm256_packus_epi32(m_lo, m_hi);
-        _mm256_storeu_si256((__m256i *)(out + x), packed);
+        __m256i delta = _mm256_mulhrs_epi16(
+            _mm256_sub_epi16(bv, av), scale);
+        _mm256_storeu_si256((__m256i *)(out + x),
+                            _mm256_add_epi16(av, delta));
     }
 
     for (; x < w; x++) {

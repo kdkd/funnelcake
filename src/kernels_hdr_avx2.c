@@ -18,8 +18,9 @@
  * Adapted from the 8-bit kernels_avx2.c.  Key differences:
  *   - Each YMM register holds 16 uint16_t elements (not 32 uint8_t).
  *   - Pairwise averaging uses _mm256_avg_epu16 (AVX2): (a + b + 1) >> 1.
- *   - Bilinear blends require widening to 32-bit because 1023 * 171
- *     = 174,933 overflows uint16_t.
+ *   - Bilinear blends use an exact signed-difference VPMULHRSW identity for
+ *     shallow ladders, with a widened VPMADDWD form retained to balance the
+ *     execution ports in the denser 12x pipeline.
  *   - Deinterleave shuffle tables operate on 2-byte elements instead
  *     of single bytes.
  *   - P010 chroma deinterleaving is handled at the entry point by
@@ -126,33 +127,36 @@ static inline __m256i avx2_avg_u16(__m256i a, __m256i b)
  * AVX2 vertical blend helper for 10-bit
  *
  * Computes (a * 171 + b * 85 + 128) >> 8 across 16 uint16_t elements.
- * 1023 * 171 = 174,933 overflows 16 bits, so the weighted sum is built in
- * 32-bit.  Interleaving a and b into (a_i, b_i) pairs and running one
- * vpmaddwd against the weight pair {171, 85} gives 171*a_i + 85*b_i for each
- * pair directly, a single multiply-add in place of two multiplies and an add.
- * 10-bit inputs keep every product and the sum well inside a signed 32-bit
- * lane.  unpacklo/hi feed the low and high element groups and packus_epi32
- * narrows back to 16-bit; both work within 128-bit lanes, so the packed
- * result stays in element order.
+ * Rewriting the blend as a + round((b-a) * 85/256) keeps the entire operation
+ * in signed 16-bit lanes: the 10-bit difference is in [-1023,1023], and
+ * vpmulhrsw with 85*128 performs the exact signed rounded division by 256.
+ * The identity replaces the widened unpack/madd/round/pack chain with three
+ * dependent vector instructions.
  * ----------------------------------------------------------------------- */
 
 static inline __m256i avx2_blend_2_1_hdr(__m256i a, __m256i b)
 {
-    /* Weight pair: the low 16 bits multiply a, the high 16 bits multiply b. */
+    const __m256i scale = _mm256_set1_epi16(85 * 128);
+    __m256i delta = _mm256_mulhrs_epi16(_mm256_sub_epi16(b, a), scale);
+    return _mm256_add_epi16(a, delta);
+}
+
+/* The widened formulation uses more instructions, but keeping it available
+ * lets the thirds kernel distribute work between the integer-multiply and
+ * shuffle ports on cores where a dense sequence of vpmulhrsw instructions
+ * becomes the bottleneck. */
+static inline __m256i avx2_blend_2_1_hdr_wide(__m256i a, __m256i b)
+{
     const __m256i w   = _mm256_set1_epi32((85 << 16) | 171);
     const __m256i rnd = _mm256_set1_epi32(128);
-
     __m256i ab_lo = _mm256_unpacklo_epi16(a, b);
     __m256i ab_hi = _mm256_unpackhi_epi16(a, b);
-
     __m256i lo = _mm256_srli_epi32(
         _mm256_add_epi32(_mm256_madd_epi16(ab_lo, w), rnd), 8);
     __m256i hi = _mm256_srli_epi32(
         _mm256_add_epi32(_mm256_madd_epi16(ab_hi, w), rnd), 8);
-
     return _mm256_packus_epi32(lo, hi);
 }
-
 
 /* -----------------------------------------------------------------------
  * AVX2 horizontal halving helper for 10-bit
@@ -279,6 +283,74 @@ static inline __m128i halve_8_to_4_hdr(__m128i v)
     __m128i sum = _mm_add_epi16(even, odd);
     __m128i one = _mm_set1_epi16(1);
     return _mm_srli_epi16(_mm_add_epi16(sum, one), 1);
+}
+
+/* Complete the horizontal pow2 cascade while a freshly computed vertical
+ * average is still in registers.  The valid result counts are 16/8/4/2 for
+ * the paired form and 8/4/2/1 for the residual YMM form. */
+static inline void store_pow2_32_hdr(__m256i v0, __m256i v1, int level,
+                                     uint16_t *restrict dst)
+{
+    __m256i h1 = avx2_halve_32_to_16_hdr(v0, v1);
+    if (level == 0) {
+        _mm256_storeu_si256((__m256i *)dst, h1);
+        return;
+    }
+
+    __m128i h2 = avx2_halve_16_to_8_hdr(h1);
+    if (level == 1) {
+        _mm_storeu_si128((__m128i *)dst, h2);
+        return;
+    }
+
+    __m128i h3 = halve_8_to_4_hdr(h2);
+    if (level == 2) {
+        _mm_storel_epi64((__m128i *)dst, h3);
+        return;
+    }
+
+    __m128i h4 = halve_8_to_4_hdr(h3);
+    uint32_t packed = (uint32_t)_mm_cvtsi128_si32(h4);
+    memcpy(dst, &packed, sizeof(packed));
+}
+
+static inline void store_pow2_16_hdr(__m256i v, int level,
+                                     uint16_t *restrict dst)
+{
+    __m128i h1 = avx2_halve_16_to_8_hdr(v);
+    if (level == 0) {
+        _mm_storeu_si128((__m128i *)dst, h1);
+        return;
+    }
+
+    __m128i h2 = halve_8_to_4_hdr(h1);
+    if (level == 1) {
+        _mm_storel_epi64((__m128i *)dst, h2);
+        return;
+    }
+
+    __m128i h3 = halve_8_to_4_hdr(h2);
+    if (level == 2) {
+        uint32_t packed = (uint32_t)_mm_cvtsi128_si32(h3);
+        memcpy(dst, &packed, sizeof(packed));
+        return;
+    }
+
+    __m128i h4 = halve_8_to_4_hdr(h3);
+    dst[0] = (uint16_t)_mm_extract_epi16(h4, 0);
+}
+
+static inline uint16_t reduce_pow2_scalar_hdr(const uint16_t *src, int level)
+{
+    uint16_t values[16];
+    int count = 2 << level;
+    memcpy(values, src, (size_t)count * sizeof(uint16_t));
+    while (count > 1) {
+        for (int i = 0; i < count / 2; i++)
+            values[i] = avg_u16(values[2 * i], values[2 * i + 1]);
+        count >>= 1;
+    }
+    return values[0];
 }
 
 
@@ -445,25 +517,18 @@ static inline void deinterleave_3x16_hdr(__m256i reg_a, __m256i reg_b, __m256i r
  * group 1, lane 1 = group 2).  Produces 32 output elements (64 bytes)
  * stored at dst.
  *
- * The blend for 10-bit requires widening to 32-bit because
- * 1023 * 171 = 174,933 overflows uint16_t.  We process each YMM's
- * low and high halves separately, widening 16->32, multiplying,
- * shifting, and packing back to 16-bit.
+ * The default blend uses the exact signed-difference VPMULHRSW identity.
+ * A widened VPMADDWD variant is selected by the 12x pipeline to distribute
+ * its denser instruction stream across different execution ports.
  *
  * After blending, the interleave step reorders [out0, out1] into
  * memory layout [out0[0], out1[0], out0[1], out1[1], ...] using
  * _mm256_unpacklo/hi_epi16, then vperm2i128 to fix lane crossing.
  * ----------------------------------------------------------------------- */
 
-static inline void h_chunk_1_5x_hdr_avx2(__m256i A, __m256i B, __m256i C,
-                                           uint16_t *restrict dst)
+static inline void h_chunk_1_5x_store_hdr_avx2(__m256i out0, __m256i out1,
+                                                uint16_t *restrict dst)
 {
-    /* out0 = (A * 171 + B * 85 + 128) >> 8 */
-    __m256i out0 = avx2_blend_2_1_hdr(A, B);
-
-    /* out1 = (C * 171 + B * 85 + 128) >> 8 */
-    __m256i out1 = avx2_blend_2_1_hdr(C, B);
-
     /* Interleave out0/out1 pairs (16-bit elements).
      * unpacklo_epi16 interleaves the low 4 elements per lane,
      * unpackhi_epi16 interleaves the high 4 elements per lane. */
@@ -480,6 +545,20 @@ static inline void h_chunk_1_5x_hdr_avx2(__m256i A, __m256i B, __m256i C,
 
     _mm256_store_si256((__m256i *)(dst),      store0);
     _mm256_store_si256((__m256i *)(dst + 16), store1);
+}
+
+static inline void h_chunk_1_5x_hdr_avx2(__m256i A, __m256i B, __m256i C,
+                                          uint16_t *restrict dst)
+{
+    h_chunk_1_5x_store_hdr_avx2(avx2_blend_2_1_hdr(A, B),
+                                avx2_blend_2_1_hdr(C, B), dst);
+}
+
+static inline void h_chunk_1_5x_wide_hdr_avx2(__m256i A, __m256i B, __m256i C,
+                                               uint16_t *restrict dst)
+{
+    h_chunk_1_5x_store_hdr_avx2(avx2_blend_2_1_hdr_wide(A, B),
+                                avx2_blend_2_1_hdr_wide(C, B), dst);
 }
 
 
@@ -536,11 +615,12 @@ static inline void h_chunk_6x_hdr_avx2(__m256i result_3x, uint16_t *restrict dst
  * Power-of-two kernel: scale a single 10-bit plane (AVX2)
  *
  * Vertical: AVX2 avx2_avg_u16 cascade (16 elements per YMM chunk)
- * Horizontal: AVX2 pairwise halving cascade + scalar tail
+ * Horizontal: completed in registers as each vertical vector is produced
  *
- * Same architecture as the 8-bit scale_plane_pow2_avx2 but operating
- * on uint16_t elements.  Each YMM register holds 16 elements (32 bytes)
- * instead of 32 bytes of 8-bit data.
+ * Vertical levels remain separate passes to avoid a high-pressure reduction
+ * tree.  Only vertical data needed by a deeper level is stored to scratch;
+ * requested horizontal results are emitted from the live vectors, eliminating
+ * the completed-row reloads and the full-width horizontal scratch passes.
  * ----------------------------------------------------------------------- */
 
 static void __attribute__((hot)) scale_plane_pow2_hdr_avx2(
@@ -589,15 +669,7 @@ static void __attribute__((hot)) scale_plane_pow2_hdr_avx2(
         if (!vert_buf[k]) return;
     }
 
-    /* Horizontal cascade buffer */
-    uint16_t *h_buf = (uint16_t *)fused_scratch_alloc(
-        &scratch, (size_t)src_w * sizeof(uint16_t));
-    if (!h_buf) return;
-
     int out_row[4] = { 0, 0, 0, 0 };
-
-    /* AVX2 chunk count: 16 uint16_t elements = 32 bytes per YMM */
-    int avx2_chunks = src_w / 16;
 
     for (int g = 0; g < num_groups; g++) {
         const uint16_t *grp_base = src
@@ -605,7 +677,8 @@ static void __attribute__((hot)) scale_plane_pow2_hdr_avx2(
 
         /* -- Vertical cascade (AVX2) --------------------------------- */
 
-        /* Level 0 (2x vertical): pairwise average source rows */
+        /* Level 0 (2x vertical), with the horizontal result emitted from the
+         * live averages when requested. */
         for (int r = 0; r < vert_rows[0]; r++) {
             const uint16_t *restrict ra = grp_base
                 + (size_t)(2 * r) * (size_t)src_el_stride;
@@ -613,16 +686,45 @@ static void __attribute__((hot)) scale_plane_pow2_hdr_avx2(
                 + (size_t)(2 * r + 1) * (size_t)src_el_stride;
             uint16_t *restrict dst_row = vert_buf[0]
                 + (size_t)r * (size_t)src_w;
+            int emit = (active_outputs & (1u << bit_pos[0])) != 0;
+            int keep = deepest > 0;
+            int dst_el_stride = emit
+                ? dst_strides[0] / (int)sizeof(uint16_t) : 0;
+            uint16_t *restrict out = emit ? dst_planes[0]
+                + (size_t)out_row[0] * (size_t)dst_el_stride : NULL;
 
             int x = 0;
-            for (int c = 0; c < avx2_chunks; c++, x += 16) {
-                __m256i va = _mm256_loadu_si256((const __m256i *)(ra + x));
-                __m256i vb = _mm256_loadu_si256((const __m256i *)(rb + x));
-                _mm256_storeu_si256((__m256i *)(dst_row + x),
-                                    avx2_avg_u16(va, vb));
+            int out_x = 0;
+            for (; x + 32 <= src_w; x += 32, out_x += 16) {
+                __m256i v0 = avx2_avg_u16(
+                    _mm256_loadu_si256((const __m256i *)(ra + x)),
+                    _mm256_loadu_si256((const __m256i *)(rb + x)));
+                __m256i v1 = avx2_avg_u16(
+                    _mm256_loadu_si256((const __m256i *)(ra + x + 16)),
+                    _mm256_loadu_si256((const __m256i *)(rb + x + 16)));
+                if (keep) {
+                    _mm256_storeu_si256((__m256i *)(dst_row + x), v0);
+                    _mm256_storeu_si256((__m256i *)(dst_row + x + 16), v1);
+                }
+                if (emit) store_pow2_32_hdr(v0, v1, 0, out + out_x);
             }
+            if (x + 16 <= src_w) {
+                __m256i v = avx2_avg_u16(
+                    _mm256_loadu_si256((const __m256i *)(ra + x)),
+                    _mm256_loadu_si256((const __m256i *)(rb + x)));
+                if (keep) _mm256_storeu_si256((__m256i *)(dst_row + x), v);
+                if (emit) store_pow2_16_hdr(v, 0, out + out_x);
+                x += 16;
+                out_x += 8;
+            }
+            int tail_start = x;
             for (; x < src_w; x++) {
                 dst_row[x] = avg_u16(ra[x], rb[x]);
+            }
+            if (emit) {
+                for (int sx = tail_start; sx < src_w; sx += 2)
+                    out[out_x++] = reduce_pow2_scalar_hdr(dst_row + sx, 0);
+                out_row[0]++;
             }
         }
 
@@ -635,90 +737,48 @@ static void __attribute__((hot)) scale_plane_pow2_hdr_avx2(
                     + (size_t)(2 * r + 1) * (size_t)src_w;
                 uint16_t *restrict dst_row = vert_buf[k]
                     + (size_t)r * (size_t)src_w;
+                int emit = (active_outputs & (1u << bit_pos[k])) != 0;
+                int keep = k < deepest;
+                int dst_el_stride = emit
+                    ? dst_strides[k] / (int)sizeof(uint16_t) : 0;
+                uint16_t *restrict out = emit ? dst_planes[k]
+                    + (size_t)out_row[k] * (size_t)dst_el_stride : NULL;
 
                 int x = 0;
-                for (int c = 0; c < avx2_chunks; c++, x += 16) {
-                    __m256i va = _mm256_loadu_si256((const __m256i *)(ra + x));
-                    __m256i vb = _mm256_loadu_si256((const __m256i *)(rb + x));
-                    _mm256_storeu_si256((__m256i *)(dst_row + x),
-                                        avx2_avg_u16(va, vb));
+                int out_x = 0;
+                int out_per_32 = 16 >> k;
+                for (; x + 32 <= src_w; x += 32, out_x += out_per_32) {
+                    __m256i v0 = avx2_avg_u16(
+                        _mm256_loadu_si256((const __m256i *)(ra + x)),
+                        _mm256_loadu_si256((const __m256i *)(rb + x)));
+                    __m256i v1 = avx2_avg_u16(
+                        _mm256_loadu_si256((const __m256i *)(ra + x + 16)),
+                        _mm256_loadu_si256((const __m256i *)(rb + x + 16)));
+                    if (keep) {
+                        _mm256_storeu_si256((__m256i *)(dst_row + x), v0);
+                        _mm256_storeu_si256((__m256i *)(dst_row + x + 16), v1);
+                    }
+                    if (emit) store_pow2_32_hdr(v0, v1, k, out + out_x);
                 }
+                if (x + 16 <= src_w) {
+                    __m256i v = avx2_avg_u16(
+                        _mm256_loadu_si256((const __m256i *)(ra + x)),
+                        _mm256_loadu_si256((const __m256i *)(rb + x)));
+                    if (keep) _mm256_storeu_si256((__m256i *)(dst_row + x), v);
+                    if (emit) store_pow2_16_hdr(v, k, out + out_x);
+                    x += 16;
+                    out_x += 8 >> k;
+                }
+                int tail_start = x;
                 for (; x < src_w; x++) {
                     dst_row[x] = avg_u16(ra[x], rb[x]);
                 }
-            }
-        }
-
-        /* -- Horizontal cascade (AVX2) + output write ---------------- */
-
-        for (int k = 0; k <= deepest; k++) {
-            if (!(active_outputs & (1u << bit_pos[k]))) continue;
-
-            /* Convert destination byte stride to element stride */
-            int dst_el_stride = dst_strides[k] / (int)sizeof(uint16_t);
-
-            for (int r = 0; r < vert_rows[k]; r++) {
-                const uint16_t *restrict vert_row = vert_buf[k]
-                    + (size_t)r * (size_t)src_w;
-
-                /* Horizontal cascade: (k+1) halvings */
-                int cur_w = src_w;
-                const uint16_t *cur_src = vert_row;
-
-                /* Output plane row this reduction level writes to. */
-                uint16_t *out = dst_planes[k]
-                    + (size_t)out_row[k] * (size_t)dst_el_stride;
-
-                for (int hstep = 0; hstep < (k + 1); hstep++) {
-                    int next_w = cur_w >> 1;
-                    /* Number of whole 16-sample chunks in this row. */
-                    int h_chunks = cur_w / 16;
-                    int out_x = 0;
-
-                    /* The last halving of the cascade writes straight into the
-                     * output plane; earlier halvings write the scratch row
-                     * h_buf that feeds the next step.  The vector stores stop
-                     * at h_chunks*8 elements, which is at most the destination
-                     * width (src_w is divisible by 2^(k+1), so every step's
-                     * width stays even), so the row padding past the image edge
-                     * is never written.  The unroll keeps enough independent
-                     * pairs in flight to hide the multiply latency of the
-                     * paired halve.  step_dst is deliberately not marked
-                     * restrict: on intermediate steps it is h_buf and overlaps
-                     * cur_src, but each load happens before the store that
-                     * trails it, so writing in place is safe. */
-                    uint16_t *step_dst = (hstep == k) ? out : h_buf;
-
-                    int c = 0;
-                    #pragma GCC unroll 4
-                    for (; c + 1 < h_chunks; c += 2) {
-                        __m256i v0 = _mm256_loadu_si256(
-                            (const __m256i *)(cur_src + c * 16));
-                        __m256i v1 = _mm256_loadu_si256(
-                            (const __m256i *)(cur_src + c * 16 + 16));
-                        _mm256_storeu_si256((__m256i *)(step_dst + out_x),
-                                            avx2_halve_32_to_16_hdr(v0, v1));
-                        out_x += 16;
-                    }
-                    /* Trailing single chunk for an odd chunk count. */
-                    for (; c < h_chunks; c++) {
-                        __m256i v = _mm256_loadu_si256(
-                            (const __m256i *)(cur_src + c * 16));
-                        __m128i result = avx2_halve_16_to_8_hdr(v);
-                        _mm_storeu_si128((__m128i *)(step_dst + out_x), result);
-                        out_x += 8;
-                    }
-                    /* Scalar tail for remaining elements */
-                    int tail_in = h_chunks * 16;
-                    for (int tx = tail_in; tx + 1 < cur_w; tx += 2) {
-                        step_dst[out_x++] = avg_u16(cur_src[tx], cur_src[tx + 1]);
-                    }
-
-                    cur_w = next_w;
-                    cur_src = step_dst;
+                if (emit) {
+                    int step = 2 << k;
+                    for (int sx = tail_start; sx < src_w; sx += step)
+                        out[out_x++] = reduce_pow2_scalar_hdr(dst_row + sx, k);
+                    out_row[k]++;
                 }
-
-                out_row[k]++;
             }
         }
     }
@@ -749,7 +809,7 @@ static void __attribute__((hot)) scale_plane_pow2_hdr_avx2(
  * Horizontal: deinterleave_3x16_hdr + h_chunk_{1_5x,3x,6x}_hdr_avx2
  * ----------------------------------------------------------------------- */
 
-static void __attribute__((hot)) scale_plane_thirds_hdr_avx2(
+static void __attribute__((hot, aligned(64))) scale_plane_thirds_hdr_avx2(
     const uint16_t *restrict src,
     int src_w, int src_h, int src_stride,
     uint32_t active_outputs,
@@ -947,22 +1007,51 @@ static void __attribute__((hot)) scale_plane_thirds_hdr_avx2(
                 /* 1.5x rows.  Rows 0/3 are v01/v45 directly; rows 1/2 are the
                  * vertical bilinear blends computed component-wise (blend
                  * commutes with the deinterleave). */
-                h_chunk_1_5x_hdr_avx2(Av01, Bv01, Cv01, dst_1_5x_r0 + out_off_1_5x);
-                {
-                    __m256i bA = avx2_blend_2_1_hdr(Av01, Av23);
-                    __m256i bB = avx2_blend_2_1_hdr(Bv01, Bv23);
-                    __m256i bC = avx2_blend_2_1_hdr(Cv01, Cv23);
-                    h_chunk_1_5x_hdr_avx2(bA, bB, bC,
-                                          dst_1_5x_r1 + out_off_1_5x);
+                /* Select once per chunk rather than once per blend.  A 12x
+                 * ladder has enough simultaneous horizontal and vertical
+                 * blends to bottleneck a dense VPMULHRSW sequence on Zen 5;
+                 * the widened VPMADDWD pipeline spreads that work across the
+                 * multiply and shuffle ports.  Shallower ladders retain the
+                 * much shorter three-instruction VPMULHRSW formulation. */
+                if (need_12x) {
+                    h_chunk_1_5x_wide_hdr_avx2(
+                        Av01, Bv01, Cv01, dst_1_5x_r0 + out_off_1_5x);
+                    {
+                        __m256i bA = avx2_blend_2_1_hdr_wide(Av01, Av23);
+                        __m256i bB = avx2_blend_2_1_hdr_wide(Bv01, Bv23);
+                        __m256i bC = avx2_blend_2_1_hdr_wide(Cv01, Cv23);
+                        h_chunk_1_5x_wide_hdr_avx2(
+                            bA, bB, bC, dst_1_5x_r1 + out_off_1_5x);
+                    }
+                    {
+                        __m256i bA = avx2_blend_2_1_hdr_wide(Av23, Av45);
+                        __m256i bB = avx2_blend_2_1_hdr_wide(Bv23, Bv45);
+                        __m256i bC = avx2_blend_2_1_hdr_wide(Cv23, Cv45);
+                        h_chunk_1_5x_wide_hdr_avx2(
+                            bA, bB, bC, dst_1_5x_r2 + out_off_1_5x);
+                    }
+                    h_chunk_1_5x_wide_hdr_avx2(
+                        Av45, Bv45, Cv45, dst_1_5x_r3 + out_off_1_5x);
+                } else {
+                    h_chunk_1_5x_hdr_avx2(
+                        Av01, Bv01, Cv01, dst_1_5x_r0 + out_off_1_5x);
+                    {
+                        __m256i bA = avx2_blend_2_1_hdr(Av01, Av23);
+                        __m256i bB = avx2_blend_2_1_hdr(Bv01, Bv23);
+                        __m256i bC = avx2_blend_2_1_hdr(Cv01, Cv23);
+                        h_chunk_1_5x_hdr_avx2(
+                            bA, bB, bC, dst_1_5x_r1 + out_off_1_5x);
+                    }
+                    {
+                        __m256i bA = avx2_blend_2_1_hdr(Av23, Av45);
+                        __m256i bB = avx2_blend_2_1_hdr(Bv23, Bv45);
+                        __m256i bC = avx2_blend_2_1_hdr(Cv23, Cv45);
+                        h_chunk_1_5x_hdr_avx2(
+                            bA, bB, bC, dst_1_5x_r2 + out_off_1_5x);
+                    }
+                    h_chunk_1_5x_hdr_avx2(
+                        Av45, Bv45, Cv45, dst_1_5x_r3 + out_off_1_5x);
                 }
-                {
-                    __m256i bA = avx2_blend_2_1_hdr(Av23, Av45);
-                    __m256i bB = avx2_blend_2_1_hdr(Bv23, Bv45);
-                    __m256i bC = avx2_blend_2_1_hdr(Cv23, Cv45);
-                    h_chunk_1_5x_hdr_avx2(bA, bB, bC,
-                                          dst_1_5x_r2 + out_off_1_5x);
-                }
-                h_chunk_1_5x_hdr_avx2(Av45, Bv45, Cv45, dst_1_5x_r3 + out_off_1_5x);
 
                 /* 3x vertical reduction in component space (reused by 6x). */
                 __m256i A3x0 = _mm256_setzero_si256();

@@ -27,12 +27,10 @@
  *   - pairwise halving: vpermt2w even/odd gather + one vpavgw
  *   - P010 chroma deinterleave: two vpermt2w per 32 chroma columns
  *
- * The arithmetic transplants from AVX2 unchanged: the 171/85 blend stays
- * in the 32-bit madd domain (1023*171 overflows 16 bits), box-of-3 stays
- * in 16 bits (max sum 3069), and the unpack/packus pairs around the blend
- * are per-128-bit-lane symmetric, so results come out linear at any
- * register width.  Tails run the same vector bodies under element masks -
- * no scalar tail exists in this file.
+ * The 171/85 blend uses an exact signed-difference VPMULHRSW identity that
+ * stays in 16-bit lanes despite 1023*171 overflowing a direct product.
+ * Box-of-3 also stays in 16 bits (max sum 3069).  Tails run the same vector
+ * bodies under element masks - no scalar tail exists in this file.
  *
  * COMPILE-TIME SELF-STUBBING: same scheme as kernels_avx512.c.  The
  * Makefile only passes -mavx512* flags when the compiler accepts them;
@@ -51,6 +49,7 @@
     defined(__AVX512VL__) && defined(__AVX512VBMI__)
 
 #include <immintrin.h>
+#include <string.h>
 
 #define ALIGN64 __attribute__((aligned(64)))
 
@@ -153,28 +152,74 @@ static inline __m128i avx512_halve_16w_to_8w(__m256i v)
     return _mm256_cvtepi32_epi16(sums);
 }
 
-/* -----------------------------------------------------------------------
- * Vertical pairwise row average across one full row of uint16_t.
- * chunks counts whole 32-element vectors; tail_mask covers the remaining
- * 0-31 elements with one masked op.
- * ----------------------------------------------------------------------- */
-static inline void avx512_avg_rows_hdr(const uint16_t *restrict ra,
-                                       const uint16_t *restrict rb,
-                                       uint16_t *restrict dst,
-                                       int chunks, __mmask32 tail_mask)
+/* 8 input elements -> 4.  Reapplying this helper to a vector with only its
+ * low four lanes valid produces the final 4 -> 2 reduction in those lanes. */
+static inline __m128i avx512_halve_8w_to_4w(__m128i v)
 {
-    int x = 0;
-    for (int c = 0; c < chunks; c++, x += 32) {
-        __m512i va = _mm512_loadu_si512((const void *)(ra + x));
-        __m512i vb = _mm512_loadu_si512((const void *)(rb + x));
-        _mm512_storeu_si512((void *)(dst + x), _mm512_avg_epu16(va, vb));
+    __m128i sums = _mm_madd_epi16(v, _mm_set1_epi16(1));
+    sums = _mm_srli_epi32(_mm_add_epi32(sums, _mm_set1_epi32(1)), 1);
+    return _mm_cvtepi32_epi16(sums);
+}
+
+/* Finish the horizontal pow2 cascade while each vertical average is still
+ * live.  The paired form consumes 64 elements; the residual consumes 32. */
+static inline void store_pow2_64w_avx512(__m512i v0, __m512i v1, int level,
+                                         uint16_t *restrict dst)
+{
+    __m512i h1 = avx512_halve_64w_to_32w(v0, v1);
+    if (level == 0) {
+        _mm512_storeu_si512((void *)dst, h1);
+        return;
     }
-    if (tail_mask) {
-        __m512i va = _mm512_maskz_loadu_epi16(tail_mask, ra + x);
-        __m512i vb = _mm512_maskz_loadu_epi16(tail_mask, rb + x);
-        _mm512_mask_storeu_epi16(dst + x, tail_mask,
-                                 _mm512_avg_epu16(va, vb));
+    __m256i h2 = avx512_halve_32w_to_16w(h1);
+    if (level == 1) {
+        _mm256_storeu_si256((__m256i *)dst, h2);
+        return;
     }
+    __m128i h3 = avx512_halve_16w_to_8w(h2);
+    if (level == 2) {
+        _mm_storeu_si128((__m128i *)dst, h3);
+        return;
+    }
+    _mm_storel_epi64((__m128i *)dst, avx512_halve_8w_to_4w(h3));
+}
+
+static inline void store_pow2_32w_avx512(__m512i v, int level,
+                                         uint16_t *restrict dst)
+{
+    __m256i h1 = avx512_halve_32w_to_16w(v);
+    if (level == 0) {
+        _mm256_storeu_si256((__m256i *)dst, h1);
+        return;
+    }
+    __m128i h2 = avx512_halve_16w_to_8w(h1);
+    if (level == 1) {
+        _mm_storeu_si128((__m128i *)dst, h2);
+        return;
+    }
+    __m128i h3 = avx512_halve_8w_to_4w(h2);
+    if (level == 2) {
+        _mm_storel_epi64((__m128i *)dst, h3);
+        return;
+    }
+    uint32_t packed = (uint32_t)_mm_cvtsi128_si32(
+        avx512_halve_8w_to_4w(h3));
+    memcpy(dst, &packed, sizeof(packed));
+}
+
+static inline uint16_t reduce_pow2_scalar_hdr_avx512(const uint16_t *src,
+                                                      int level)
+{
+    uint16_t values[16];
+    int count = 2 << level;
+    memcpy(values, src, (size_t)count * sizeof(uint16_t));
+    while (count > 1) {
+        for (int i = 0; i < count / 2; i++)
+            values[i] = (uint16_t)(((uint32_t)values[2 * i]
+                                  + values[2 * i + 1] + 1) >> 1);
+        count >>= 1;
+    }
+    return values[0];
 }
 
 /* -----------------------------------------------------------------------
@@ -208,21 +253,14 @@ static inline __m512i box3_div_hdr_avx512(__m512i A, __m512i B, __m512i C)
                               magic);
 }
 
-/* (a*171 + b*85 + 128) >> 8 on 32 elements.  10-bit a times 171 overflows
- * 16 bits, so the weighted sum runs in the 32-bit madd domain: interleave
- * (a_i, b_i) pairs, one vpmaddwd against {171, 85} per half, round, shift,
- * pack back.  unpack/packus are per-lane symmetric: linear in, linear out. */
+/* (a*171 + b*85 + 128) >> 8 on 32 elements.  Rewriting this as
+ * a + round((b-a)*85/256) keeps the 10-bit difference in signed 16-bit
+ * range; VPMULHRSW with 85*128 performs the exact rounded division. */
 static inline __m512i avx512_blend_2_1_hdr(__m512i a, __m512i b)
 {
-    const __m512i w   = _mm512_set1_epi32((85 << 16) | 171);
-    const __m512i rnd = _mm512_set1_epi32(128);
-
-    __m512i lo = _mm512_srli_epi32(_mm512_add_epi32(
-        _mm512_madd_epi16(_mm512_unpacklo_epi16(a, b), w), rnd), 8);
-    __m512i hi = _mm512_srli_epi32(_mm512_add_epi32(
-        _mm512_madd_epi16(_mm512_unpackhi_epi16(a, b), w), rnd), 8);
-
-    return _mm512_packus_epi32(lo, hi);
+    const __m512i scale = _mm512_set1_epi16(85 * 128);
+    return _mm512_add_epi16(a, _mm512_mulhrs_epi16(
+        _mm512_sub_epi16(b, a), scale));
 }
 
 /* Horizontal 1.5x on one deinterleaved component triplet: 32 triplets in,
@@ -253,8 +291,9 @@ static inline __attribute__((always_inline)) void h_chunk_1_5x_hdr_avx512(
 /* -----------------------------------------------------------------------
  * Power-of-two kernel: scale a single 10-bit plane (AVX-512)
  *
- * Same two-phase structure as scale_plane_pow2_hdr_avx2 at twice the
- * element width, with every partial chunk handled by one masked op.
+ * Requested horizontal reductions are emitted from live vertical vectors;
+ * only rows consumed by a deeper level reach scratch.  This removes the
+ * completed-row reloads and full-width horizontal scratch cascades.
  * ----------------------------------------------------------------------- */
 static void __attribute__((hot)) scale_plane_pow2_hdr_avx512(
     const uint16_t *restrict src,
@@ -299,105 +338,111 @@ static void __attribute__((hot)) scale_plane_pow2_hdr_avx512(
         if (!vert_buf[k]) return;
     }
 
-    uint16_t *h_buf = (uint16_t *)fused_scratch_alloc(
-        &scratch, (size_t)src_w * sizeof(uint16_t));
-    if (!h_buf) return;
-
     int out_row[4] = { 0, 0, 0, 0 };
-
-    /* Vertical chunk geometry: 32 elements per vector plus a masked tail. */
-    int v_chunks = src_w / 32;
-    int v_rem    = src_w - v_chunks * 32;
-    __mmask32 v_mask = v_rem ? hdr_mask32(v_rem) : 0;
 
     for (int g = 0; g < num_groups; g++) {
         const uint16_t *grp_base = src
             + (size_t)g * (size_t)group_rows * (size_t)src_el_stride;
 
-        /* -- Vertical cascade --------------------------------------- */
-
+        /* Level 0 emits its horizontal result from live vertical averages
+         * and only stores rows that feed a deeper vertical level. */
         for (int r = 0; r < vert_rows[0]; r++) {
-            avx512_avg_rows_hdr(
-                grp_base + (size_t)(2 * r)     * (size_t)src_el_stride,
-                grp_base + (size_t)(2 * r + 1) * (size_t)src_el_stride,
-                vert_buf[0] + (size_t)r * (size_t)src_w,
-                v_chunks, v_mask);
-        }
+            const uint16_t *restrict ra = grp_base
+                + (size_t)(2 * r) * (size_t)src_el_stride;
+            const uint16_t *restrict rb = grp_base
+                + (size_t)(2 * r + 1) * (size_t)src_el_stride;
+            uint16_t *restrict dst_row = vert_buf[0] + (size_t)r * (size_t)src_w;
+            int emit = (active_outputs & (1u << bit_pos[0])) != 0;
+            int keep = deepest > 0;
+            int dst_el_stride = emit
+                ? dst_strides[0] / (int)sizeof(uint16_t) : 0;
+            uint16_t *restrict out = emit ? dst_planes[0]
+                + (size_t)out_row[0] * (size_t)dst_el_stride : NULL;
 
-        for (int k = 1; k <= deepest; k++) {
-            for (int r = 0; r < vert_rows[k]; r++) {
-                avx512_avg_rows_hdr(
-                    vert_buf[k - 1] + (size_t)(2 * r)     * (size_t)src_w,
-                    vert_buf[k - 1] + (size_t)(2 * r + 1) * (size_t)src_w,
-                    vert_buf[k] + (size_t)r * (size_t)src_w,
-                    v_chunks, v_mask);
+            int x = 0;
+            int out_x = 0;
+            for (; x + 64 <= src_w; x += 64, out_x += 32) {
+                __m512i v0 = _mm512_avg_epu16(
+                    _mm512_loadu_si512((const void *)(ra + x)),
+                    _mm512_loadu_si512((const void *)(rb + x)));
+                __m512i v1 = _mm512_avg_epu16(
+                    _mm512_loadu_si512((const void *)(ra + x + 32)),
+                    _mm512_loadu_si512((const void *)(rb + x + 32)));
+                if (keep) {
+                    _mm512_storeu_si512((void *)(dst_row + x), v0);
+                    _mm512_storeu_si512((void *)(dst_row + x + 32), v1);
+                }
+                if (emit) store_pow2_64w_avx512(v0, v1, 0, out + out_x);
+            }
+            if (x + 32 <= src_w) {
+                __m512i v = _mm512_avg_epu16(
+                    _mm512_loadu_si512((const void *)(ra + x)),
+                    _mm512_loadu_si512((const void *)(rb + x)));
+                if (keep) _mm512_storeu_si512((void *)(dst_row + x), v);
+                if (emit) store_pow2_32w_avx512(v, 0, out + out_x);
+                x += 32;
+                out_x += 16;
+            }
+            int tail_start = x;
+            for (; x < src_w; x++)
+                dst_row[x] = (uint16_t)(((uint32_t)ra[x] + rb[x] + 1) >> 1);
+            if (emit) {
+                for (int sx = tail_start; sx < src_w; sx += 2)
+                    out[out_x++] = reduce_pow2_scalar_hdr_avx512(dst_row + sx, 0);
+                out_row[0]++;
             }
         }
 
-        /* -- Horizontal cascade + output write ----------------------- */
-
-        for (int k = 0; k <= deepest; k++) {
-            if (!(active_outputs & (1u << bit_pos[k]))) continue;
-
-            int dst_el_stride = dst_strides[k] / (int)sizeof(uint16_t);
-
+        /* Deeper levels keep the separate, low-pressure vertical passes but
+         * finish each requested horizontal cascade before spilling the row. */
+        for (int k = 1; k <= deepest; k++) {
             for (int r = 0; r < vert_rows[k]; r++) {
-                const uint16_t *restrict vert_row = vert_buf[k]
-                    + (size_t)r * (size_t)src_w;
+                const uint16_t *restrict ra = vert_buf[k - 1]
+                    + (size_t)(2 * r) * (size_t)src_w;
+                const uint16_t *restrict rb = vert_buf[k - 1]
+                    + (size_t)(2 * r + 1) * (size_t)src_w;
+                uint16_t *restrict dst_row = vert_buf[k] + (size_t)r * (size_t)src_w;
+                int emit = (active_outputs & (1u << bit_pos[k])) != 0;
+                int keep = k < deepest;
+                int dst_el_stride = emit
+                    ? dst_strides[k] / (int)sizeof(uint16_t) : 0;
+                uint16_t *restrict out = emit ? dst_planes[k]
+                    + (size_t)out_row[k] * (size_t)dst_el_stride : NULL;
 
-                uint16_t *restrict out = dst_planes[k]
-                    + (size_t)out_row[k] * (size_t)dst_el_stride;
-
-                /* (k+1) halvings; the final one writes the output plane,
-                 * earlier ones write h_buf.  Masked stores never touch
-                 * row padding past the image edge. */
-                int cur_w = src_w;
-                const uint16_t *cur_src = vert_row;
-
-                for (int hstep = 0; hstep < (k + 1); hstep++) {
-                    uint16_t *step_dst = (hstep == k) ? out : h_buf;
-
-                    int h_chunks = cur_w / 32;
-                    int out_x = 0;
-
-                    int c = 0;
-                    #pragma GCC unroll 4
-                    for (; c + 1 < h_chunks; c += 2) {
-                        __m512i v0 = _mm512_loadu_si512(
-                            (const void *)(cur_src + c * 32));
-                        __m512i v1 = _mm512_loadu_si512(
-                            (const void *)(cur_src + c * 32 + 32));
-                        _mm512_storeu_si512((void *)(step_dst + out_x),
-                                            avx512_halve_64w_to_32w(v0, v1));
-                        out_x += 32;
+                int x = 0;
+                int out_x = 0;
+                int out_per_64 = 32 >> k;
+                for (; x + 64 <= src_w; x += 64, out_x += out_per_64) {
+                    __m512i v0 = _mm512_avg_epu16(
+                        _mm512_loadu_si512((const void *)(ra + x)),
+                        _mm512_loadu_si512((const void *)(rb + x)));
+                    __m512i v1 = _mm512_avg_epu16(
+                        _mm512_loadu_si512((const void *)(ra + x + 32)),
+                        _mm512_loadu_si512((const void *)(rb + x + 32)));
+                    if (keep) {
+                        _mm512_storeu_si512((void *)(dst_row + x), v0);
+                        _mm512_storeu_si512((void *)(dst_row + x + 32), v1);
                     }
-                    for (; c < h_chunks; c++) {
-                        __m512i v = _mm512_loadu_si512(
-                            (const void *)(cur_src + c * 32));
-                        _mm256_storeu_si256((__m256i *)(step_dst + out_x),
-                                            avx512_halve_32w_to_16w(v));
-                        out_x += 16;
-                    }
-
-                    /* Masked tail: same pattern as the SDR kernel - the
-                     * output mask clips the garbage halves above the valid
-                     * region, and an odd final element (no pair partner)
-                     * is dropped to match the scalar tails elsewhere. */
-                    int rem = cur_w - h_chunks * 32;
-                    if (rem > 1) {
-                        __mmask32 in_m = hdr_mask32(rem);
-                        __mmask16 out_m = (__mmask16)((1u << (rem >> 1)) - 1);
-                        __m512i v = _mm512_maskz_loadu_epi16(in_m,
-                                        cur_src + (size_t)h_chunks * 32);
-                        _mm256_mask_storeu_epi16(step_dst + out_x, out_m,
-                                                 avx512_halve_32w_to_16w(v));
-                    }
-
-                    cur_w >>= 1;
-                    cur_src = step_dst;
+                    if (emit) store_pow2_64w_avx512(v0, v1, k, out + out_x);
                 }
-
-                out_row[k]++;
+                if (x + 32 <= src_w) {
+                    __m512i v = _mm512_avg_epu16(
+                        _mm512_loadu_si512((const void *)(ra + x)),
+                        _mm512_loadu_si512((const void *)(rb + x)));
+                    if (keep) _mm512_storeu_si512((void *)(dst_row + x), v);
+                    if (emit) store_pow2_32w_avx512(v, k, out + out_x);
+                    x += 32;
+                    out_x += 16 >> k;
+                }
+                int tail_start = x;
+                for (; x < src_w; x++)
+                    dst_row[x] = (uint16_t)(((uint32_t)ra[x] + rb[x] + 1) >> 1);
+                if (emit) {
+                    int step = 2 << k;
+                    for (int sx = tail_start; sx < src_w; sx += step)
+                        out[out_x++] = reduce_pow2_scalar_hdr_avx512(dst_row + sx, k);
+                    out_row[k]++;
+                }
             }
         }
     }

@@ -207,17 +207,17 @@ bit.
 
 **aarch64 / NEON**
 
-| Workload | Graviton 4 | Apple M3 Ultra | Raspberry Pi 5 |
+| Workload | Graviton 4 | Apple M5 Max | Raspberry Pi 5 |
 |---|---|---|---|
-| 1920×1080 I010 down:1.5x,3x,6x        |  693 µs |  237 µs |  2160 µs |
-| 3840×2160 I010 down:1.5x,3x,6x,12x    | 3066 µs | 1281 µs | 10708 µs |
-| 3840×2160 P010 down:1.5x,3x,6x,12x    | 3389 µs | 1509 µs | 12379 µs |
-| 1920×1080 I010 up:2x                  |  787 µs |  510 µs |  3068 µs |
-| 1920×1080 I010 down:1.5x,3x up:2x     | 1421 µs |  758 µs |  5140 µs |
-| 1920×1080 I010 down:1.5x,3x,6x tone   | 3017 µs | 1398 µs |  6043 µs |
-| 3840×2160 I010 down:1.5x,3x,6x,12x tone | 12463 µs | 5911 µs | 26633 µs |
-| 1920×1080 I010 down:1.5x,3x,6x HDR+tone | 3025 µs | 1449 µs | 6068 µs |
-| 3840×2160 I010 tone 1x                | 15918 µs | 7909 µs | 26815 µs |
+| 1920×1080 I010 down:1.5x,3x,6x        |  284 µs |  140 µs |  1754 µs |
+| 3840×2160 I010 down:1.5x,3x,6x,12x    | 1585 µs |  718 µs |  8819 µs |
+| 3840×2160 P010 down:1.5x,3x,6x,12x    | 1975 µs |  879 µs | 10336 µs |
+| 1920×1080 I010 up:2x                  |  755 µs |  480 µs |  3086 µs |
+| 1920×1080 I010 down:1.5x,3x up:2x     | 1031 µs |  670 µs |  4829 µs |
+| 1920×1080 I010 down:1.5x,3x,6x tone   | 2471 µs | 1130 µs |  5146 µs |
+| 3840×2160 I010 down:1.5x,3x,6x,12x tone | 10229 µs | 4910 µs | 22842 µs |
+| 1920×1080 I010 down:1.5x,3x,6x HDR+tone | 2465 µs | 1141 µs | 5202 µs |
+| 3840×2160 I010 tone 1x                | 14423 µs | 6733 µs | 22954 µs |
 
 The P010 row uses the Y + interleaved-UV layout that most HEVC Main10
 encoders emit natively; the P010 vs I010 gap on the matching 4K
@@ -225,11 +225,12 @@ workload (e.g. 3392 vs 2682 µs on Epyc 7302) is the on-the-fly UV
 deinterleave cost, not a fundamental difference in scaling work.
 
 The AVX2 and NEON HDR kernels are roughly 2–4× slower per byte than
-their SDR counterparts because 10-bit samples halve the number of
-pixels per SIMD register and because the weighted blends overflow
-16-bit lanes at 10-bit precision and must run widened in the 32-bit
-domain, where the rounding steps cost extra add-and-shift work. The
-AVX-512 HDR kernels claw most of that back: a 512-bit register restores
+their SDR counterparts primarily because 10-bit samples halve the
+number of pixels per SIMD register. AVX2 must also widen weighted
+blends into the 32-bit domain; NEON instead expresses the exact blend
+as a signed difference and uses its saturating rounding multiply-high
+instruction in 16-bit lanes. The AVX-512 HDR kernels claw most of the
+lane-count penalty back: a 512-bit register restores
 the lane count a 256-bit register has for 8-bit samples, so on the
 Zen 5 column above the HDR rows run much closer to their SDR twins
 (e.g. 88 µs vs 56 µs at the 1080p thirds ladder).

@@ -462,6 +462,14 @@ static inline uint16_t up_blend_21_u16_scalar(uint16_t a, uint16_t b)
     return (uint16_t)(((uint32_t)a * 85 + (uint32_t)b * 171 + 128) >> 8);
 }
 
+/* (171*a + 85*b + 128) >> 8, using the exact signed-delta Q15 form. */
+static inline uint16x8_t up_blend_171_85_neon_u16(uint16x8_t a, uint16x8_t b)
+{
+    int16x8_t diff = vreinterpretq_s16_u16(vsubq_u16(b, a));
+    int16x8_t delta = vqrdmulhq_n_s16(diff, 10880);
+    return vaddq_u16(a, vreinterpretq_u16_s16(delta));
+}
+
 /* ---- Horizontal 2x upscale of one HDR row ---- */
 static void up_h_2x_row_neon_u16(const uint16_t *src, int src_w, uint16_t *dst)
 {
@@ -529,22 +537,10 @@ static inline void up_vblend_21_row_neon_u16(const uint16_t *a_row,
                                              int w, uint16_t *out)
 {
     int x = 0;
-    const uint16x4_t w85_4   = vdup_n_u16(85);
-    const uint16x4_t w171_4  = vdup_n_u16(171);
-    const uint32x4_t r128_32 = vdupq_n_u32(128);
-
     for (; x + 8 <= w; x += 8) {
         uint16x8_t av = vld1q_u16(a_row + x);
         uint16x8_t bv = vld1q_u16(b_row + x);
-        /* +128 folds into the first vmlal; saves a separate vaddq_u32. */
-        uint32x4_t lo = vmlal_u16(r128_32, vget_low_u16(av), w85_4);
-        lo = vmlal_u16(lo, vget_low_u16(bv), w171_4);
-        uint32x4_t hi = vmlal_u16(r128_32, vget_high_u16(av), w85_4);
-        hi = vmlal_u16(hi, vget_high_u16(bv), w171_4);
-        /* Shift right 8 and narrow back to u16. */
-        uint16x4_t lo_u16 = vshrn_n_u32(lo, 8);
-        uint16x4_t hi_u16 = vshrn_n_u32(hi, 8);
-        vst1q_u16(out + x, vcombine_u16(lo_u16, hi_u16));
+        vst1q_u16(out + x, up_blend_171_85_neon_u16(bv, av));
     }
     for (; x < w; x++) {
         out[x] = up_blend_21_u16_scalar(a_row[x], b_row[x]);
@@ -558,10 +554,6 @@ static void up_h_1_5x_row_neon_u16(const uint16_t *src, int w, uint16_t *dst)
     int full_chunks = pairs / 8;   /* 8 pairs per chunk */
     int p = 0;
 
-    const uint16x4_t w85_4   = vdup_n_u16(85);
-    const uint16x4_t w171_4  = vdup_n_u16(171);
-    const uint32x4_t r128_32 = vdupq_n_u32(128);
-
     for (int c = 0; c < full_chunks; c++) {
         /* vld2q_u16 loads 16 u16 values and deinterleaves into two 8-lane
          * vectors: even positions -> a, odd positions -> b. */
@@ -574,22 +566,8 @@ static void up_h_1_5x_row_neon_u16(const uint16_t *src, int w, uint16_t *dst)
         uint16_t next_a = (next_idx < w) ? src[next_idx] : src[w - 1];
         uint16x8_t c_vec = vextq_u16(a, vdupq_n_u16(next_a), 1);
 
-        /* +128 folds into the first vmlal of each half; saves 4 vaddq_u32. */
-        /* m1 = (a*85 + b*171 + 128) >> 8 */
-        uint32x4_t m1_lo = vmlal_u16(r128_32, vget_low_u16(a), w85_4);
-        m1_lo = vmlal_u16(m1_lo, vget_low_u16(b), w171_4);
-        uint32x4_t m1_hi = vmlal_u16(r128_32, vget_high_u16(a), w85_4);
-        m1_hi = vmlal_u16(m1_hi, vget_high_u16(b), w171_4);
-        uint16x8_t m1 = vcombine_u16(vshrn_n_u32(m1_lo, 8),
-                                     vshrn_n_u32(m1_hi, 8));
-
-        /* m2 = (c*85 + b*171 + 128) >> 8 */
-        uint32x4_t m2_lo = vmlal_u16(r128_32, vget_low_u16(c_vec), w85_4);
-        m2_lo = vmlal_u16(m2_lo, vget_low_u16(b), w171_4);
-        uint32x4_t m2_hi = vmlal_u16(r128_32, vget_high_u16(c_vec), w85_4);
-        m2_hi = vmlal_u16(m2_hi, vget_high_u16(b), w171_4);
-        uint16x8_t m2 = vcombine_u16(vshrn_n_u32(m2_lo, 8),
-                                     vshrn_n_u32(m2_hi, 8));
+        uint16x8_t m1 = up_blend_171_85_neon_u16(b, a);
+        uint16x8_t m2 = up_blend_171_85_neon_u16(b, c_vec);
 
         /* vst3q_u16 stores three 8-lane vectors interleaved as 24 u16
          * values: {a[0], m1[0], m2[0], a[1], m1[1], m2[1], ...}. */

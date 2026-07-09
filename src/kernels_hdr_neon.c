@@ -74,41 +74,25 @@ static inline uint16_t div3_u32(uint32_t sum)
  * NEON helpers for 10-bit arithmetic
  * ----------------------------------------------------------------------- */
 
-/* NEON divide-by-3 for a uint16x8_t of sums (each max 3069).
- * Returns uint16x8_t: (sum * 21846) >> 16.
- * Uses widening multiply: vmull_u16 gives uint32x4_t, then vshrn_n_u32
- * narrows back to uint16x4_t. */
+/* Exact floor(sum / 3) for sums up to 3069.  SQDMULH computes
+ * floor(sum * 10923 / 32768); 10923 is ceil(32768 / 3), and its positive
+ * error stays below 0.032 over this input range, so it cannot cross the next
+ * integer for any residue modulo three. */
 static inline uint16x8_t neon_div3_u16x8_hdr(uint16x8_t sum)
 {
-    uint16x4_t magic = vdup_n_u16(21846);   /* 0x5556 */
-    uint32x4_t p_lo = vmull_u16(vget_low_u16(sum),  magic);
-    uint32x4_t p_hi = vmull_u16(vget_high_u16(sum), magic);
-    uint16x4_t d_lo = vshrn_n_u32(p_lo, 16);
-    uint16x4_t d_hi = vshrn_n_u32(p_hi, 16);
-    return vcombine_u16(d_lo, d_hi);
+    int16x8_t q = vqdmulhq_n_s16(vreinterpretq_s16_u16(sum), 10923);
+    return vreinterpretq_u16_s16(q);
 }
 
-/* Bilinear blend of two 8-element uint16 registers:
- * (a * 171 + b * 85 + 128) >> 8.
- * Widens to uint32_t because 1023 * 171 = 174,933 overflows uint16_t.
- * Max intermediate: 1023*171 + 1023*85 + 128 = 261,960 + 86,955 + 128 = 349,043
- * which fits in uint32_t. */
+/* Bilinear blend (171*a + 85*b + 128) >> 8.  Since the weights sum to
+ * 256, rewrite this as a + round((b-a)*85/256).  SQRDMULH with 10880
+ * (85/256 in Q15) has exactly the scalar rounding behavior for the signed
+ * difference range -1023..1023 and avoids widening both vector halves. */
 static inline uint16x8_t neon_blend_reg_hdr(uint16x8_t a, uint16x8_t b)
 {
-    uint16x4_t w171 = vdup_n_u16(171);
-    uint16x4_t w85  = vdup_n_u16(85);
-    uint32x4_t r128 = vdupq_n_u32(128);
-
-    /* +128 folds into the first vmlal; saves a separate vaddq_u32. */
-    uint32x4_t lo = vmlal_u16(r128, vget_low_u16(a), w171);
-    lo = vmlal_u16(lo, vget_low_u16(b), w85);
-    uint16x4_t res_lo = vshrn_n_u32(lo, 8);
-
-    uint32x4_t hi = vmlal_u16(r128, vget_high_u16(a), w171);
-    hi = vmlal_u16(hi, vget_high_u16(b), w85);
-    uint16x4_t res_hi = vshrn_n_u32(hi, 8);
-
-    return vcombine_u16(res_lo, res_hi);
+    int16x8_t diff = vreinterpretq_s16_u16(vsubq_u16(b, a));
+    int16x8_t delta = vqrdmulhq_n_s16(diff, 10880);
+    return vaddq_u16(a, vreinterpretq_u16_s16(delta));
 }
 
 /* -----------------------------------------------------------------------
@@ -421,11 +405,8 @@ static void __attribute__((hot)) scale_plane_pow2_hdr_neon(
  * Fused vertical+horizontal chunk helpers for 10-bit
  *
  * These inline functions perform horizontal filtering on a 48-byte chunk
- * (3 x uint16x8_t = 24 elements) that has already been vertically
- * reduced in registers.
- *
- * The store+reload through a 48-byte stack buffer enables vld3q_u16
- * hardware deinterleave (essentially free on Apple Silicon L1).
+ * (3 x uint16x8_t = 24 elements) that was deinterleaved at the source load
+ * and then vertically reduced in registers.
  * ----------------------------------------------------------------------- */
 
 /* Horizontal 1.5x on one deinterleaved 10-bit chunk (A, B, C each 8 elements).
@@ -435,25 +416,8 @@ static void __attribute__((hot)) scale_plane_pow2_hdr_neon(
 static inline void h_chunk_1_5x_hdr(uint16x8_t A, uint16x8_t B, uint16x8_t C,
                                      uint16_t *restrict dst)
 {
-    uint16x4_t w171 = vdup_n_u16(171);
-    uint16x4_t w85  = vdup_n_u16(85);
-    uint32x4_t r128 = vdupq_n_u32(128);
-
-    /* B*85 + 128 is shared between out0 and out1; compute once. */
-    uint32x4_t b85_lo = vmlal_u16(r128, vget_low_u16(B),  w85);
-    uint32x4_t b85_hi = vmlal_u16(r128, vget_high_u16(B), w85);
-
-    /* Output 0: pixel at 1/3 position, weighted toward A */
-    uint32x4_t t0_lo = vmlal_u16(b85_lo, vget_low_u16(A),  w171);
-    uint32x4_t t0_hi = vmlal_u16(b85_hi, vget_high_u16(A), w171);
-    uint16x8_t out0 = vcombine_u16(vshrn_n_u32(t0_lo, 8),
-                                    vshrn_n_u32(t0_hi, 8));
-
-    /* Output 1: pixel at 2/3 position, weighted toward C */
-    uint32x4_t t1_lo = vmlal_u16(b85_lo, vget_low_u16(C),  w171);
-    uint32x4_t t1_hi = vmlal_u16(b85_hi, vget_high_u16(C), w171);
-    uint16x8_t out1 = vcombine_u16(vshrn_n_u32(t1_lo, 8),
-                                    vshrn_n_u32(t1_hi, 8));
+    uint16x8_t out0 = neon_blend_reg_hdr(A, B);
+    uint16x8_t out1 = neon_blend_reg_hdr(C, B);
 
     /* Interleave: [out0[0], out1[0], out0[1], out1[1], ...] */
     uint16x8x2_t interleaved = vzipq_u16(out0, out1);
@@ -474,6 +438,14 @@ static inline uint16x8_t h_chunk_3x_hdr(uint16x8_t A, uint16x8_t B, uint16x8_t C
     return result;
 }
 
+static inline uint16x8_t h_chunk_3x_hdr_reg(uint16x8_t A, uint16x8_t B,
+                                             uint16x8_t C)
+{
+    uint16x8_t sum = vaddq_u16(A, B);
+    sum = vaddq_u16(sum, C);
+    return neon_div3_u16x8_hdr(sum);
+}
+
 /* Horizontal 6x cascaded from a 3x result (8 elements -> 4 elements).
  * Pairwise average: vpaddlq_u16 -> uint32x4, then vrshrn_n_u32 to narrow.
  * Stores 4 output uint16_t at dst.  Returns the 4-element result. */
@@ -485,22 +457,6 @@ static inline uint16x4_t h_chunk_6x_hdr(uint16x8_t result_3x,
     vst1_u16(dst, result);
     return result;
 }
-
-/* Deinterleave a 48-byte chunk (3 x uint16x8_t = 24 elements) using vld3q_u16.
- *
- * vld3q_u16 loads 24 consecutive uint16_t and deinterleaves them into three
- * 8-element vectors.  Since vld3q_u16 takes a memory address, we store the
- * three vertically-blended registers to a stack buffer and reload. */
-static inline uint16x8x3_t deinterleave_chunk_hdr(
-    uint16x8_t a, uint16x8_t b, uint16x8_t c,
-    uint16_t chunk_buf[24])
-{
-    vst1q_u16(chunk_buf,      a);
-    vst1q_u16(chunk_buf + 8,  b);
-    vst1q_u16(chunk_buf + 16, c);
-    return vld3q_u16(chunk_buf);
-}
-
 
 static void __attribute__((hot)) scale_plane_thirds_hdr_neon(
     const uint16_t *restrict src,
@@ -571,9 +527,6 @@ static void __attribute__((hot)) scale_plane_thirds_hdr_neon(
     int tail_start  = full_chunks * 24;
     int tail_cols   = src_w - tail_start;
 
-    /* Deinterleave buffer (stack-allocated, 24 uint16_t = 48 bytes) */
-    uint16_t __attribute__((aligned(16))) chunk_buf[24];
-
     /* Output row cursors */
     int out_row[4] = { 0, 0, 0, 0 };
 
@@ -643,39 +596,28 @@ static void __attribute__((hot)) scale_plane_thirds_hdr_neon(
             int out_off_3x   = ci * 8;  /* 24 ->  8 output elements */
             int out_off_6x   = ci * 4;  /* 24 ->  4 output elements */
 
-            /* --- LOAD 6 rows x 3 registers = 18 loads ---
-             * Each row needs 3 vld1q_u16 for 24 uint16_t elements.
-             * Loading all before arithmetic allows OoO overlap. */
-            uint16x8_t r0a = vld1q_u16(row0 + cx);
-            uint16x8_t r0b = vld1q_u16(row0 + cx + 8);
-            uint16x8_t r0c = vld1q_u16(row0 + cx + 16);
-            uint16x8_t r1a = vld1q_u16(row1 + cx);
-            uint16x8_t r1b = vld1q_u16(row1 + cx + 8);
-            uint16x8_t r1c = vld1q_u16(row1 + cx + 16);
-            uint16x8_t r2a = vld1q_u16(row2 + cx);
-            uint16x8_t r2b = vld1q_u16(row2 + cx + 8);
-            uint16x8_t r2c = vld1q_u16(row2 + cx + 16);
-            uint16x8_t r3a = vld1q_u16(row3 + cx);
-            uint16x8_t r3b = vld1q_u16(row3 + cx + 8);
-            uint16x8_t r3c = vld1q_u16(row3 + cx + 16);
-            uint16x8_t r4a = vld1q_u16(row4 + cx);
-            uint16x8_t r4b = vld1q_u16(row4 + cx + 8);
-            uint16x8_t r4c = vld1q_u16(row4 + cx + 16);
-            uint16x8_t r5a = vld1q_u16(row5 + cx);
-            uint16x8_t r5b = vld1q_u16(row5 + cx + 8);
-            uint16x8_t r5c = vld1q_u16(row5 + cx + 16);
+            /* Deinterleave at the source load.  All vertical operations are
+             * lane-wise, so the permutation commutes exactly with the
+             * vertical cascade and removes every register -> stack -> ld3
+             * round trip from the output paths. */
+            uint16x8x3_t r0 = vld3q_u16(row0 + cx);
+            uint16x8x3_t r1 = vld3q_u16(row1 + cx);
+            uint16x8x3_t r2 = vld3q_u16(row2 + cx);
+            uint16x8x3_t r3 = vld3q_u16(row3 + cx);
+            uint16x8x3_t r4 = vld3q_u16(row4 + cx);
+            uint16x8x3_t r5 = vld3q_u16(row5 + cx);
 
             /* --- VERTICAL PAIRWISE AVERAGES (in registers) ---
              * Average adjacent row pairs using vrhaddq_u16 (rounded). */
-            uint16x8_t v01a = vrhaddq_u16(r0a, r1a);
-            uint16x8_t v01b = vrhaddq_u16(r0b, r1b);
-            uint16x8_t v01c = vrhaddq_u16(r0c, r1c);
-            uint16x8_t v23a = vrhaddq_u16(r2a, r3a);
-            uint16x8_t v23b = vrhaddq_u16(r2b, r3b);
-            uint16x8_t v23c = vrhaddq_u16(r2c, r3c);
-            uint16x8_t v45a = vrhaddq_u16(r4a, r5a);
-            uint16x8_t v45b = vrhaddq_u16(r4b, r5b);
-            uint16x8_t v45c = vrhaddq_u16(r4c, r5c);
+            uint16x8_t v01a = vrhaddq_u16(r0.val[0], r1.val[0]);
+            uint16x8_t v01b = vrhaddq_u16(r0.val[1], r1.val[1]);
+            uint16x8_t v01c = vrhaddq_u16(r0.val[2], r1.val[2]);
+            uint16x8_t v23a = vrhaddq_u16(r2.val[0], r3.val[0]);
+            uint16x8_t v23b = vrhaddq_u16(r2.val[1], r3.val[1]);
+            uint16x8_t v23c = vrhaddq_u16(r2.val[2], r3.val[2]);
+            uint16x8_t v45a = vrhaddq_u16(r4.val[0], r5.val[0]);
+            uint16x8_t v45b = vrhaddq_u16(r4.val[1], r5.val[1]);
+            uint16x8_t v45c = vrhaddq_u16(r4.val[2], r5.val[2]);
 
             /* --- 1.5x OUTPUT (4 rows) ---
              * Rows 0 and 3 come from v01 and v45 directly.
@@ -683,11 +625,8 @@ static void __attribute__((hot)) scale_plane_thirds_hdr_neon(
              * averages: blend(v01,v23) and blend(v23,v45).
              * Blend uses neon_blend_reg_hdr which widens to uint32_t. */
             if (need_1_5x) {
-                uint16x8x3_t d;
-
                 /* Row 0: v01 */
-                d = deinterleave_chunk_hdr(v01a, v01b, v01c, chunk_buf);
-                h_chunk_1_5x_hdr(d.val[0], d.val[1], d.val[2],
+                h_chunk_1_5x_hdr(v01a, v01b, v01c,
                                   dst_1_5x_r0 + out_off_1_5x);
 
                 /* Row 1: blend(v01, v23) */
@@ -695,8 +634,7 @@ static void __attribute__((hot)) scale_plane_thirds_hdr_neon(
                     uint16x8_t ba = neon_blend_reg_hdr(v01a, v23a);
                     uint16x8_t bb = neon_blend_reg_hdr(v01b, v23b);
                     uint16x8_t bc = neon_blend_reg_hdr(v01c, v23c);
-                    d = deinterleave_chunk_hdr(ba, bb, bc, chunk_buf);
-                    h_chunk_1_5x_hdr(d.val[0], d.val[1], d.val[2],
+                    h_chunk_1_5x_hdr(ba, bb, bc,
                                       dst_1_5x_r1 + out_off_1_5x);
                 }
 
@@ -705,14 +643,12 @@ static void __attribute__((hot)) scale_plane_thirds_hdr_neon(
                     uint16x8_t ba = neon_blend_reg_hdr(v23a, v45a);
                     uint16x8_t bb = neon_blend_reg_hdr(v23b, v45b);
                     uint16x8_t bc = neon_blend_reg_hdr(v23c, v45c);
-                    d = deinterleave_chunk_hdr(ba, bb, bc, chunk_buf);
-                    h_chunk_1_5x_hdr(d.val[0], d.val[1], d.val[2],
+                    h_chunk_1_5x_hdr(ba, bb, bc,
                                       dst_1_5x_r2 + out_off_1_5x);
                 }
 
                 /* Row 3: v45 */
-                d = deinterleave_chunk_hdr(v45a, v45b, v45c, chunk_buf);
-                h_chunk_1_5x_hdr(d.val[0], d.val[1], d.val[2],
+                h_chunk_1_5x_hdr(v45a, v45b, v45c,
                                   dst_1_5x_r3 + out_off_1_5x);
             }
 
@@ -729,14 +665,10 @@ static void __attribute__((hot)) scale_plane_thirds_hdr_neon(
                 v3x1c = vrhaddq_u16(v23c, v45c);
 
                 if (active_outputs & (1u << 2)) {
-                    uint16x8x3_t d;
-
-                    d = deinterleave_chunk_hdr(v3x0a, v3x0b, v3x0c, chunk_buf);
-                    h_chunk_3x_hdr(d.val[0], d.val[1], d.val[2],
+                    h_chunk_3x_hdr(v3x0a, v3x0b, v3x0c,
                                     dst_3x_r0 + out_off_3x);
 
-                    d = deinterleave_chunk_hdr(v3x1a, v3x1b, v3x1c, chunk_buf);
-                    h_chunk_3x_hdr(d.val[0], d.val[1], d.val[2],
+                    h_chunk_3x_hdr(v3x1a, v3x1b, v3x1c,
                                     dst_3x_r1 + out_off_3x);
                 }
             }
@@ -756,9 +688,7 @@ static void __attribute__((hot)) scale_plane_thirds_hdr_neon(
                 }
 
                 if (active_outputs & (1u << 4)) {
-                    uint16x8x3_t d = deinterleave_chunk_hdr(v6xa, v6xb, v6xc, chunk_buf);
-                    uint16x8_t r3x = h_chunk_3x_hdr(d.val[0], d.val[1], d.val[2],
-                                                      (uint16_t *)chunk_buf);
+                    uint16x8_t r3x = h_chunk_3x_hdr_reg(v6xa, v6xb, v6xc);
                     h_chunk_6x_hdr(r3x, dst_6x_r0 + out_off_6x);
                 }
             }
@@ -882,8 +812,20 @@ static void __attribute__((hot)) scale_plane_thirds_hdr_neon(
                     int dw = dst_widths[3];
                     int ds_el = dst_strides[3] / (int)sizeof(uint16_t);
 
-                    /* Horizontal: 3x box avg -> halve -> halve = 12:1 */
-                    h_filter_3x_hdr(v6x_prev, src_w, h_3x_buf, w_3x);
+                    /* Full chunks remain deinterleaved in v6x_prev.  Convert
+                     * those directly; only the scalar tail is in row order. */
+                    for (int ci = 0; ci < full_chunks; ci++) {
+                        int cx = ci * 24;
+                        uint16x8_t A = vld1q_u16(v6x_prev + cx);
+                        uint16x8_t B = vld1q_u16(v6x_prev + cx + 8);
+                        uint16x8_t C = vld1q_u16(v6x_prev + cx + 16);
+                        h_chunk_3x_hdr(A, B, C, h_3x_buf + ci * 8);
+                    }
+                    if (tail_cols > 0) {
+                        int tail_w3 = w_3x - full_chunks * 8;
+                        h_filter_3x_hdr(v6x_prev + tail_start, tail_cols,
+                                        h_3x_buf + full_chunks * 8, tail_w3);
+                    }
                     h_filter_halve_hdr(h_3x_buf, h_6x_buf, w_6x);
                     h_filter_halve_hdr(h_6x_buf,
                                         dst_planes[3] + (size_t)out_row[3] * (size_t)ds_el, dw);

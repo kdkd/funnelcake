@@ -46,6 +46,7 @@
     defined(__AVX512VL__) && defined(__AVX512VBMI__)
 
 #include <immintrin.h>
+#include <string.h>
 
 /* Real AVX-512 build: dispatch may select this kernel set. */
 int fused_avx512_compiled(void)
@@ -117,40 +118,99 @@ static inline __m512i avx512_halve_128_to_64(__m512i v0, __m512i v1)
                            _mm512_permutex2var_epi8(v0, odd,  v1));
 }
 
-/* -----------------------------------------------------------------------
- * Vertical pairwise row average: dst[x] = avg(ra[x], rb[x]) across one
- * full row.  chunks counts whole 64-byte vectors; tail_mask covers the
- * remaining 0-63 bytes with a single masked load/avg/store - the masked
- * lanes never touch memory, so there is no scalar tail and no overrun.
- * ----------------------------------------------------------------------- */
-static inline void avx512_avg_rows(const uint8_t *restrict ra,
-                                   const uint8_t *restrict rb,
-                                   uint8_t *restrict dst,
-                                   int chunks, __mmask64 tail_mask)
+/* 32 -> 16 and 16 -> 8 byte forms complete the in-register pow2 cascade. */
+static inline __m128i avx512_halve_32_to_16(__m256i v)
 {
-    int x = 0;
-    for (int c = 0; c < chunks; c++, x += 64) {
-        __m512i va = _mm512_loadu_si512((const void *)(ra + x));
-        __m512i vb = _mm512_loadu_si512((const void *)(rb + x));
-        _mm512_storeu_si512((void *)(dst + x), _mm512_avg_epu8(va, vb));
+    __m256i halves = _mm256_avg_epu16(
+        _mm256_maddubs_epi16(v, _mm256_set1_epi8(1)),
+        _mm256_setzero_si256());
+    return _mm256_cvtepi16_epi8(halves);
+}
+
+static inline __m128i avx512_halve_16_to_8(__m128i v)
+{
+    __m128i halves = _mm_avg_epu16(
+        _mm_maddubs_epi16(v, _mm_set1_epi8(1)),
+        _mm_setzero_si128());
+    return _mm_packus_epi16(halves, halves);
+}
+
+/* Finish a horizontal pow2 cascade while the freshly computed vertical
+ * averages are still in registers.  The helpers match the 128-byte paired
+ * loop and its 64-byte residual respectively. */
+static inline void store_pow2_128_avx512(__m512i v0, __m512i v1, int level,
+                                         uint8_t *restrict dst)
+{
+    __m512i h1 = avx512_halve_128_to_64(v0, v1);
+    if (level == 0) {
+        _mm512_storeu_si512((void *)dst, h1);
+        return;
     }
-    if (tail_mask) {
-        __m512i va = _mm512_maskz_loadu_epi8(tail_mask, ra + x);
-        __m512i vb = _mm512_maskz_loadu_epi8(tail_mask, rb + x);
-        _mm512_mask_storeu_epi8(dst + x, tail_mask, _mm512_avg_epu8(va, vb));
+
+    __m256i h2 = avx512_halve_64_to_32(h1);
+    if (level == 1) {
+        _mm256_storeu_si256((__m256i *)dst, h2);
+        return;
     }
+
+    __m128i h3 = avx512_halve_32_to_16(h2);
+    if (level == 2) {
+        _mm_storeu_si128((__m128i *)dst, h3);
+        return;
+    }
+
+    _mm_storel_epi64((__m128i *)dst, avx512_halve_16_to_8(h3));
+}
+
+static inline void store_pow2_64_avx512(__m512i v, int level,
+                                        uint8_t *restrict dst)
+{
+    __m256i h1 = avx512_halve_64_to_32(v);
+    if (level == 0) {
+        _mm256_storeu_si256((__m256i *)dst, h1);
+        return;
+    }
+
+    __m128i h2 = avx512_halve_32_to_16(h1);
+    if (level == 1) {
+        _mm_storeu_si128((__m128i *)dst, h2);
+        return;
+    }
+
+    __m128i h3 = avx512_halve_16_to_8(h2);
+    if (level == 2) {
+        _mm_storel_epi64((__m128i *)dst, h3);
+        return;
+    }
+
+    uint32_t packed = (uint32_t)_mm_cvtsi128_si32(
+        avx512_halve_16_to_8(h3));
+    memcpy(dst, &packed, sizeof(packed));
+}
+
+static inline uint8_t reduce_pow2_scalar_avx512(const uint8_t *src, int level)
+{
+    uint8_t values[16];
+    int count = 2 << level;
+    memcpy(values, src, (size_t)count);
+    while (count > 1) {
+        for (int i = 0; i < count / 2; i++)
+            values[i] = (uint8_t)(((unsigned)values[2 * i]
+                                 + (unsigned)values[2 * i + 1] + 1) >> 1);
+        count >>= 1;
+    }
+    return values[0];
 }
 
 /* -----------------------------------------------------------------------
  * Power-of-two kernel: scale a single plane (AVX-512)
  *
- * Same two-phase structure as scale_plane_pow2_avx2: a vertical cascade
- * of pairwise row averages written to scratch buffers, then a horizontal
- * halving cascade from those buffers with the final halving writing
- * straight into the output plane.  The differences are pure width and
- * tail handling: 64-byte vectors throughout, and every partial chunk -
- * vertical or horizontal - is one masked operation instead of a scalar
- * loop, so odd widths run the same vector code as aligned ones.
+ * Each vertical pass emits its requested horizontal reduction while the
+ * averaged vectors are still live.  Only rows consumed by a deeper vertical
+ * level reach scratch, eliminating completed-row reloads and the former
+ * in-place horizontal cascade.  Full chunks consume 128 source bytes at a
+ * time; a 64-byte residual stays vectorized and uncommon shorter tails use
+ * the bit-identical scalar reduction.
  * ----------------------------------------------------------------------- */
 static void __attribute__((hot)) scale_plane_pow2_avx512(
     const uint8_t *restrict src,
@@ -164,8 +224,7 @@ static void __attribute__((hot)) scale_plane_pow2_avx512(
     size_t scratch_pool_size)
 {
     (void)dst_heights;
-    (void)dst_widths;  /* the final halving writes results straight to the
-                        * output plane, so this width is not needed here */
+    (void)dst_widths;
 
     static const int bit_pos[4] = { 1, 3, 5, 7 };
 
@@ -196,112 +255,109 @@ static void __attribute__((hot)) scale_plane_pow2_avx512(
         if (!vert_buf[k]) return;
     }
 
-    /* Horizontal cascade buffer */
-    uint8_t *h_buf = (uint8_t *)fused_scratch_alloc(&scratch, (size_t)src_w);
-    if (!h_buf) return;
-
     int out_row[4] = { 0, 0, 0, 0 };
-
-    /* Vertical chunk geometry: whole 64-byte vectors plus one masked tail
-     * covering the remaining 0-63 bytes. */
-    int v_chunks = src_w / 64;
-    int v_rem    = src_w - v_chunks * 64;
-    __mmask64 v_mask = v_rem
-        ? (__mmask64)(~(uint64_t)0 >> (64 - v_rem)) : 0;
 
     for (int g = 0; g < num_groups; g++) {
         const uint8_t *grp_base = src + (size_t)g * (size_t)group_rows * (size_t)src_stride;
 
-        /* -- Vertical cascade --------------------------------------- */
-
-        /* Level 0 (2x vertical): pairwise average source rows */
+        /* Level 0: emit the 2x horizontal result from the live vertical
+         * averages, retaining the full-width rows only when a deeper level
+         * consumes them. */
         for (int r = 0; r < vert_rows[0]; r++) {
-            avx512_avg_rows(grp_base + (size_t)(2 * r)     * (size_t)src_stride,
-                            grp_base + (size_t)(2 * r + 1) * (size_t)src_stride,
-                            vert_buf[0] + (size_t)r * (size_t)src_w,
-                            v_chunks, v_mask);
-        }
+            const uint8_t *restrict ra = grp_base
+                + (size_t)(2 * r) * (size_t)src_stride;
+            const uint8_t *restrict rb = grp_base
+                + (size_t)(2 * r + 1) * (size_t)src_stride;
+            uint8_t *restrict dst_row = vert_buf[0] + (size_t)r * (size_t)src_w;
+            int emit = (active_outputs & (1u << bit_pos[0])) != 0;
+            int keep = deepest > 0;
+            uint8_t *restrict out = emit ? dst_planes[0]
+                + (size_t)out_row[0] * (size_t)dst_strides[0] : NULL;
 
-        /* Deeper levels: pairwise average previous level */
-        for (int k = 1; k <= deepest; k++) {
-            for (int r = 0; r < vert_rows[k]; r++) {
-                avx512_avg_rows(vert_buf[k - 1] + (size_t)(2 * r)     * (size_t)src_w,
-                                vert_buf[k - 1] + (size_t)(2 * r + 1) * (size_t)src_w,
-                                vert_buf[k] + (size_t)r * (size_t)src_w,
-                                v_chunks, v_mask);
+            int x = 0;
+            int out_x = 0;
+            for (; x + 128 <= src_w; x += 128, out_x += 64) {
+                __m512i v0 = _mm512_avg_epu8(
+                    _mm512_loadu_si512((const void *)(ra + x)),
+                    _mm512_loadu_si512((const void *)(rb + x)));
+                __m512i v1 = _mm512_avg_epu8(
+                    _mm512_loadu_si512((const void *)(ra + x + 64)),
+                    _mm512_loadu_si512((const void *)(rb + x + 64)));
+                if (keep) {
+                    _mm512_storeu_si512((void *)(dst_row + x), v0);
+                    _mm512_storeu_si512((void *)(dst_row + x + 64), v1);
+                }
+                if (emit) store_pow2_128_avx512(v0, v1, 0, out + out_x);
+            }
+            if (x + 64 <= src_w) {
+                __m512i v = _mm512_avg_epu8(
+                    _mm512_loadu_si512((const void *)(ra + x)),
+                    _mm512_loadu_si512((const void *)(rb + x)));
+                if (keep) _mm512_storeu_si512((void *)(dst_row + x), v);
+                if (emit) store_pow2_64_avx512(v, 0, out + out_x);
+                x += 64;
+                out_x += 32;
+            }
+            int tail_start = x;
+            for (; x < src_w; x++)
+                dst_row[x] = (uint8_t)(((unsigned)ra[x] + rb[x] + 1) >> 1);
+            if (emit) {
+                for (int sx = tail_start; sx < src_w; sx += 2)
+                    out[out_x++] = reduce_pow2_scalar_avx512(dst_row + sx, 0);
+                out_row[0]++;
             }
         }
 
-        /* -- Horizontal cascade + output write ----------------------- */
-
-        for (int k = 0; k <= deepest; k++) {
-            if (!(active_outputs & (1u << bit_pos[k]))) continue;
-
+        /* Deeper vertical passes keep the low-pressure row-by-row shape,
+         * but each pass now finishes its horizontal output before spilling
+         * the next row.  This removes every completed-row reload and the
+         * entire in-place horizontal scratch cascade. */
+        for (int k = 1; k <= deepest; k++) {
             for (int r = 0; r < vert_rows[k]; r++) {
-                const uint8_t *restrict vert_row = vert_buf[k] + (size_t)r * (size_t)src_w;
+                const uint8_t *restrict ra = vert_buf[k - 1]
+                    + (size_t)(2 * r) * (size_t)src_w;
+                const uint8_t *restrict rb = vert_buf[k - 1]
+                    + (size_t)(2 * r + 1) * (size_t)src_w;
+                uint8_t *restrict dst_row = vert_buf[k] + (size_t)r * (size_t)src_w;
+                int emit = (active_outputs & (1u << bit_pos[k])) != 0;
+                int keep = k < deepest;
+                uint8_t *restrict out = emit ? dst_planes[k]
+                    + (size_t)out_row[k] * (size_t)dst_strides[k] : NULL;
 
-                /* Output plane row for this reduction level. */
-                uint8_t *restrict out = dst_planes[k]
-                    + (size_t)out_row[k] * (size_t)dst_strides[k];
-
-                /* Horizontal cascade: (k+1) halvings.  The final halving
-                 * (hstep == k) writes straight to the output plane; earlier
-                 * steps write to h_buf to feed the next halving.  The last
-                 * step produces exactly the destination width in bytes
-                 * (src_w is divisible by 2^(k+1), guaranteed by the
-                 * exact-division and chroma-alignment checks done at setup)
-                 * and the masked stores never write past it, so row padding
-                 * beyond the image edge is left untouched. */
-                int cur_w = src_w;
-                const uint8_t *cur_src = vert_row;
-
-                for (int hstep = 0; hstep < (k + 1); hstep++) {
-                    uint8_t *step_dst = (hstep == k) ? out : h_buf;
-
-                    int h_chunks = cur_w / 64;
-                    int out_x = 0;
-
-                    /* Paired halve: 128 -> 64 bytes per iteration, one
-                     * full-width store. */
-                    int c = 0;
-                    #pragma GCC unroll 4
-                    for (; c + 1 < h_chunks; c += 2) {
-                        __m512i v0 = _mm512_loadu_si512((const void *)(cur_src + c * 64));
-                        __m512i v1 = _mm512_loadu_si512((const void *)(cur_src + c * 64 + 64));
-                        _mm512_storeu_si512((void *)(step_dst + out_x),
-                                            avx512_halve_128_to_64(v0, v1));
-                        out_x += 64;
+                int x = 0;
+                int out_x = 0;
+                int out_per_128 = 64 >> k;
+                for (; x + 128 <= src_w; x += 128, out_x += out_per_128) {
+                    __m512i v0 = _mm512_avg_epu8(
+                        _mm512_loadu_si512((const void *)(ra + x)),
+                        _mm512_loadu_si512((const void *)(rb + x)));
+                    __m512i v1 = _mm512_avg_epu8(
+                        _mm512_loadu_si512((const void *)(ra + x + 64)),
+                        _mm512_loadu_si512((const void *)(rb + x + 64)));
+                    if (keep) {
+                        _mm512_storeu_si512((void *)(dst_row + x), v0);
+                        _mm512_storeu_si512((void *)(dst_row + x + 64), v1);
                     }
-                    for (; c < h_chunks; c++) {
-                        __m512i v = _mm512_loadu_si512((const void *)(cur_src + c * 64));
-                        _mm256_storeu_si256((__m256i *)(step_dst + out_x),
-                                            avx512_halve_64_to_32(v));
-                        out_x += 32;
-                    }
-
-                    /* Masked tail: up to 63 leftover input bytes in one
-                     * masked load, the same halve, and a masked store of
-                     * the floor(rem/2) output bytes.  Zero-padded lanes
-                     * above the input mask produce garbage halves, but the
-                     * output mask never lets them out of the register.  An
-                     * odd final byte has no pair partner and is dropped,
-                     * matching the scalar tail in the other kernels. */
-                    int rem = cur_w - h_chunks * 64;
-                    if (rem > 1) {
-                        __mmask64 in_m = (__mmask64)(~(uint64_t)0 >> (64 - rem));
-                        int nout = rem >> 1;
-                        __mmask32 out_m = (__mmask32)(~(uint32_t)0 >> (32 - nout));
-                        __m512i v = _mm512_maskz_loadu_epi8(in_m,
-                                        cur_src + (size_t)h_chunks * 64);
-                        _mm256_mask_storeu_epi8(step_dst + out_x, out_m,
-                                                avx512_halve_64_to_32(v));
-                    }
-
-                    cur_w >>= 1;
-                    cur_src = step_dst;
+                    if (emit) store_pow2_128_avx512(v0, v1, k, out + out_x);
                 }
-
-                out_row[k]++;
+                if (x + 64 <= src_w) {
+                    __m512i v = _mm512_avg_epu8(
+                        _mm512_loadu_si512((const void *)(ra + x)),
+                        _mm512_loadu_si512((const void *)(rb + x)));
+                    if (keep) _mm512_storeu_si512((void *)(dst_row + x), v);
+                    if (emit) store_pow2_64_avx512(v, k, out + out_x);
+                    x += 64;
+                    out_x += 32 >> k;
+                }
+                int tail_start = x;
+                for (; x < src_w; x++)
+                    dst_row[x] = (uint8_t)(((unsigned)ra[x] + rb[x] + 1) >> 1);
+                if (emit) {
+                    int step = 2 << k;
+                    for (int sx = tail_start; sx < src_w; sx += step)
+                        out[out_x++] = reduce_pow2_scalar_avx512(dst_row + sx, k);
+                    out_row[k]++;
+                }
             }
         }
     }
@@ -439,24 +495,22 @@ static inline __m512i box3_div_avx512(__m512i A, __m512i B, __m512i C)
 
 /* Vertical 2:1 bilinear blend, (a*171 + b*85 + 128) >> 8, returned as the
  * two per-lane 16-bit halves so the horizontal 1.5x can consume them
- * directly.  Same maddubs decomposition as avx2_blend_2_1_u16:
- * 171a + 85b = 256a + 85(b - a), with the rounding 128 smuggled in by
- * interleaving 0x80 under a. */
+ * directly.  Widening the bytes makes the exact signed-difference
+ * VPMULHRSW identity available without a later pack/unpack round trip. */
 static inline void avx512_blend_2_1_u16(__m512i a, __m512i b,
                                         __m512i *out_lo, __m512i *out_hi)
 {
-    const __m512i wpair = _mm512_set1_epi16((short)(((-85 & 0xFF) << 8) | 85));
-    const __m512i half  = _mm512_set1_epi8((char)0x80);
+    const __m512i zero  = _mm512_setzero_si512();
+    const __m512i scale = _mm512_set1_epi16(85 * 128);
+    __m512i a_lo = _mm512_unpacklo_epi8(a, zero);
+    __m512i a_hi = _mm512_unpackhi_epi8(a, zero);
+    __m512i b_lo = _mm512_unpacklo_epi8(b, zero);
+    __m512i b_hi = _mm512_unpackhi_epi8(b, zero);
 
-    __m512i ba_lo = _mm512_unpacklo_epi8(b, a);
-    __m512i ba_hi = _mm512_unpackhi_epi8(b, a);
-
-    *out_lo = _mm512_srli_epi16(_mm512_add_epi16(
-        _mm512_maddubs_epi16(ba_lo, wpair),
-        _mm512_unpacklo_epi8(half, a)), 8);
-    *out_hi = _mm512_srli_epi16(_mm512_add_epi16(
-        _mm512_maddubs_epi16(ba_hi, wpair),
-        _mm512_unpackhi_epi8(half, a)), 8);
+    *out_lo = _mm512_add_epi16(a_lo, _mm512_mulhrs_epi16(
+        _mm512_sub_epi16(b_lo, a_lo), scale));
+    *out_hi = _mm512_add_epi16(a_hi, _mm512_mulhrs_epi16(
+        _mm512_sub_epi16(b_hi, a_hi), scale));
 }
 
 /* Horizontal 1.5x bilinear on already-widened u16 component halves.
@@ -468,25 +522,28 @@ static inline __attribute__((always_inline)) void h_chunk_1_5x_u16_avx512(
     __m512i c_lo, __m512i c_hi,
     uint8_t *restrict dst, int full, __mmask64 m_lo, __mmask64 m_hi)
 {
-    const __m512i w171 = _mm512_set1_epi16(171);
-    const __m512i w85  = _mm512_set1_epi16(85);
-    const __m512i rnd  = _mm512_set1_epi16(128);
+    /*
+     * (171*a + 85*b + 128) >> 8
+     *     == a + round((b-a) * 85/256)
+     *
+     * Every widened component is in [0,255], so the signed difference is
+     * safely in [-255,255].  VPMULHRSW with 85*128 performs the exact rounded
+     * division by 256, replacing each mullo/mullo/add/add/shift chain with
+     * sub/mulhrs/add while preserving bit-for-bit scalar parity.
+     */
+    const __m512i scale = _mm512_set1_epi16(85 * 128);
 
-    /* b*85 is shared by both output pixels of the triplet. */
-    __m512i b85_lo = _mm512_mullo_epi16(b_lo, w85);
-    __m512i b85_hi = _mm512_mullo_epi16(b_hi, w85);
-
-    /* out0 = (A*171 + B*85 + 128) >> 8, out1 = (C*171 + B*85 + 128) >> 8 */
+    /* out0 blends A toward B; out1 blends C toward B. */
     __m512i out0 = _mm512_packus_epi16(
-        _mm512_srli_epi16(_mm512_add_epi16(rnd,
-            _mm512_add_epi16(_mm512_mullo_epi16(a_lo, w171), b85_lo)), 8),
-        _mm512_srli_epi16(_mm512_add_epi16(rnd,
-            _mm512_add_epi16(_mm512_mullo_epi16(a_hi, w171), b85_hi)), 8));
+        _mm512_add_epi16(a_lo, _mm512_mulhrs_epi16(
+            _mm512_sub_epi16(b_lo, a_lo), scale)),
+        _mm512_add_epi16(a_hi, _mm512_mulhrs_epi16(
+            _mm512_sub_epi16(b_hi, a_hi), scale)));
     __m512i out1 = _mm512_packus_epi16(
-        _mm512_srli_epi16(_mm512_add_epi16(rnd,
-            _mm512_add_epi16(_mm512_mullo_epi16(c_lo, w171), b85_lo)), 8),
-        _mm512_srli_epi16(_mm512_add_epi16(rnd,
-            _mm512_add_epi16(_mm512_mullo_epi16(c_hi, w171), b85_hi)), 8));
+        _mm512_add_epi16(c_lo, _mm512_mulhrs_epi16(
+            _mm512_sub_epi16(b_lo, c_lo), scale)),
+        _mm512_add_epi16(c_hi, _mm512_mulhrs_epi16(
+            _mm512_sub_epi16(b_hi, c_hi), scale)));
 
     /* Pixel interleave [out0[0], out1[0], out0[1], ...]: one vpermt2b per
      * 64 output bytes, where AVX2 needs an unpack plus a vperm2i128. */
@@ -504,30 +561,33 @@ static inline __attribute__((always_inline)) void h_chunk_1_5x_u16_avx512(
     }
 }
 
-/* u8 entry: widen A,B,C and run the core.  Used for 1.5x rows that come
- * straight from a pair average (rows 0 and 3 of each group). */
+/* Packed u8 entry used for 1.5x rows that come straight from a pair average
+ * (rows 0 and 3 of each group). */
 static inline __attribute__((always_inline)) void h_chunk_1_5x_avx512(
     __m512i A, __m512i B, __m512i C,
     uint8_t *restrict dst, int full, __mmask64 m_lo, __mmask64 m_hi)
 {
-    const __m512i zero = _mm512_setzero_si512();
-    h_chunk_1_5x_u16_avx512(_mm512_unpacklo_epi8(A, zero),
-                            _mm512_unpackhi_epi8(A, zero),
-                            _mm512_unpacklo_epi8(B, zero),
-                            _mm512_unpackhi_epi8(B, zero),
-                            _mm512_unpacklo_epi8(C, zero),
-                            _mm512_unpackhi_epi8(C, zero),
-                            dst, full, m_lo, m_hi);
-}
+    /* Form the two exact blends directly from packed components instead of
+     * routing through the general six-operand widened core.  Keeping B packed
+     * until both blends are visible also lets the compiler share its widens. */
+    __m512i out0_lo, out0_hi, out1_lo, out1_hi;
+    avx512_blend_2_1_u16(A, B, &out0_lo, &out0_hi);
+    avx512_blend_2_1_u16(C, B, &out1_lo, &out1_hi);
 
-/* 32 -> 16 byte halve (256-bit form of avx512_halve_64_to_32), used by the
- * fused 12x cascade's final step. */
-static inline __m128i avx512_halve_32_to_16(__m256i v)
-{
-    __m256i halves = _mm256_avg_epu16(
-        _mm256_maddubs_epi16(v, _mm256_set1_epi8(1)),
-        _mm256_setzero_si256());
-    return _mm256_cvtepi16_epi8(halves);
+    __m512i out0 = _mm512_packus_epi16(out0_lo, out0_hi);
+    __m512i out1 = _mm512_packus_epi16(out1_lo, out1_hi);
+    __m512i ilo = _mm512_permutex2var_epi8(
+        out0, _mm512_load_si512((const void *)il15_lo), out1);
+    __m512i ihi = _mm512_permutex2var_epi8(
+        out0, _mm512_load_si512((const void *)il15_hi), out1);
+
+    if (full) {
+        _mm512_storeu_si512((void *)dst, ilo);
+        _mm512_storeu_si512((void *)(dst + 64), ihi);
+    } else {
+        _mm512_mask_storeu_epi8(dst, m_lo, ilo);
+        _mm512_mask_storeu_epi8(dst + 64, m_hi, ihi);
+    }
 }
 
 /* n low bits set; n in [0, 64]. */
@@ -866,8 +926,7 @@ static void __attribute__((hot)) scale_plane_thirds_avx512(
                 v6x_cur  = tmp;
             } else {
                 /* In-place pointwise average (v6x_prev aliases the
-                 * destination, so avx512_avg_rows' restrict contract does
-                 * not apply; each vector is fully loaded before its store). */
+                 * destination; each vector is fully loaded before its store). */
                 {
                     int x = 0;
                     for (int c = 0; c < v_chunks; c++, x += 64) {

@@ -91,6 +91,9 @@ static const hdr_bench_entry_t hdr_bench_configs[] = {
     { "2560x1440 I010 down:2x,4x,8x HDR",          2560, 1440,
       FUSED_SCALE_2X | FUSED_SCALE_4X | FUSED_SCALE_8X,
       1, 0, 0, 0, 0, 0, 0 },
+    { "2048x1152 I010 down:2x,4x,8x,16x HDR",      2048, 1152,
+      FUSED_SCALE_2X | FUSED_SCALE_4X | FUSED_SCALE_8X | FUSED_SCALE_16X,
+      1, 0, 0, 0, 0, 0, 0 },
     { "3840x2160 I010 down:1.5x,3x,6x,12x HDR",    3840, 2160,
       FUSED_SCALE_1_5X | FUSED_SCALE_3X | FUSED_SCALE_6X | FUSED_SCALE_12X,
       1, 0, 0, 0, 0, 0, 0 },
@@ -151,6 +154,11 @@ static const hdr_bench_entry_t hdr_bench_configs[] = {
     { "1280x720 I010 down:2x,4x up:2x,4x HDR",     1280,  720,
       FUSED_SCALE_2X|FUSED_SCALE_4X, 1, 0, 0, 0,
       FUSED_UPSCALE_2X|FUSED_UPSCALE_4X, 0, 0 },
+    { "1920x1080 P010 down:2x up:2x HDR",          1920, 1080,
+      FUSED_SCALE_2X, 1, 0, 1, 0, FUSED_UPSCALE_2X, 0, 0 },
+    { "1920x1080 P010 down:1.5x,3x up:2x HDR",     1920, 1080,
+      FUSED_SCALE_1_5X|FUSED_SCALE_3X, 1, 0, 1, 0,
+      FUSED_UPSCALE_2X, 0, 0 },
 };
 
 #define HDR_BENCH_CONFIG_COUNT ((int)(sizeof(hdr_bench_configs) / sizeof(hdr_bench_configs[0])))

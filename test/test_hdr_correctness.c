@@ -25,6 +25,59 @@ static void suppress_log(fused_hdr_ctx_t *ctx)
     ctx->log_errors.target   = FUSED_LOG_SUPPRESS;
 }
 
+static int hdr_output_equal_exact(const fused_hdr_output_t *a,
+                                  const fused_hdr_output_t *b,
+                                  const char *group,
+                                  int output_idx)
+{
+    if (a->width != b->width || a->height != b->height) {
+        printf("\n  FAIL [%s:%d] P010 %s[%d] dimensions differ\n",
+               __func__, __LINE__, group, output_idx);
+        return 0;
+    }
+
+    const uint16_t *a_planes[3] = { a->plane_y, a->plane_u, a->plane_v };
+    const uint16_t *b_planes[3] = { b->plane_y, b->plane_u, b->plane_v };
+    int a_strides[3] = {
+        a->y_stride / (int)sizeof(uint16_t),
+        a->uv_stride / (int)sizeof(uint16_t),
+        a->uv_stride / (int)sizeof(uint16_t)
+    };
+    int b_strides[3] = {
+        b->y_stride / (int)sizeof(uint16_t),
+        b->uv_stride / (int)sizeof(uint16_t),
+        b->uv_stride / (int)sizeof(uint16_t)
+    };
+    static const char *plane_names[3] = { "Y", "U", "V" };
+
+    for (int plane = 0; plane < 3; plane++) {
+        if (!a_planes[plane] || !b_planes[plane]) {
+            printf("\n  FAIL [%s:%d] P010 %s[%d] %s plane missing\n",
+                   __func__, __LINE__, group, output_idx, plane_names[plane]);
+            return 0;
+        }
+
+        int width = plane == 0 ? a->width : a->width / 2;
+        int height = plane == 0 ? a->height : a->height / 2;
+        for (int y = 0; y < height; y++) {
+            const uint16_t *a_row = a_planes[plane] + y * a_strides[plane];
+            const uint16_t *b_row = b_planes[plane] + y * b_strides[plane];
+            for (int x = 0; x < width; x++) {
+                if (a_row[x] != b_row[x]) {
+                    printf("\n  FAIL [%s:%d] P010 %s[%d] %s pixel(%d,%d) "
+                           "I010=%u P010=%u\n",
+                           __func__, __LINE__, group, output_idx,
+                           plane_names[plane], x, y,
+                           (unsigned)a_row[x], (unsigned)b_row[x]);
+                    return 0;
+                }
+            }
+        }
+    }
+
+    return 1;
+}
+
 /*
  * Probe whether fused_hdr_run actually writes HDR output for a given config.
  * Run with a solid-512 source and check if any HDR output pixel is non-zero.
@@ -506,6 +559,96 @@ static void test_hdr_p010_equivalence(void)
     fused_hdr_free(&ctx_p010);
     test_hdr_frame_free(&i010_frame);
     test_p010_frame_free(&p010_frame);
+    TEST_PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * 6b. test_hdr_p010_combined_equivalence
+ *     Combined downscale and upscale must reuse planar P010 temporaries
+ *     without changing any Y, U, or V sample.
+ * -------------------------------------------------------------------------- */
+
+static void test_hdr_p010_combined_equivalence(void)
+{
+    const int width = 640;
+    const int height = 360;
+    const uint32_t down_flags = FUSED_SCALE_1_5X | FUSED_SCALE_3X;
+    const uint32_t up_flags = FUSED_UPSCALE_2X;
+    const uint32_t seed = 0x51a7c0de;
+    test_hdr_frame_t i010_frame;
+    test_p010_frame_t p010_frame;
+    fused_hdr_ctx_t ctx_i010;
+    fused_hdr_ctx_t ctx_p010;
+
+    int r = test_hdr_frame_create(&i010_frame, width, height,
+                                  PATTERN_RANDOM, seed);
+    TEST_ASSERT(r == 0, "test_hdr_frame_create failed for I010");
+    r = test_p010_frame_create(&p010_frame, width, height,
+                               PATTERN_RANDOM, seed);
+    if (r != 0) {
+        test_hdr_frame_free(&i010_frame);
+        TEST_ASSERT(0, "test_p010_frame_create failed");
+    }
+
+    memset(&ctx_i010, 0, sizeof(ctx_i010));
+    ctx_i010.src_width       = width;
+    ctx_i010.src_height      = height;
+    ctx_i010.src_y_stride    = i010_frame.y_stride;
+    ctx_i010.src_uv_stride   = i010_frame.uv_stride;
+    ctx_i010.src_format      = FUSED_PIX_I010;
+    ctx_i010.src_transfer    = FUSED_TRC_PQ;
+    ctx_i010.requested_flags = down_flags;
+    ctx_i010.hdr_flags       = down_flags;
+    ctx_i010.upscale_flags   = up_flags;
+    suppress_log(&ctx_i010);
+
+    memset(&ctx_p010, 0, sizeof(ctx_p010));
+    ctx_p010.src_width       = width;
+    ctx_p010.src_height      = height;
+    ctx_p010.src_y_stride    = p010_frame.y_stride;
+    ctx_p010.src_uv_stride   = p010_frame.uv_stride;
+    ctx_p010.src_format      = FUSED_PIX_P010;
+    ctx_p010.src_transfer    = FUSED_TRC_PQ;
+    ctx_p010.requested_flags = down_flags;
+    ctx_p010.hdr_flags       = down_flags;
+    ctx_p010.upscale_flags   = up_flags;
+    suppress_log(&ctx_p010);
+
+    int rc_i010 = fused_hdr_init(&ctx_i010);
+    int rc_p010 = fused_hdr_init(&ctx_p010);
+    if (rc_i010 < 0 || rc_p010 < 0) {
+        fused_hdr_free(&ctx_i010);
+        fused_hdr_free(&ctx_p010);
+        test_hdr_frame_free(&i010_frame);
+        test_p010_frame_free(&p010_frame);
+        TEST_ASSERT(0, "combined P010 or I010 init failed");
+    }
+
+    fused_hdr_run(&ctx_i010, i010_frame.plane_y,
+                  i010_frame.plane_u, i010_frame.plane_v);
+    fused_hdr_run(&ctx_p010, p010_frame.plane_y,
+                  p010_frame.plane_uv, NULL);
+
+    int equal = 1;
+    for (int i = 0; i < 8 && equal; i++) {
+        const fused_hdr_output_t *a = &ctx_i010.hdr_outputs[i];
+        const fused_hdr_output_t *b = &ctx_p010.hdr_outputs[i];
+        if (!a->plane_y && !b->plane_y) continue;
+        equal = hdr_output_equal_exact(a, b, "down", i);
+    }
+    for (int i = 0; i < FUSED_MAX_UPSCALE_STEPS && equal; i++) {
+        const fused_hdr_output_t *a = &ctx_i010.upscale_hdr_outputs[i];
+        const fused_hdr_output_t *b = &ctx_p010.upscale_hdr_outputs[i];
+        if (!a->plane_y && !b->plane_y) continue;
+        equal = hdr_output_equal_exact(a, b, "up", i);
+    }
+
+    fused_hdr_free(&ctx_i010);
+    fused_hdr_free(&ctx_p010);
+    test_hdr_frame_free(&i010_frame);
+    test_p010_frame_free(&p010_frame);
+
+    TEST_ASSERT(equal, "combined P010 output differs from I010");
     TEST_PASS();
 }
 
@@ -1300,6 +1443,7 @@ void run_hdr_correctness_tests(void)
     RUN_TEST(test_hdr_tonemap_monotonicity);
     RUN_TEST(test_hdr_tonemap_range);
     RUN_TEST(test_hdr_p010_equivalence);
+    RUN_TEST(test_hdr_p010_combined_equivalence);
     RUN_TEST(test_hdr_curve_variation);
     RUN_TEST(test_hdr_output_dimensions);
     RUN_TEST(test_hdr_hlg_vs_pq_differ);

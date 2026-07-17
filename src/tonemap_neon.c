@@ -126,53 +126,63 @@ tm_lookup16_neon(const uint8_t *lut, uint16x8_t i0, uint16x8_t i1,
 
 static inline __attribute__((always_inline)) void
 tm_chroma_dots_neon(uint16x8_t r, uint16x8_t g, uint16x8_t b, uint16x8_t y,
-                    int32x4_t cbs, int32x4_t crs,
-                    int32x4_t cmin, int32x4_t cmax,
+                    int16x8_t cbs, int16x8_t crs,
+                    int16x8_t cmin, int16x8_t cmax,
                     uint8_t *du, uint8_t *dv)
 {
     int32x4_t c128 = vdupq_n_s32(128);
-    int32x4_t zero = vdupq_n_s32(0);
-    int32x4_t c255 = vdupq_n_s32(255);
+    uint16x8_t c255 = vdupq_n_u16(255);
     int16x4_t g425 = vdup_n_s16(425),  gm150 = vdup_n_s16(-150);
     int16x4_t gm19 = vdup_n_s16(-19),  gm5   = vdup_n_s16(-5);
     int16x4_t gm26 = vdup_n_s16(-26),  g287  = vdup_n_s16(287);
 
-    int32x4_t cbq[2], crq[2];
+    /* Values are 0..255, so the u16 halves reinterpret as s16.  The
+     * saturating rounded narrows perform the gamut rounding, lower clamp,
+     * and 32-to-16 conversion together. */
+    int16x4_t rl = vreinterpret_s16_u16(vget_low_u16(r));
+    int16x4_t gl = vreinterpret_s16_u16(vget_low_u16(g));
+    int16x4_t bl = vreinterpret_s16_u16(vget_low_u16(b));
+    int16x4_t rh = vreinterpret_s16_u16(vget_high_u16(r));
+    int16x4_t gh = vreinterpret_s16_u16(vget_high_u16(g));
+    int16x4_t bh = vreinterpret_s16_u16(vget_high_u16(b));
 
-    for (int h = 0; h < 2; h++) {
-        /* values are 0..255, so the u16 halves reinterpret as s16 */
-        int16x4_t rw = vreinterpret_s16_u16(
-            h ? vget_high_u16(r) : vget_low_u16(r));
-        int16x4_t gw = vreinterpret_s16_u16(
-            h ? vget_high_u16(g) : vget_low_u16(g));
-        int16x4_t bw = vreinterpret_s16_u16(
-            h ? vget_high_u16(b) : vget_low_u16(b));
-        int32x4_t yw = vreinterpretq_s32_u32(vmovl_u16(
-            h ? vget_high_u16(y) : vget_low_u16(y)));
+    int32x4_t r709l = vmlal_s16(
+        vmlal_s16(vmull_s16(rl, g425), gl, gm150), bl, gm19);
+    int32x4_t r709h = vmlal_s16(
+        vmlal_s16(vmull_s16(rh, g425), gh, gm150), bh, gm19);
+    int32x4_t b709l = vmlal_s16(
+        vmlal_s16(vmull_s16(rl, gm5), gl, gm26), bl, g287);
+    int32x4_t b709h = vmlal_s16(
+        vmlal_s16(vmull_s16(rh, gm5), gh, gm26), bh, g287);
 
-        /* Gamut rows * 256 (each sums to 256), widening MACs from 16-bit:
-         * see tonemap.h */
-        int32x4_t r709 = vshrq_n_s32(vaddq_s32(
-            vmlal_s16(vmlal_s16(vmull_s16(rw, g425), gw, gm150), bw, gm19),
-            c128), 8);
-        int32x4_t b709 = vshrq_n_s32(vaddq_s32(
-            vmlal_s16(vmlal_s16(vmull_s16(rw, gm5), gw, gm26), bw, g287),
-            c128), 8);
-        r709 = vminq_s32(vmaxq_s32(r709, zero), c255);
-        b709 = vminq_s32(vmaxq_s32(b709, zero), c255);
+    uint16x8_t r709 = vqrshrun_high_n_s32(
+        vqrshrun_n_s32(r709l, 8), r709h, 8);
+    uint16x8_t b709 = vqrshrun_high_n_s32(
+        vqrshrun_n_s32(b709l, 8), b709h, 8);
+    r709 = vminq_u16(r709, c255);
+    b709 = vminq_u16(b709, c255);
 
-        /* cb = clamp(128 + ((b709 - y)*cbs + 128 >> 8), cmin, cmax) */
-        int32x4_t cb = vaddq_s32(c128, vshrq_n_s32(
-            vaddq_s32(vmulq_s32(vsubq_s32(b709, yw), cbs), c128), 8));
-        int32x4_t cr = vaddq_s32(c128, vshrq_n_s32(
-            vaddq_s32(vmulq_s32(vsubq_s32(r709, yw), crs), c128), 8));
+    /* cb = clamp(128 + ((b709 - y)*cbs + 128 >> 8), cmin, cmax).
+     * Differences and scales fit signed 16-bit; widening multiplies retain
+     * the exact 32-bit products. */
+    int16x8_t bd = vsubq_s16(vreinterpretq_s16_u16(b709),
+                             vreinterpretq_s16_u16(y));
+    int16x8_t rd = vsubq_s16(vreinterpretq_s16_u16(r709),
+                             vreinterpretq_s16_u16(y));
+    int32x4_t cbl = vmull_s16(vget_low_s16(bd), vget_low_s16(cbs));
+    int32x4_t cbh = vmull_high_s16(bd, cbs);
+    int32x4_t crl = vmull_s16(vget_low_s16(rd), vget_low_s16(crs));
+    int32x4_t crh = vmull_high_s16(rd, crs);
 
-        cbq[h] = vminq_s32(vmaxq_s32(cb, cmin), cmax);
-        crq[h] = vminq_s32(vmaxq_s32(cr, cmin), cmax);
-    }
+    cbl = vrsraq_n_s32(c128, cbl, 8);
+    cbh = vrsraq_n_s32(c128, cbh, 8);
+    crl = vrsraq_n_s32(c128, crl, 8);
+    crh = vrsraq_n_s32(c128, crh, 8);
 
-    int16x8_t cbw = vcombine_s16(vmovn_s32(cbq[0]), vmovn_s32(cbq[1]));
-    int16x8_t crw = vcombine_s16(vmovn_s32(crq[0]), vmovn_s32(crq[1]));
+    int16x8_t cbw = vcombine_s16(vmovn_s32(cbl), vmovn_s32(cbh));
+    int16x8_t crw = vcombine_s16(vmovn_s32(crl), vmovn_s32(crh));
+    cbw = vminq_s16(vmaxq_s16(cbw, cmin), cmax);
+    crw = vminq_s16(vmaxq_s16(crw, cmin), cmax);
     vst1_u8(du, vmovn_u16(vreinterpretq_u16_s16(cbw)));
     vst1_u8(dv, vmovn_u16(vreinterpretq_u16_s16(crw)));
 }
@@ -189,7 +199,7 @@ tm_chunk_neon(const fused_hdr_internal_t *state,
               const uint16_t *sy0, const uint16_t *sy1,
               uint8_t *dy0, uint8_t *dy1,
               uint8_t *du, uint8_t *dv,
-              int32x4_t cbs, int32x4_t crs, int32x4_t cmin, int32x4_t cmax)
+              int16x8_t cbs, int16x8_t crs, int16x8_t cmin, int16x8_t cmax)
 {
     const uint8_t *lut = state->pq_to_sdr;
     uint16x8_t mask10 = vdupq_n_u16(0x3FF);
@@ -311,10 +321,10 @@ tm_frame_neon(const fused_hdr_internal_t *state,
 
     int simd_cw = chroma_w & ~7;
 
-    int32x4_t cbs  = vdupq_n_s32(state->cb_out_scale);
-    int32x4_t crs  = vdupq_n_s32(state->cr_out_scale);
-    int32x4_t cmin = vdupq_n_s32(state->chroma_out_min);
-    int32x4_t cmax = vdupq_n_s32(state->chroma_out_max);
+    int16x8_t cbs  = vdupq_n_s16((int16_t)state->cb_out_scale);
+    int16x8_t crs  = vdupq_n_s16((int16_t)state->cr_out_scale);
+    int16x8_t cmin = vdupq_n_s16((int16_t)state->chroma_out_min);
+    int16x8_t cmax = vdupq_n_s16((int16_t)state->chroma_out_max);
 
     for (int cy = 0; cy < chroma_h; cy++) {
         const uint16_t *su  = src_u  ? src_u  + cy * src_uv_pitch : 0;

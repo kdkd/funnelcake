@@ -91,6 +91,20 @@ static void up_h_2x_row_neon(const uint8_t *src, int src_w, uint8_t *dst)
     }
 }
 
+static inline __attribute__((always_inline)) uint8x16_t
+up_h_2x_mid_neon(uint8x16_t r, uint8x16_t next)
+{
+    return vrhaddq_u8(r, vextq_u8(r, next, 1));
+}
+
+static inline __attribute__((always_inline)) void
+up_h_2x_store_neon(uint8x16_t r, uint8x16_t mid, uint8_t *dst)
+{
+    uint8x16x2_t zipped = { { vzip1q_u8(r, mid), vzip2q_u8(r, mid) } };
+    vst1q_u8(dst, zipped.val[0]);
+    vst1q_u8(dst + 16, zipped.val[1]);
+}
+
 
 /* -----------------------------------------------------------------------
  * Vertical 2x upscale of one plane (with horizontal doubling fused)
@@ -100,9 +114,10 @@ static void up_h_2x_row_neon(const uint8_t *src, int src_w, uint8_t *dst)
  *   - Output row 2i+0 = horizontally-doubled src[i]
  *   - Output row 2i+1 = horizontally-doubled vert_avg(src[i], src[i+1])
  *
- * The vertical midpoint row is computed in-place (vrhaddq_u8 over the
- * full row width) before being passed to up_h_2x_row_neon.  Bottom edge
- * replicates src[h-1] as src[h].
+ * Four chunks from both source rows are kept in registers. The exact output
+ * row is stored as one 128-byte run, followed by the vertical midpoint row.
+ * This preserves sequential stores while removing scratch traffic for the
+ * tiled portion. Bottom and right edges replicate.
  */
 static void up_2x_plane_neon(const uint8_t *src, int src_w, int src_h,
                              int src_stride, uint8_t *dst, int dst_stride,
@@ -117,21 +132,51 @@ static void up_2x_plane_neon(const uint8_t *src, int src_w, int src_h,
         const uint8_t *row_nxt = (i + 1 < src_h)
                                     ? src + (size_t)(i + 1) * src_stride
                                     : row_cur;
+        uint8_t *dst_cur = dst + (size_t)(2 * i) * dst_stride;
+        uint8_t *dst_mid = dst_cur + dst_stride;
 
-        /* Compute vertical midpoint row in-place via NEON pairwise average. */
         int x = 0;
-        for (; x + 16 <= src_w; x += 16) {
-            uint8x16_t a = vld1q_u8(row_cur + x);
-            uint8x16_t b = vld1q_u8(row_nxt + x);
-            vst1q_u8(scratch + x, vrhaddq_u8(a, b));
-        }
-        for (; x < src_w; x++) {
-            scratch[x] = up_avg_u8(row_cur[x], row_nxt[x]);
+        for (; x + 64 <= src_w; x += 64) {
+            uint8x16_t a0 = vld1q_u8(row_cur + x);
+            uint8x16_t m0 = vrhaddq_u8(a0, vld1q_u8(row_nxt + x));
+            uint8x16_t a1 = vld1q_u8(row_cur + x + 16);
+            uint8x16_t m1 = vrhaddq_u8(a1, vld1q_u8(row_nxt + x + 16));
+            uint8x16_t a2 = vld1q_u8(row_cur + x + 32);
+            uint8x16_t m2 = vrhaddq_u8(a2, vld1q_u8(row_nxt + x + 32));
+            uint8x16_t a3 = vld1q_u8(row_cur + x + 48);
+            uint8x16_t m3 = vrhaddq_u8(a3, vld1q_u8(row_nxt + x + 48));
+
+            int edge_x = (x + 64 < src_w) ? x + 64 : src_w - 1;
+            uint8_t edge_cur = row_cur[edge_x];
+            uint8_t edge_mid = up_avg_u8(row_cur[edge_x], row_nxt[edge_x]);
+            uint8x16_t a4 = vdupq_n_u8(edge_cur);
+            uint8x16_t m4 = vdupq_n_u8(edge_mid);
+
+            uint8x16_t ah0 = up_h_2x_mid_neon(a0, a1);
+            uint8x16_t ah1 = up_h_2x_mid_neon(a1, a2);
+            uint8x16_t ah2 = up_h_2x_mid_neon(a2, a3);
+            uint8x16_t ah3 = up_h_2x_mid_neon(a3, a4);
+            uint8x16_t mh0 = up_h_2x_mid_neon(m0, m1);
+            uint8x16_t mh1 = up_h_2x_mid_neon(m1, m2);
+            uint8x16_t mh2 = up_h_2x_mid_neon(m2, m3);
+            uint8x16_t mh3 = up_h_2x_mid_neon(m3, m4);
+
+            up_h_2x_store_neon(a0, ah0, dst_cur + 2 * x);
+            up_h_2x_store_neon(a1, ah1, dst_cur + 2 * x + 32);
+            up_h_2x_store_neon(a2, ah2, dst_cur + 2 * x + 64);
+            up_h_2x_store_neon(a3, ah3, dst_cur + 2 * x + 96);
+            up_h_2x_store_neon(m0, mh0, dst_mid + 2 * x);
+            up_h_2x_store_neon(m1, mh1, dst_mid + 2 * x + 32);
+            up_h_2x_store_neon(m2, mh2, dst_mid + 2 * x + 64);
+            up_h_2x_store_neon(m3, mh3, dst_mid + 2 * x + 96);
         }
 
-        /* Horizontally double both rows. */
-        up_h_2x_row_neon(row_cur, src_w, dst + (size_t)(2 * i)     * dst_stride);
-        up_h_2x_row_neon(scratch, src_w, dst + (size_t)(2 * i + 1) * dst_stride);
+        if (x < src_w) {
+            for (int tx = x; tx < src_w; tx++)
+                scratch[tx] = up_avg_u8(row_cur[tx], row_nxt[tx]);
+            up_h_2x_row_neon(row_cur + x, src_w - x, dst_cur + 2 * x);
+            up_h_2x_row_neon(scratch + x, src_w - x, dst_mid + 2 * x);
+        }
     }
 }
 
@@ -494,7 +539,21 @@ static void up_h_2x_row_neon_u16(const uint16_t *src, int src_w, uint16_t *dst)
     }
 }
 
-/* ---- Vertical 2x upscale of one HDR plane ---- */
+static inline __attribute__((always_inline)) uint16x8_t
+up_h_2x_mid_neon_u16(uint16x8_t r, uint16x8_t next)
+{
+    return vrhaddq_u16(r, vextq_u16(r, next, 1));
+}
+
+static inline __attribute__((always_inline)) void
+up_h_2x_store_neon_u16(uint16x8_t r, uint16x8_t mid, uint16_t *dst)
+{
+    vst1q_u16(dst, vzip1q_u16(r, mid));
+    vst1q_u16(dst + 8, vzip2q_u16(r, mid));
+}
+
+/* Four 8-lane chunks stay in registers so each output row is written as one
+ * sequential 128-byte run. Scratch is used only for a residual tail. */
 static void up_2x_plane_neon_u16(const uint16_t *src, int src_w, int src_h,
                                  int src_el_stride, uint16_t *dst,
                                  int dst_el_stride, uint16_t *scratch)
@@ -506,89 +565,149 @@ static void up_2x_plane_neon_u16(const uint16_t *src, int src_w, int src_h,
         const uint16_t *row_nxt = (i + 1 < src_h)
                                     ? src + (size_t)(i + 1) * src_el_stride
                                     : row_cur;
+        uint16_t *dst_cur = dst + (size_t)(2 * i) * dst_el_stride;
+        uint16_t *dst_mid = dst_cur + dst_el_stride;
 
-        /* Vertical midpoint row via vrhaddq_u16. */
         int x = 0;
-        for (; x + 8 <= src_w; x += 8) {
-            uint16x8_t a = vld1q_u16(row_cur + x);
-            uint16x8_t b = vld1q_u16(row_nxt + x);
-            vst1q_u16(scratch + x, vrhaddq_u16(a, b));
-        }
-        for (; x < src_w; x++) {
-            scratch[x] = up_avg_u16_scalar(row_cur[x], row_nxt[x]);
+        for (; x + 32 <= src_w; x += 32) {
+            uint16x8_t a0 = vld1q_u16(row_cur + x);
+            uint16x8_t m0 = vrhaddq_u16(a0, vld1q_u16(row_nxt + x));
+            uint16x8_t a1 = vld1q_u16(row_cur + x + 8);
+            uint16x8_t m1 = vrhaddq_u16(a1, vld1q_u16(row_nxt + x + 8));
+            uint16x8_t a2 = vld1q_u16(row_cur + x + 16);
+            uint16x8_t m2 = vrhaddq_u16(a2, vld1q_u16(row_nxt + x + 16));
+            uint16x8_t a3 = vld1q_u16(row_cur + x + 24);
+            uint16x8_t m3 = vrhaddq_u16(a3, vld1q_u16(row_nxt + x + 24));
+
+            int edge_x = (x + 32 < src_w) ? x + 32 : src_w - 1;
+            uint16_t edge_cur = row_cur[edge_x];
+            uint16_t edge_mid = up_avg_u16_scalar(row_cur[edge_x],
+                                                   row_nxt[edge_x]);
+            uint16x8_t a4 = vdupq_n_u16(edge_cur);
+            uint16x8_t m4 = vdupq_n_u16(edge_mid);
+
+            uint16x8_t ah0 = up_h_2x_mid_neon_u16(a0, a1);
+            uint16x8_t ah1 = up_h_2x_mid_neon_u16(a1, a2);
+            uint16x8_t ah2 = up_h_2x_mid_neon_u16(a2, a3);
+            uint16x8_t ah3 = up_h_2x_mid_neon_u16(a3, a4);
+            uint16x8_t mh0 = up_h_2x_mid_neon_u16(m0, m1);
+            uint16x8_t mh1 = up_h_2x_mid_neon_u16(m1, m2);
+            uint16x8_t mh2 = up_h_2x_mid_neon_u16(m2, m3);
+            uint16x8_t mh3 = up_h_2x_mid_neon_u16(m3, m4);
+
+            up_h_2x_store_neon_u16(a0, ah0, dst_cur + 2 * x);
+            up_h_2x_store_neon_u16(a1, ah1, dst_cur + 2 * x + 16);
+            up_h_2x_store_neon_u16(a2, ah2, dst_cur + 2 * x + 32);
+            up_h_2x_store_neon_u16(a3, ah3, dst_cur + 2 * x + 48);
+            up_h_2x_store_neon_u16(m0, mh0, dst_mid + 2 * x);
+            up_h_2x_store_neon_u16(m1, mh1, dst_mid + 2 * x + 16);
+            up_h_2x_store_neon_u16(m2, mh2, dst_mid + 2 * x + 32);
+            up_h_2x_store_neon_u16(m3, mh3, dst_mid + 2 * x + 48);
         }
 
-        up_h_2x_row_neon_u16(row_cur, src_w,
-                             dst + (size_t)(2 * i)     * dst_el_stride);
-        up_h_2x_row_neon_u16(scratch, src_w,
-                             dst + (size_t)(2 * i + 1) * dst_el_stride);
+        if (x < src_w) {
+            for (int tx = x; tx < src_w; tx++)
+                scratch[tx] = up_avg_u16_scalar(row_cur[tx], row_nxt[tx]);
+            up_h_2x_row_neon_u16(row_cur + x, src_w - x, dst_cur + 2 * x);
+            up_h_2x_row_neon_u16(scratch + x, src_w - x, dst_mid + 2 * x);
+        }
     }
 }
 
-/* ---- Vertical 85/171 blend of two HDR rows ---- */
-static inline void up_vblend_21_row_neon_u16(const uint16_t *a_row,
-                                             const uint16_t *b_row,
-                                             int w, uint16_t *out)
+static inline __attribute__((always_inline)) uint16x8x3_t
+up_h_1_5x_make_neon_u16(uint16x8_t even, uint16x8_t odd,
+                        uint16_t next_even)
 {
-    int x = 0;
-    for (; x + 8 <= w; x += 8) {
-        uint16x8_t av = vld1q_u16(a_row + x);
-        uint16x8_t bv = vld1q_u16(b_row + x);
-        vst1q_u16(out + x, up_blend_171_85_neon_u16(bv, av));
-    }
-    for (; x < w; x++) {
-        out[x] = up_blend_21_u16_scalar(a_row[x], b_row[x]);
-    }
+    uint16x8_t following = vextq_u16(
+        even, vdupq_n_u16(next_even), 1);
+    uint16x8x3_t out = { {
+        even,
+        up_blend_171_85_neon_u16(odd, even),
+        up_blend_171_85_neon_u16(odd, following)
+    } };
+    return out;
 }
 
-/* ---- Horizontal 1.5x (2->3) HDR upscale of one row ---- */
-static void up_h_1_5x_row_neon_u16(const uint16_t *src, int w, uint16_t *dst)
+/* Produce all three rows while loading each source row once per tile. */
+static void up_vh_1_5x_three_rows_neon_u16(const uint16_t *top,
+                                           const uint16_t *middle,
+                                           const uint16_t *bottom,
+                                           int w, uint16_t *dst_exact,
+                                           uint16_t *dst_top,
+                                           uint16_t *dst_bottom)
 {
     int pairs = w / 2;
-    int full_chunks = pairs / 8;   /* 8 pairs per chunk */
+    int full_chunks = pairs / 8;
     int p = 0;
 
-    for (int c = 0; c < full_chunks; c++) {
-        /* vld2q_u16 loads 16 u16 values and deinterleaves into two 8-lane
-         * vectors: even positions -> a, odd positions -> b. */
-        uint16x8x2_t ab = vld2q_u16(src + 2 * p);
-        uint16x8_t a = ab.val[0];
-        uint16x8_t b = ab.val[1];
-
-        /* Next "a" for the c-vector shift. */
+    for (int chunk = 0; chunk < full_chunks; chunk++) {
+        uint16x8x2_t middle_ab = vld2q_u16(middle + 2 * p);
+        uint16x8x2_t top_ab = vld2q_u16(top + 2 * p);
         int next_idx = 2 * (p + 8);
-        uint16_t next_a = (next_idx < w) ? src[next_idx] : src[w - 1];
-        uint16x8_t c_vec = vextq_u16(a, vdupq_n_u16(next_a), 1);
+        int edge_idx = (next_idx < w) ? next_idx : w - 1;
+        uint16x8x3_t exact_out = up_h_1_5x_make_neon_u16(
+            top_ab.val[0], top_ab.val[1], top[edge_idx]);
+        uint16x8_t top_even = up_blend_171_85_neon_u16(
+            middle_ab.val[0], top_ab.val[0]);
+        uint16x8_t top_odd = up_blend_171_85_neon_u16(
+            middle_ab.val[1], top_ab.val[1]);
+        uint16_t next_top = up_blend_21_u16_scalar(
+            top[edge_idx], middle[edge_idx]);
+        uint16x8x3_t top_out = up_h_1_5x_make_neon_u16(
+            top_even, top_odd, next_top);
+        vst3q_u16(dst_exact + 3 * p, exact_out);
+        vst3q_u16(dst_top + 3 * p, top_out);
 
-        uint16x8_t m1 = up_blend_171_85_neon_u16(b, a);
-        uint16x8_t m2 = up_blend_171_85_neon_u16(b, c_vec);
-
-        /* vst3q_u16 stores three 8-lane vectors interleaved as 24 u16
-         * values: {a[0], m1[0], m2[0], a[1], m1[1], m2[1], ...}. */
-        uint16x8x3_t triple = { { a, m1, m2 } };
-        vst3q_u16(dst + 3 * p, triple);
-
+        uint16x8x2_t bottom_ab = vld2q_u16(bottom + 2 * p);
+        uint16x8_t bottom_even = up_blend_171_85_neon_u16(
+            middle_ab.val[0], bottom_ab.val[0]);
+        uint16x8_t bottom_odd = up_blend_171_85_neon_u16(
+            middle_ab.val[1], bottom_ab.val[1]);
+        uint16_t next_bottom = up_blend_21_u16_scalar(
+            bottom[edge_idx], middle[edge_idx]);
+        uint16x8x3_t bottom_out = up_h_1_5x_make_neon_u16(
+            bottom_even, bottom_odd, next_bottom);
+        vst3q_u16(dst_bottom + 3 * p, bottom_out);
         p += 8;
     }
 
-    /* Scalar tail. */
     for (; p < pairs; p++) {
-        uint16_t a = src[2 * p];
-        uint16_t b = src[2 * p + 1];
-        uint16_t c = (2 * p + 2 < w) ? src[2 * p + 2] : src[w - 1];
-        dst[3 * p + 0] = a;
-        dst[3 * p + 1] = up_blend_21_u16_scalar(a, b);
-        dst[3 * p + 2] = up_blend_21_u16_scalar(c, b);
+        int even_idx = 2 * p;
+        int odd_idx = even_idx + 1;
+        int next_idx = even_idx + 2;
+        int edge_idx = (next_idx < w) ? next_idx : w - 1;
+
+        uint16_t exact_a = top[even_idx];
+        uint16_t exact_b = top[odd_idx];
+        uint16_t exact_c = top[edge_idx];
+        dst_exact[3 * p + 0] = exact_a;
+        dst_exact[3 * p + 1] = up_blend_21_u16_scalar(exact_a, exact_b);
+        dst_exact[3 * p + 2] = up_blend_21_u16_scalar(exact_c, exact_b);
+
+        uint16_t a = up_blend_21_u16_scalar(
+            top[even_idx], middle[even_idx]);
+        uint16_t b = up_blend_21_u16_scalar(
+            top[odd_idx], middle[odd_idx]);
+        uint16_t c = up_blend_21_u16_scalar(
+            top[edge_idx], middle[edge_idx]);
+        dst_top[3 * p + 0] = a;
+        dst_top[3 * p + 1] = up_blend_21_u16_scalar(a, b);
+        dst_top[3 * p + 2] = up_blend_21_u16_scalar(c, b);
+
+        a = up_blend_21_u16_scalar(bottom[even_idx], middle[even_idx]);
+        b = up_blend_21_u16_scalar(bottom[odd_idx], middle[odd_idx]);
+        c = up_blend_21_u16_scalar(bottom[edge_idx], middle[edge_idx]);
+        dst_bottom[3 * p + 0] = a;
+        dst_bottom[3 * p + 1] = up_blend_21_u16_scalar(a, b);
+        dst_bottom[3 * p + 2] = up_blend_21_u16_scalar(c, b);
     }
 }
 
 /* ---- 1.5x plane upscale for HDR ---- */
 static void up_1_5x_plane_neon_u16(const uint16_t *src, int src_w, int src_h,
                                    int src_el_stride, uint16_t *dst,
-                                   int dst_el_stride, uint16_t *scratch)
+                                   int dst_el_stride)
 {
-    if (!scratch) return;
-
     int pairs_v = src_h / 2;
     for (int j = 0; j < pairs_v; j++) {
         const uint16_t *r2j  = src + (size_t)(2 * j)     * src_el_stride;
@@ -597,16 +716,11 @@ static void up_1_5x_plane_neon_u16(const uint16_t *src, int src_w, int src_h,
                                     ? src + (size_t)(2 * j + 2) * src_el_stride
                                     : r2j1;
 
-        up_h_1_5x_row_neon_u16(r2j, src_w,
-                               dst + (size_t)(3 * j + 0) * dst_el_stride);
-
-        up_vblend_21_row_neon_u16(r2j, r2j1, src_w, scratch);
-        up_h_1_5x_row_neon_u16(scratch, src_w,
-                               dst + (size_t)(3 * j + 1) * dst_el_stride);
-
-        up_vblend_21_row_neon_u16(r2j2, r2j1, src_w, scratch);
-        up_h_1_5x_row_neon_u16(scratch, src_w,
-                               dst + (size_t)(3 * j + 2) * dst_el_stride);
+        up_vh_1_5x_three_rows_neon_u16(
+            r2j, r2j1, r2j2, src_w,
+            dst + (size_t)(3 * j + 0) * dst_el_stride,
+            dst + (size_t)(3 * j + 1) * dst_el_stride,
+            dst + (size_t)(3 * j + 2) * dst_el_stride);
     }
 }
 
@@ -697,10 +811,24 @@ static void upscale_plane_hdr_neon(const fused_hdr_kernel_params_t *p,
 
         if (tail_src && dst) {
             up_1_5x_plane_neon_u16(tail_src, tail_src_w, tail_src_h,
-                                   tail_src_el_stride, dst, dst_el_stride,
-                                   p->upscale_scratch_hdr);
+                                   tail_src_el_stride, dst, dst_el_stride);
         }
     }
+}
+
+static void fused_kernel_upscale_hdr_planar_neon(
+    const fused_hdr_kernel_params_t *p,
+    const uint16_t *src_y,
+    const uint16_t *src_u,
+    const uint16_t *src_v,
+    int src_uv_el_stride)
+{
+    upscale_plane_hdr_neon(p, src_y, p->src_width, p->src_height,
+                           p->src_y_el_stride, 0);
+    upscale_plane_hdr_neon(p, src_u, p->src_width / 2, p->src_height / 2,
+                           src_uv_el_stride, 1);
+    upscale_plane_hdr_neon(p, src_v, p->src_width / 2, p->src_height / 2,
+                           src_uv_el_stride, 2);
 }
 
 void fused_kernel_upscale_hdr_neon(const fused_hdr_kernel_params_t *p,
@@ -719,12 +847,8 @@ void fused_kernel_upscale_hdr_neon(const fused_hdr_kernel_params_t *p,
         up_src_uv_el_stride = p->p010_tmp_stride / (int)sizeof(uint16_t);
     }
 
-    upscale_plane_hdr_neon(p, src_y, p->src_width, p->src_height,
-                           p->src_y_el_stride, 0);
-    upscale_plane_hdr_neon(p, up_src_u, p->src_width / 2, p->src_height / 2,
-                           up_src_uv_el_stride, 1);
-    upscale_plane_hdr_neon(p, up_src_v, p->src_width / 2, p->src_height / 2,
-                           up_src_uv_el_stride, 2);
+    fused_kernel_upscale_hdr_planar_neon(
+        p, src_y, up_src_u, up_src_v, up_src_uv_el_stride);
 }
 
 void fused_kernel_thirds_up_hdr_neon(const fused_hdr_kernel_params_t *p,
@@ -736,7 +860,14 @@ void fused_kernel_thirds_up_hdr_neon(const fused_hdr_kernel_params_t *p,
         fused_kernel_thirds_hdr_neon(p, src_y, src_u, src_v);
     }
     if (p->upscale_hdr_active != 0) {
-        fused_kernel_upscale_hdr_neon(p, src_y, src_u, src_v);
+        if (p->active_outputs != 0 && p->is_p010 &&
+            p->p010_tmp_u && p->p010_tmp_v) {
+            fused_kernel_upscale_hdr_planar_neon(
+                p, src_y, p->p010_tmp_u, p->p010_tmp_v,
+                p->p010_tmp_stride / (int)sizeof(uint16_t));
+        } else {
+            fused_kernel_upscale_hdr_neon(p, src_y, src_u, src_v);
+        }
     }
 }
 
@@ -749,7 +880,14 @@ void fused_kernel_pow2_up_hdr_neon(const fused_hdr_kernel_params_t *p,
         fused_kernel_pow2_hdr_neon(p, src_y, src_u, src_v);
     }
     if (p->upscale_hdr_active != 0) {
-        fused_kernel_upscale_hdr_neon(p, src_y, src_u, src_v);
+        if (p->active_outputs != 0 && p->is_p010 &&
+            p->p010_tmp_u && p->p010_tmp_v) {
+            fused_kernel_upscale_hdr_planar_neon(
+                p, src_y, p->p010_tmp_u, p->p010_tmp_v,
+                p->p010_tmp_stride / (int)sizeof(uint16_t));
+        } else {
+            fused_kernel_upscale_hdr_neon(p, src_y, src_u, src_v);
+        }
     }
 }
 

@@ -223,7 +223,7 @@ static void h_filter_halve_hdr(const uint16_t *restrict src,
  * uint16_t elements with 8 elements per Q register instead of 16.
  * ----------------------------------------------------------------------- */
 
-static void __attribute__((hot)) scale_plane_pow2_hdr_neon(
+static void __attribute__((hot)) scale_plane_pow2_hdr_neon_buffered(
     const uint16_t *restrict src,
     int src_w, int src_h, int src_stride,
     uint32_t active_outputs,
@@ -379,6 +379,322 @@ static void __attribute__((hot)) scale_plane_pow2_hdr_neon(
     }
 
     /* Scratch buffers are carved from the persistent pool - nothing to free. */
+}
+
+/* Register-tiled HDR power-of-two reductions for 2x, 4x, and 8x. Each
+ * 8-element column tile remains in registers through the vertical tree and
+ * is horizontally reduced directly into its final output planes. */
+static inline uint16x8_t hdr_pow2_hhalve_reg(uint16x8_t v)
+{
+    uint32x4_t sum = vpaddlq_u16(v);
+    uint16x4_t out = vrshrn_n_u32(sum, 1);
+    return vcombine_u16(out, vdup_n_u16(0));
+}
+
+static inline void hdr_pow2_store_h1(uint16x8_t v, uint16_t *dst)
+{
+    v = hdr_pow2_hhalve_reg(v);
+    vst1_u16(dst, vget_low_u16(v));
+}
+
+static inline void hdr_pow2_store_h2(uint16x8_t v, uint16_t *dst)
+{
+    v = hdr_pow2_hhalve_reg(hdr_pow2_hhalve_reg(v));
+    vst1_lane_u32((uint32_t *)dst,
+                  vreinterpret_u32_u16(vget_low_u16(v)), 0);
+}
+
+static inline void hdr_pow2_store_h3(uint16x8_t v, uint16_t *dst)
+{
+    v = hdr_pow2_hhalve_reg(
+        hdr_pow2_hhalve_reg(hdr_pow2_hhalve_reg(v)));
+    vst1_lane_u16(dst, vget_low_u16(v), 0);
+}
+
+static void hdr_pow2_tiled_depth0(
+    const uint16_t *restrict src, int src_w, int src_h, int src_el_stride,
+    uint32_t active_outputs, uint16_t *restrict dst[4], int strides[4])
+{
+    int groups = src_h / 2;
+    int emit0 = (active_outputs & (1u << 1)) != 0;
+    for (int g = 0; g < groups; g++) {
+        const uint16_t *r0 = src + (size_t)(2 * g) * src_el_stride;
+        const uint16_t *r1 = r0 + src_el_stride;
+        for (int x = 0; x < src_w; x += 8) {
+            uint16x8_t v0 = vrhaddq_u16(vld1q_u16(r0 + x),
+                                         vld1q_u16(r1 + x));
+            if (emit0)
+                hdr_pow2_store_h1(v0,
+                    dst[0] + (size_t)g * strides[0] + x / 2);
+        }
+    }
+}
+
+static void hdr_pow2_tiled_depth1(
+    const uint16_t *restrict src, int src_w, int src_h, int src_el_stride,
+    uint32_t active_outputs, uint16_t *restrict dst[4], int strides[4])
+{
+    int groups = src_h / 4;
+    int emit0 = (active_outputs & (1u << 1)) != 0;
+    int emit1 = (active_outputs & (1u << 3)) != 0;
+    for (int g = 0; g < groups; g++) {
+        const uint16_t *base = src + (size_t)(4 * g) * src_el_stride;
+        for (int x = 0; x < src_w; x += 8) {
+            uint16x8_t v0 = vrhaddq_u16(vld1q_u16(base + x),
+                                         vld1q_u16(base + src_el_stride + x));
+            uint16x8_t v1 = vrhaddq_u16(
+                vld1q_u16(base + 2 * (size_t)src_el_stride + x),
+                vld1q_u16(base + 3 * (size_t)src_el_stride + x));
+            if (emit0) {
+                hdr_pow2_store_h1(v0,
+                    dst[0] + (size_t)(2 * g) * strides[0] + x / 2);
+                hdr_pow2_store_h1(v1,
+                    dst[0] + (size_t)(2 * g + 1) * strides[0] + x / 2);
+            }
+            uint16x8_t v2 = vrhaddq_u16(v0, v1);
+            if (emit1)
+                hdr_pow2_store_h2(v2,
+                    dst[1] + (size_t)g * strides[1] + x / 4);
+        }
+    }
+}
+
+static void hdr_pow2_tiled_depth2(
+    const uint16_t *restrict src, int src_w, int src_h, int src_el_stride,
+    uint32_t active_outputs, uint16_t *restrict dst[4], int strides[4])
+{
+    int groups = src_h / 8;
+    int emit0 = (active_outputs & (1u << 1)) != 0;
+    int emit1 = (active_outputs & (1u << 3)) != 0;
+    int emit2 = (active_outputs & (1u << 5)) != 0;
+    for (int g = 0; g < groups; g++) {
+        const uint16_t *base = src + (size_t)(8 * g) * src_el_stride;
+        for (int x = 0; x < src_w; x += 8) {
+            uint16x8_t v0 = vrhaddq_u16(vld1q_u16(base + x),
+                                         vld1q_u16(base + src_el_stride + x));
+            uint16x8_t v1 = vrhaddq_u16(
+                vld1q_u16(base + 2 * (size_t)src_el_stride + x),
+                vld1q_u16(base + 3 * (size_t)src_el_stride + x));
+            uint16x8_t v2 = vrhaddq_u16(
+                vld1q_u16(base + 4 * (size_t)src_el_stride + x),
+                vld1q_u16(base + 5 * (size_t)src_el_stride + x));
+            uint16x8_t v3 = vrhaddq_u16(
+                vld1q_u16(base + 6 * (size_t)src_el_stride + x),
+                vld1q_u16(base + 7 * (size_t)src_el_stride + x));
+            if (emit0) {
+                uint16_t *out = dst[0]
+                    + (size_t)(4 * g) * strides[0] + x / 2;
+                hdr_pow2_store_h1(v0, out);
+                hdr_pow2_store_h1(v1, out + strides[0]);
+                hdr_pow2_store_h1(v2, out + 2 * (size_t)strides[0]);
+                hdr_pow2_store_h1(v3, out + 3 * (size_t)strides[0]);
+            }
+            uint16x8_t v4 = vrhaddq_u16(v0, v1);
+            uint16x8_t v5 = vrhaddq_u16(v2, v3);
+            if (emit1) {
+                uint16_t *out = dst[1]
+                    + (size_t)(2 * g) * strides[1] + x / 4;
+                hdr_pow2_store_h2(v4, out);
+                hdr_pow2_store_h2(v5, out + strides[1]);
+            }
+            uint16x8_t v6 = vrhaddq_u16(v4, v5);
+            if (emit2)
+                hdr_pow2_store_h3(v6,
+                    dst[2] + (size_t)g * strides[2] + x / 8);
+        }
+    }
+}
+
+typedef struct {
+    uint16x8_t lo;
+    uint16x8_t hi;
+} hdr_pow2_tile16_t;
+
+static inline __attribute__((always_inline)) hdr_pow2_tile16_t
+hdr_pow2_load_pair16(const uint16_t *base, int row, int src_el_stride, int x)
+{
+    const uint16_t *a = base + (size_t)row * src_el_stride + x;
+    const uint16_t *b = a + src_el_stride;
+    hdr_pow2_tile16_t out;
+    out.lo = vrhaddq_u16(vld1q_u16(a), vld1q_u16(b));
+    out.hi = vrhaddq_u16(vld1q_u16(a + 8), vld1q_u16(b + 8));
+    return out;
+}
+
+static inline __attribute__((always_inline)) hdr_pow2_tile16_t
+hdr_pow2_avg_tile16(hdr_pow2_tile16_t a, hdr_pow2_tile16_t b)
+{
+    hdr_pow2_tile16_t out = {
+        vrhaddq_u16(a.lo, b.lo),
+        vrhaddq_u16(a.hi, b.hi)
+    };
+    return out;
+}
+
+static inline __attribute__((always_inline)) void
+hdr_pow2_store_h1_tile16(hdr_pow2_tile16_t v, uint16_t *dst)
+{
+    hdr_pow2_store_h1(v.lo, dst);
+    hdr_pow2_store_h1(v.hi, dst + 4);
+}
+
+static inline __attribute__((always_inline)) void
+hdr_pow2_store_h2_tile16(hdr_pow2_tile16_t v, uint16_t *dst)
+{
+    hdr_pow2_store_h2(v.lo, dst);
+    hdr_pow2_store_h2(v.hi, dst + 2);
+}
+
+static inline __attribute__((always_inline)) void
+hdr_pow2_store_h3_tile16(hdr_pow2_tile16_t v, uint16_t *dst)
+{
+    hdr_pow2_store_h3(v.lo, dst);
+    hdr_pow2_store_h3(v.hi, dst + 1);
+}
+
+static inline __attribute__((always_inline)) void
+hdr_pow2_store_h4_tile16(hdr_pow2_tile16_t v, uint16_t *dst)
+{
+    v.lo = hdr_pow2_hhalve_reg(
+        hdr_pow2_hhalve_reg(hdr_pow2_hhalve_reg(v.lo)));
+    v.hi = hdr_pow2_hhalve_reg(
+        hdr_pow2_hhalve_reg(hdr_pow2_hhalve_reg(v.hi)));
+    uint16x8_t out = vrhaddq_u16(v.lo, v.hi);
+    vst1_lane_u16(dst, vget_low_u16(out), 0);
+}
+
+static void hdr_pow2_tiled_depth3(
+    const uint16_t *restrict src, int src_w, int src_h, int src_el_stride,
+    uint32_t active_outputs, uint16_t *restrict dst[4], int strides[4])
+{
+    int groups = src_h / 16;
+    int emit0 = (active_outputs & (1u << 1)) != 0;
+    int emit1 = (active_outputs & (1u << 3)) != 0;
+    int emit2 = (active_outputs & (1u << 5)) != 0;
+    int emit3 = (active_outputs & (1u << 7)) != 0;
+
+    for (int g = 0; g < groups; g++) {
+        const uint16_t *base = src + (size_t)(16 * g) * src_el_stride;
+        for (int x = 0; x < src_w; x += 16) {
+            uint16_t *out0 = emit0
+                ? dst[0] + (size_t)(8 * g) * strides[0] + x / 2 : NULL;
+            uint16_t *out1 = emit1
+                ? dst[1] + (size_t)(4 * g) * strides[1] + x / 4 : NULL;
+            uint16_t *out2 = emit2
+                ? dst[2] + (size_t)(2 * g) * strides[2] + x / 8 : NULL;
+
+            hdr_pow2_tile16_t v0 = hdr_pow2_load_pair16(
+                base, 0, src_el_stride, x);
+            if (emit0) hdr_pow2_store_h1_tile16(v0, out0);
+            hdr_pow2_tile16_t v1 = hdr_pow2_load_pair16(
+                base, 2, src_el_stride, x);
+            if (emit0) hdr_pow2_store_h1_tile16(v1, out0 + strides[0]);
+            hdr_pow2_tile16_t w0 = hdr_pow2_avg_tile16(v0, v1);
+            if (emit1) hdr_pow2_store_h2_tile16(w0, out1);
+
+            hdr_pow2_tile16_t v2 = hdr_pow2_load_pair16(
+                base, 4, src_el_stride, x);
+            if (emit0)
+                hdr_pow2_store_h1_tile16(v2, out0 + 2 * (size_t)strides[0]);
+            hdr_pow2_tile16_t v3 = hdr_pow2_load_pair16(
+                base, 6, src_el_stride, x);
+            if (emit0)
+                hdr_pow2_store_h1_tile16(v3, out0 + 3 * (size_t)strides[0]);
+            hdr_pow2_tile16_t w1 = hdr_pow2_avg_tile16(v2, v3);
+            if (emit1) hdr_pow2_store_h2_tile16(w1, out1 + strides[1]);
+
+            hdr_pow2_tile16_t z0 = hdr_pow2_avg_tile16(w0, w1);
+            if (emit2) hdr_pow2_store_h3_tile16(z0, out2);
+
+            hdr_pow2_tile16_t v4 = hdr_pow2_load_pair16(
+                base, 8, src_el_stride, x);
+            if (emit0)
+                hdr_pow2_store_h1_tile16(v4, out0 + 4 * (size_t)strides[0]);
+            hdr_pow2_tile16_t v5 = hdr_pow2_load_pair16(
+                base, 10, src_el_stride, x);
+            if (emit0)
+                hdr_pow2_store_h1_tile16(v5, out0 + 5 * (size_t)strides[0]);
+            hdr_pow2_tile16_t w2 = hdr_pow2_avg_tile16(v4, v5);
+            if (emit1)
+                hdr_pow2_store_h2_tile16(w2, out1 + 2 * (size_t)strides[1]);
+
+            hdr_pow2_tile16_t v6 = hdr_pow2_load_pair16(
+                base, 12, src_el_stride, x);
+            if (emit0)
+                hdr_pow2_store_h1_tile16(v6, out0 + 6 * (size_t)strides[0]);
+            hdr_pow2_tile16_t v7 = hdr_pow2_load_pair16(
+                base, 14, src_el_stride, x);
+            if (emit0)
+                hdr_pow2_store_h1_tile16(v7, out0 + 7 * (size_t)strides[0]);
+            hdr_pow2_tile16_t w3 = hdr_pow2_avg_tile16(v6, v7);
+            if (emit1)
+                hdr_pow2_store_h2_tile16(w3, out1 + 3 * (size_t)strides[1]);
+
+            hdr_pow2_tile16_t z1 = hdr_pow2_avg_tile16(w2, w3);
+            if (emit2) hdr_pow2_store_h3_tile16(z1, out2 + strides[2]);
+
+            hdr_pow2_tile16_t q0 = hdr_pow2_avg_tile16(z0, z1);
+            if (emit3)
+                hdr_pow2_store_h4_tile16(q0,
+                    dst[3] + (size_t)g * strides[3] + x / 16);
+        }
+    }
+}
+
+static void __attribute__((hot)) scale_plane_pow2_hdr_neon(
+    const uint16_t *restrict src,
+    int src_w, int src_h, int src_stride,
+    uint32_t active_outputs,
+    uint16_t *restrict dst_planes[4],
+    int dst_widths[4],
+    int dst_strides[4],
+    int dst_heights[4],
+    uint8_t *scratch_pool_base,
+    size_t scratch_pool_size)
+{
+    static const int bit_pos[4] = { 1, 3, 5, 7 };
+    int deepest = -1;
+    for (int k = 3; k >= 0; k--) {
+        if (active_outputs & (1u << bit_pos[k])) {
+            deepest = k;
+            break;
+        }
+    }
+
+    int width_mask = (deepest == 3) ? 15 : 7;
+    if ((src_w & width_mask) != 0) {
+        scale_plane_pow2_hdr_neon_buffered(
+            src, src_w, src_h, src_stride, active_outputs,
+            dst_planes, dst_widths, dst_strides, dst_heights,
+            scratch_pool_base, scratch_pool_size);
+        return;
+    }
+
+    int src_el_stride = src_stride / (int)sizeof(uint16_t);
+    int dst_el_strides[4];
+    for (int k = 0; k < 4; k++)
+        dst_el_strides[k] = dst_strides[k] / (int)sizeof(uint16_t);
+
+    switch (deepest) {
+    case 0:
+        hdr_pow2_tiled_depth0(src, src_w, src_h, src_el_stride,
+                              active_outputs, dst_planes, dst_el_strides);
+        break;
+    case 1:
+        hdr_pow2_tiled_depth1(src, src_w, src_h, src_el_stride,
+                              active_outputs, dst_planes, dst_el_strides);
+        break;
+    case 2:
+        hdr_pow2_tiled_depth2(src, src_w, src_h, src_el_stride,
+                              active_outputs, dst_planes, dst_el_strides);
+        break;
+    case 3:
+        hdr_pow2_tiled_depth3(src, src_w, src_h, src_el_stride,
+                              active_outputs, dst_planes, dst_el_strides);
+        break;
+    default:
+        break;
+    }
 }
 
 

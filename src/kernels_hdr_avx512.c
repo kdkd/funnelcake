@@ -222,6 +222,172 @@ static inline uint16_t reduce_pow2_scalar_hdr_avx512(const uint16_t *src,
     return values[0];
 }
 
+static inline __attribute__((always_inline)) void avg_rows_64w_avx512(
+    const uint16_t *restrict a, const uint16_t *restrict b, int x,
+    __m512i *lo, __m512i *hi)
+{
+    *lo = _mm512_avg_epu16(
+        _mm512_loadu_si512((const void *)(a + x)),
+        _mm512_loadu_si512((const void *)(b + x)));
+    *hi = _mm512_avg_epu16(
+        _mm512_loadu_si512((const void *)(a + x + 32)),
+        _mm512_loadu_si512((const void *)(b + x + 32)));
+}
+
+static inline __attribute__((always_inline)) void avg_nodes_64w_avx512(
+    __m512i a_lo, __m512i a_hi, __m512i b_lo, __m512i b_hi,
+    __m512i *lo, __m512i *hi)
+{
+    *lo = _mm512_avg_epu16(a_lo, b_lo);
+    *hi = _mm512_avg_epu16(a_hi, b_hi);
+}
+
+/* Regular-width fast path: build each 64-element column tile's exact
+ * vertical tree in registers and emit requested horizontal levels directly.
+ * Completing small subtrees keeps the peak live set low while eliminating
+ * every full-width vertical scratch read and write. */
+static void __attribute__((hot)) scale_plane_pow2_tree_64w_avx512(
+    const uint16_t *restrict src,
+    int src_w, int src_h, int src_el_stride,
+    uint32_t active_outputs, int deepest,
+    uint16_t *restrict dst_planes[4], int dst_strides[4])
+{
+    const int group_rows = 2 << deepest;
+    const int num_groups = src_h / group_rows;
+    const int emit0 = (active_outputs & (1u << 1)) != 0;
+    const int emit1 = (active_outputs & (1u << 3)) != 0;
+    const int emit2 = (active_outputs & (1u << 5)) != 0;
+    const int emit3 = (active_outputs & (1u << 7)) != 0;
+    const int ds0 = dst_strides[0] / (int)sizeof(uint16_t);
+    const int ds1 = dst_strides[1] / (int)sizeof(uint16_t);
+    const int ds2 = dst_strides[2] / (int)sizeof(uint16_t);
+    const int ds3 = dst_strides[3] / (int)sizeof(uint16_t);
+
+    for (int g = 0; g < num_groups; g++) {
+        const uint16_t *grp = src
+            + (size_t)g * (size_t)group_rows * (size_t)src_el_stride;
+        uint16_t *out0 = emit0 ? dst_planes[0]
+            + (size_t)g * (size_t)(group_rows >> 1) * (size_t)ds0 : NULL;
+        uint16_t *out1 = emit1 ? dst_planes[1]
+            + (size_t)g * (size_t)(group_rows >> 2) * (size_t)ds1 : NULL;
+        uint16_t *out2 = emit2 ? dst_planes[2]
+            + (size_t)g * (size_t)(group_rows >> 3) * (size_t)ds2 : NULL;
+        uint16_t *out3 = emit3 ? dst_planes[3]
+            + (size_t)g * (size_t)(group_rows >> 4) * (size_t)ds3 : NULL;
+
+        for (int x = 0; x < src_w; x += 64) {
+            __m512i n0_lo, n0_hi, n1_lo, n1_hi;
+            __m512i p0_lo, p0_hi;
+
+            avg_rows_64w_avx512(grp,
+                grp + (size_t)src_el_stride, x, &n0_lo, &n0_hi);
+            if (emit0)
+                store_pow2_64w_avx512(n0_lo, n0_hi, 0,
+                    out0 + (size_t)x / 2);
+            if (deepest == 0)
+                continue;
+
+            avg_rows_64w_avx512(
+                grp + (size_t)2 * (size_t)src_el_stride,
+                grp + (size_t)3 * (size_t)src_el_stride,
+                x, &n1_lo, &n1_hi);
+            if (emit0)
+                store_pow2_64w_avx512(n1_lo, n1_hi, 0,
+                    out0 + (size_t)ds0 + (size_t)x / 2);
+            avg_nodes_64w_avx512(n0_lo, n0_hi, n1_lo, n1_hi,
+                                 &p0_lo, &p0_hi);
+            if (emit1)
+                store_pow2_64w_avx512(p0_lo, p0_hi, 1,
+                    out1 + (size_t)x / 4);
+            if (deepest == 1)
+                continue;
+
+            __m512i n2_lo, n2_hi, n3_lo, n3_hi;
+            __m512i p1_lo, p1_hi, q0_lo, q0_hi;
+            avg_rows_64w_avx512(
+                grp + (size_t)4 * (size_t)src_el_stride,
+                grp + (size_t)5 * (size_t)src_el_stride,
+                x, &n2_lo, &n2_hi);
+            if (emit0)
+                store_pow2_64w_avx512(n2_lo, n2_hi, 0,
+                    out0 + (size_t)2 * (size_t)ds0 + (size_t)x / 2);
+            avg_rows_64w_avx512(
+                grp + (size_t)6 * (size_t)src_el_stride,
+                grp + (size_t)7 * (size_t)src_el_stride,
+                x, &n3_lo, &n3_hi);
+            if (emit0)
+                store_pow2_64w_avx512(n3_lo, n3_hi, 0,
+                    out0 + (size_t)3 * (size_t)ds0 + (size_t)x / 2);
+            avg_nodes_64w_avx512(n2_lo, n2_hi, n3_lo, n3_hi,
+                                 &p1_lo, &p1_hi);
+            if (emit1)
+                store_pow2_64w_avx512(p1_lo, p1_hi, 1,
+                    out1 + (size_t)ds1 + (size_t)x / 4);
+            avg_nodes_64w_avx512(p0_lo, p0_hi, p1_lo, p1_hi,
+                                 &q0_lo, &q0_hi);
+            if (emit2)
+                store_pow2_64w_avx512(q0_lo, q0_hi, 2,
+                    out2 + (size_t)x / 8);
+            if (deepest == 2)
+                continue;
+
+            __m512i n4_lo, n4_hi, n5_lo, n5_hi;
+            __m512i n6_lo, n6_hi, n7_lo, n7_hi;
+            __m512i p2_lo, p2_hi, p3_lo, p3_hi;
+            __m512i q1_lo, q1_hi, root_lo, root_hi;
+            avg_rows_64w_avx512(
+                grp + (size_t)8 * (size_t)src_el_stride,
+                grp + (size_t)9 * (size_t)src_el_stride,
+                x, &n4_lo, &n4_hi);
+            if (emit0)
+                store_pow2_64w_avx512(n4_lo, n4_hi, 0,
+                    out0 + (size_t)4 * (size_t)ds0 + (size_t)x / 2);
+            avg_rows_64w_avx512(
+                grp + (size_t)10 * (size_t)src_el_stride,
+                grp + (size_t)11 * (size_t)src_el_stride,
+                x, &n5_lo, &n5_hi);
+            if (emit0)
+                store_pow2_64w_avx512(n5_lo, n5_hi, 0,
+                    out0 + (size_t)5 * (size_t)ds0 + (size_t)x / 2);
+            avg_nodes_64w_avx512(n4_lo, n4_hi, n5_lo, n5_hi,
+                                 &p2_lo, &p2_hi);
+            if (emit1)
+                store_pow2_64w_avx512(p2_lo, p2_hi, 1,
+                    out1 + (size_t)2 * (size_t)ds1 + (size_t)x / 4);
+
+            avg_rows_64w_avx512(
+                grp + (size_t)12 * (size_t)src_el_stride,
+                grp + (size_t)13 * (size_t)src_el_stride,
+                x, &n6_lo, &n6_hi);
+            if (emit0)
+                store_pow2_64w_avx512(n6_lo, n6_hi, 0,
+                    out0 + (size_t)6 * (size_t)ds0 + (size_t)x / 2);
+            avg_rows_64w_avx512(
+                grp + (size_t)14 * (size_t)src_el_stride,
+                grp + (size_t)15 * (size_t)src_el_stride,
+                x, &n7_lo, &n7_hi);
+            if (emit0)
+                store_pow2_64w_avx512(n7_lo, n7_hi, 0,
+                    out0 + (size_t)7 * (size_t)ds0 + (size_t)x / 2);
+            avg_nodes_64w_avx512(n6_lo, n6_hi, n7_lo, n7_hi,
+                                 &p3_lo, &p3_hi);
+            if (emit1)
+                store_pow2_64w_avx512(p3_lo, p3_hi, 1,
+                    out1 + (size_t)3 * (size_t)ds1 + (size_t)x / 4);
+            avg_nodes_64w_avx512(p2_lo, p2_hi, p3_lo, p3_hi,
+                                 &q1_lo, &q1_hi);
+            if (emit2)
+                store_pow2_64w_avx512(q1_lo, q1_hi, 2,
+                    out2 + (size_t)ds2 + (size_t)x / 8);
+            avg_nodes_64w_avx512(q0_lo, q0_hi, q1_lo, q1_hi,
+                                 &root_lo, &root_hi);
+            if (emit3)
+                store_pow2_64w_avx512(root_lo, root_hi, 3,
+                    out3 + (size_t)x / 16);
+        }
+    }
+}
+
 /* -----------------------------------------------------------------------
  * Thirds building blocks
  * ----------------------------------------------------------------------- */
@@ -324,6 +490,13 @@ static void __attribute__((hot)) scale_plane_pow2_hdr_avx512(
 
     int group_rows = (2 << deepest);
     int num_groups = src_h / group_rows;
+
+    if ((src_w & 63) == 0) {
+        scale_plane_pow2_tree_64w_avx512(
+            src, src_w, src_h, src_el_stride,
+            active_outputs, deepest, dst_planes, dst_strides);
+        return;
+    }
 
     fused_scratch_t scratch;
     fused_scratch_init(&scratch, scratch_pool_base, scratch_pool_size);

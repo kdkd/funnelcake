@@ -98,7 +98,14 @@ void fused_kernel_thirds_up_hdr_avx512(const fused_hdr_kernel_params_t *p,
         fused_kernel_thirds_hdr_avx512(p, src_y, src_u, src_v);
     }
     if (p->upscale_hdr_active != 0) {
-        fused_kernel_upscale_hdr_avx2(p, src_y, src_u, src_v);
+        if (p->active_outputs != 0 && p->is_p010 &&
+            p->p010_tmp_u && p->p010_tmp_v) {
+            fused_kernel_upscale_hdr_planar_avx2(
+                p, src_y, p->p010_tmp_u, p->p010_tmp_v,
+                p->p010_tmp_stride / (int)sizeof(uint16_t));
+        } else {
+            fused_kernel_upscale_hdr_avx2(p, src_y, src_u, src_v);
+        }
     }
 }
 
@@ -111,7 +118,14 @@ void fused_kernel_pow2_up_hdr_avx512(const fused_hdr_kernel_params_t *p,
         fused_kernel_pow2_hdr_avx512(p, src_y, src_u, src_v);
     }
     if (p->upscale_hdr_active != 0) {
-        fused_kernel_upscale_hdr_avx2(p, src_y, src_u, src_v);
+        if (p->active_outputs != 0 && p->is_p010 &&
+            p->p010_tmp_u && p->p010_tmp_v) {
+            fused_kernel_upscale_hdr_planar_avx2(
+                p, src_y, p->p010_tmp_u, p->p010_tmp_v,
+                p->p010_tmp_stride / (int)sizeof(uint16_t));
+        } else {
+            fused_kernel_upscale_hdr_avx2(p, src_y, src_u, src_v);
+        }
     }
 }
 

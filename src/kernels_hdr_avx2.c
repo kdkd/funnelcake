@@ -353,6 +353,167 @@ static inline uint16_t reduce_pow2_scalar_hdr(const uint16_t *src, int level)
     return values[0];
 }
 
+static inline __attribute__((always_inline)) void avg_rows_32w_avx2(
+    const uint16_t *restrict a, const uint16_t *restrict b, int x,
+    __m256i *lo, __m256i *hi)
+{
+    *lo = _mm256_avg_epu16(
+        _mm256_loadu_si256((const __m256i *)(a + x)),
+        _mm256_loadu_si256((const __m256i *)(b + x)));
+    *hi = _mm256_avg_epu16(
+        _mm256_loadu_si256((const __m256i *)(a + x + 16)),
+        _mm256_loadu_si256((const __m256i *)(b + x + 16)));
+}
+
+static inline __attribute__((always_inline)) void avg_nodes_32w_avx2(
+    __m256i a_lo, __m256i a_hi, __m256i b_lo, __m256i b_hi,
+    __m256i *lo, __m256i *hi)
+{
+    *lo = _mm256_avg_epu16(a_lo, b_lo);
+    *hi = _mm256_avg_epu16(a_hi, b_hi);
+}
+
+/* Scratch-free 32-element column tiles for regular HDR widths.  Small
+ * bottom-up subtrees preserve every rounded average while keeping the peak
+ * YMM live set below the AVX2 register budget. */
+static void __attribute__((hot)) scale_plane_pow2_tree_32w_avx2(
+    const uint16_t *restrict src,
+    int src_w, int src_h, int src_el_stride,
+    uint32_t active_outputs, int deepest,
+    uint16_t *restrict dst_planes[4], int dst_strides[4])
+{
+    const int group_rows = 2 << deepest;
+    const int num_groups = src_h / group_rows;
+    const int emit0 = (active_outputs & (1u << 1)) != 0;
+    const int emit1 = (active_outputs & (1u << 3)) != 0;
+    const int emit2 = (active_outputs & (1u << 5)) != 0;
+    const int emit3 = (active_outputs & (1u << 7)) != 0;
+    const int ds0 = dst_strides[0] / (int)sizeof(uint16_t);
+    const int ds1 = dst_strides[1] / (int)sizeof(uint16_t);
+    const int ds2 = dst_strides[2] / (int)sizeof(uint16_t);
+    const int ds3 = dst_strides[3] / (int)sizeof(uint16_t);
+
+    for (int g = 0; g < num_groups; g++) {
+        const uint16_t *grp = src
+            + (size_t)g * (size_t)group_rows * (size_t)src_el_stride;
+        uint16_t *out0 = emit0 ? dst_planes[0]
+            + (size_t)g * (size_t)(group_rows >> 1) * (size_t)ds0 : NULL;
+        uint16_t *out1 = emit1 ? dst_planes[1]
+            + (size_t)g * (size_t)(group_rows >> 2) * (size_t)ds1 : NULL;
+        uint16_t *out2 = emit2 ? dst_planes[2]
+            + (size_t)g * (size_t)(group_rows >> 3) * (size_t)ds2 : NULL;
+        uint16_t *out3 = emit3 ? dst_planes[3]
+            + (size_t)g * (size_t)(group_rows >> 4) * (size_t)ds3 : NULL;
+
+        for (int x = 0; x < src_w; x += 32) {
+            __m256i n0_lo, n0_hi, n1_lo, n1_hi;
+            __m256i p0_lo, p0_hi;
+
+            avg_rows_32w_avx2(grp,
+                grp + (size_t)src_el_stride, x, &n0_lo, &n0_hi);
+            if (emit0)
+                store_pow2_32_hdr(n0_lo, n0_hi, 0, out0 + (size_t)x / 2);
+            if (deepest == 0)
+                continue;
+
+            avg_rows_32w_avx2(
+                grp + (size_t)2 * (size_t)src_el_stride,
+                grp + (size_t)3 * (size_t)src_el_stride,
+                x, &n1_lo, &n1_hi);
+            if (emit0)
+                store_pow2_32_hdr(n1_lo, n1_hi, 0,
+                    out0 + (size_t)ds0 + (size_t)x / 2);
+            avg_nodes_32w_avx2(n0_lo, n0_hi, n1_lo, n1_hi,
+                               &p0_lo, &p0_hi);
+            if (emit1)
+                store_pow2_32_hdr(p0_lo, p0_hi, 1, out1 + (size_t)x / 4);
+            if (deepest == 1)
+                continue;
+
+            __m256i n2_lo, n2_hi, n3_lo, n3_hi;
+            __m256i p1_lo, p1_hi, q0_lo, q0_hi;
+            avg_rows_32w_avx2(
+                grp + (size_t)4 * (size_t)src_el_stride,
+                grp + (size_t)5 * (size_t)src_el_stride,
+                x, &n2_lo, &n2_hi);
+            if (emit0)
+                store_pow2_32_hdr(n2_lo, n2_hi, 0,
+                    out0 + (size_t)2 * (size_t)ds0 + (size_t)x / 2);
+            avg_rows_32w_avx2(
+                grp + (size_t)6 * (size_t)src_el_stride,
+                grp + (size_t)7 * (size_t)src_el_stride,
+                x, &n3_lo, &n3_hi);
+            if (emit0)
+                store_pow2_32_hdr(n3_lo, n3_hi, 0,
+                    out0 + (size_t)3 * (size_t)ds0 + (size_t)x / 2);
+            avg_nodes_32w_avx2(n2_lo, n2_hi, n3_lo, n3_hi,
+                               &p1_lo, &p1_hi);
+            if (emit1)
+                store_pow2_32_hdr(p1_lo, p1_hi, 1,
+                    out1 + (size_t)ds1 + (size_t)x / 4);
+            avg_nodes_32w_avx2(p0_lo, p0_hi, p1_lo, p1_hi,
+                               &q0_lo, &q0_hi);
+            if (emit2)
+                store_pow2_32_hdr(q0_lo, q0_hi, 2, out2 + (size_t)x / 8);
+            if (deepest == 2)
+                continue;
+
+            __m256i n4_lo, n4_hi, n5_lo, n5_hi;
+            __m256i n6_lo, n6_hi, n7_lo, n7_hi;
+            __m256i p2_lo, p2_hi, p3_lo, p3_hi;
+            __m256i q1_lo, q1_hi, root_lo, root_hi;
+            avg_rows_32w_avx2(
+                grp + (size_t)8 * (size_t)src_el_stride,
+                grp + (size_t)9 * (size_t)src_el_stride,
+                x, &n4_lo, &n4_hi);
+            if (emit0)
+                store_pow2_32_hdr(n4_lo, n4_hi, 0,
+                    out0 + (size_t)4 * (size_t)ds0 + (size_t)x / 2);
+            avg_rows_32w_avx2(
+                grp + (size_t)10 * (size_t)src_el_stride,
+                grp + (size_t)11 * (size_t)src_el_stride,
+                x, &n5_lo, &n5_hi);
+            if (emit0)
+                store_pow2_32_hdr(n5_lo, n5_hi, 0,
+                    out0 + (size_t)5 * (size_t)ds0 + (size_t)x / 2);
+            avg_nodes_32w_avx2(n4_lo, n4_hi, n5_lo, n5_hi,
+                               &p2_lo, &p2_hi);
+            if (emit1)
+                store_pow2_32_hdr(p2_lo, p2_hi, 1,
+                    out1 + (size_t)2 * (size_t)ds1 + (size_t)x / 4);
+
+            avg_rows_32w_avx2(
+                grp + (size_t)12 * (size_t)src_el_stride,
+                grp + (size_t)13 * (size_t)src_el_stride,
+                x, &n6_lo, &n6_hi);
+            if (emit0)
+                store_pow2_32_hdr(n6_lo, n6_hi, 0,
+                    out0 + (size_t)6 * (size_t)ds0 + (size_t)x / 2);
+            avg_rows_32w_avx2(
+                grp + (size_t)14 * (size_t)src_el_stride,
+                grp + (size_t)15 * (size_t)src_el_stride,
+                x, &n7_lo, &n7_hi);
+            if (emit0)
+                store_pow2_32_hdr(n7_lo, n7_hi, 0,
+                    out0 + (size_t)7 * (size_t)ds0 + (size_t)x / 2);
+            avg_nodes_32w_avx2(n6_lo, n6_hi, n7_lo, n7_hi,
+                               &p3_lo, &p3_hi);
+            if (emit1)
+                store_pow2_32_hdr(p3_lo, p3_hi, 1,
+                    out1 + (size_t)3 * (size_t)ds1 + (size_t)x / 4);
+            avg_nodes_32w_avx2(p2_lo, p2_hi, p3_lo, p3_hi,
+                               &q1_lo, &q1_hi);
+            if (emit2)
+                store_pow2_32_hdr(q1_lo, q1_hi, 2,
+                    out2 + (size_t)ds2 + (size_t)x / 8);
+            avg_nodes_32w_avx2(q0_lo, q0_hi, q1_lo, q1_hi,
+                               &root_lo, &root_hi);
+            if (emit3)
+                store_pow2_32_hdr(root_lo, root_hi, 3, out3 + (size_t)x / 16);
+        }
+    }
+}
+
 
 /* -----------------------------------------------------------------------
  * SSE shuffle tables for 10-bit 3-way deinterleave
@@ -655,6 +816,13 @@ static void __attribute__((hot)) scale_plane_pow2_hdr_avx2(
     int group_rows = (2 << deepest);
     int num_groups = src_h / group_rows;
 
+    if ((src_w & 31) == 0) {
+        scale_plane_pow2_tree_32w_avx2(
+            src, src_w, src_h, src_el_stride,
+            active_outputs, deepest, dst_planes, dst_strides);
+        return;
+    }
+
     /* Carve scratch buffers from the persistent pool (init-time alloc). */
     fused_scratch_t scratch;
     fused_scratch_init(&scratch, scratch_pool_base, scratch_pool_size);
@@ -809,7 +977,8 @@ static void __attribute__((hot)) scale_plane_pow2_hdr_avx2(
  * Horizontal: deinterleave_3x16_hdr + h_chunk_{1_5x,3x,6x}_hdr_avx2
  * ----------------------------------------------------------------------- */
 
-static void __attribute__((hot, aligned(64))) scale_plane_thirds_hdr_avx2(
+static inline __attribute__((always_inline)) void
+scale_plane_thirds_hdr_avx2_impl(
     const uint16_t *restrict src,
     int src_w, int src_h, int src_stride,
     uint32_t active_outputs,
@@ -818,7 +987,8 @@ static void __attribute__((hot, aligned(64))) scale_plane_thirds_hdr_avx2(
     int dst_strides[4],
     int dst_heights[4],
     uint8_t *scratch_pool_base,
-    size_t scratch_pool_size)
+    size_t scratch_pool_size,
+    int v6x_planar)
 {
     (void)dst_heights;
 
@@ -864,7 +1034,7 @@ static void __attribute__((hot, aligned(64))) scale_plane_thirds_hdr_avx2(
     int w_3x = src_w / 3;
     int w_6x = w_3x / 2;
     uint16_t *h_3x_buf = NULL, *h_6x_buf = NULL;
-    if (need_12x && (active_outputs & (1u << 6))) {
+    if (need_12x && (active_outputs & (1u << 6)) && !v6x_planar) {
         size_t buf_3x_bytes = (size_t)w_3x * sizeof(uint16_t);
         size_t buf_6x_bytes = (size_t)(w_6x > 0 ? w_6x : 1) * sizeof(uint16_t);
         h_3x_buf = (uint16_t *)fused_scratch_alloc(&scratch, buf_3x_bytes);
@@ -981,19 +1151,19 @@ static void __attribute__((hot, aligned(64))) scale_plane_thirds_hdr_avx2(
              * rows, so the else branch deinterleaves each reduced row directly,
              * which issues fewer shuffles.
              *
-             * 12x needs the raw interleaved ABCABC 6x row (its h_filter_3x_hdr
-             * reads v6x_cur linearly), so the raw 6x row is produced and stored
-             * here, independent of the branch below, while the raw pair averages
-             * are still live.  avg(avg(v01,v23),avg(v23,v45)) is the 6x reduction
-             * of the three pair averages. */
-            if (need_12x) {
+             * Ragged-width 12x needs the raw interleaved ABCABC 6x row for
+             * its scalar fallback.  Whole 48-element chunks instead store
+             * the already-computed A6/B6/C6 components below, matching the
+             * SDR kernel and avoiding both this duplicate average tree and
+             * a later deinterleave. */
+            if (need_12x && !v6x_planar) {
                 __m256i v6xa = avx2_avg_u16(avx2_avg_u16(v01a, v23a),
                                             avx2_avg_u16(v23a, v45a));
                 __m256i v6xb = avx2_avg_u16(avx2_avg_u16(v01b, v23b),
                                             avx2_avg_u16(v23b, v45b));
                 __m256i v6xc = avx2_avg_u16(avx2_avg_u16(v01c, v23c),
                                             avx2_avg_u16(v23c, v45c));
-                _mm256_storeu_si256((__m256i *)(v6x_cur + cx),      v6xa);
+                _mm256_storeu_si256((__m256i *)(v6x_cur + cx), v6xa);
                 _mm256_storeu_si256((__m256i *)(v6x_cur + cx + 16), v6xb);
                 _mm256_storeu_si256((__m256i *)(v6x_cur + cx + 32), v6xc);
             }
@@ -1074,14 +1244,25 @@ static void __attribute__((hot, aligned(64))) scale_plane_thirds_hdr_avx2(
                     }
                 }
 
-                /* 6x = halve(box3(avg(v3x0,v3x1))) in component space. */
-                if (need_6x && (active_outputs & (1u << 4))) {
+                /* 6x = halve(box3(avg(v3x0,v3x1))) in component space.
+                 * The same components are the planar 12x intermediate. */
+                if ((need_6x && (active_outputs & (1u << 4))) || v6x_planar) {
                     __m256i A6x = avx2_avg_u16(A3x0, A3x1);
                     __m256i B6x = avx2_avg_u16(B3x0, B3x1);
                     __m256i C6x = avx2_avg_u16(C3x0, C3x1);
-                    uint16_t __attribute__((aligned(32))) scratch_3x[16];
-                    __m256i r3x = h_chunk_3x_hdr_avx2(A6x, B6x, C6x, scratch_3x);
-                    h_chunk_6x_hdr_avx2(r3x, dst_6x_r0 + out_off_6x);
+                    if (need_6x && (active_outputs & (1u << 4))) {
+                        uint16_t __attribute__((aligned(32))) scratch_3x[16];
+                        __m256i r3x = h_chunk_3x_hdr_avx2(
+                            A6x, B6x, C6x, scratch_3x);
+                        h_chunk_6x_hdr_avx2(r3x, dst_6x_r0 + out_off_6x);
+                    }
+                    if (v6x_planar) {
+                        _mm256_storeu_si256((__m256i *)(v6x_cur + cx), A6x);
+                        _mm256_storeu_si256(
+                            (__m256i *)(v6x_cur + cx + 16), B6x);
+                        _mm256_storeu_si256(
+                            (__m256i *)(v6x_cur + cx + 32), C6x);
+                    }
                 }
             } else {
                 /* No 1.5x active: deinterleave each reduced row directly.  With
@@ -1110,15 +1291,25 @@ static void __attribute__((hot, aligned(64))) scale_plane_thirds_hdr_avx2(
                         h_chunk_3x_hdr_avx2(A, B, C, dst_3x_r1 + out_off_3x);
                     }
                 }
-                if (need_6x && (active_outputs & (1u << 4))) {
+                if ((need_6x && (active_outputs & (1u << 4))) || v6x_planar) {
                     __m256i v6xa = avx2_avg_u16(v3x0a, v3x1a);
                     __m256i v6xb = avx2_avg_u16(v3x0b, v3x1b);
                     __m256i v6xc = avx2_avg_u16(v3x0c, v3x1c);
                     __m256i A, B, C;
                     deinterleave_3x16_hdr(v6xa, v6xb, v6xc, &A, &B, &C);
-                    uint16_t __attribute__((aligned(32))) scratch_3x[16];
-                    __m256i r3x = h_chunk_3x_hdr_avx2(A, B, C, scratch_3x);
-                    h_chunk_6x_hdr_avx2(r3x, dst_6x_r0 + out_off_6x);
+                    if (need_6x && (active_outputs & (1u << 4))) {
+                        uint16_t __attribute__((aligned(32))) scratch_3x[16];
+                        __m256i r3x = h_chunk_3x_hdr_avx2(
+                            A, B, C, scratch_3x);
+                        h_chunk_6x_hdr_avx2(r3x, dst_6x_r0 + out_off_6x);
+                    }
+                    if (v6x_planar) {
+                        _mm256_storeu_si256((__m256i *)(v6x_cur + cx), A);
+                        _mm256_storeu_si256(
+                            (__m256i *)(v6x_cur + cx + 16), B);
+                        _mm256_storeu_si256(
+                            (__m256i *)(v6x_cur + cx + 32), C);
+                    }
                 }
             }
         } /* end chunk loop */
@@ -1243,31 +1434,19 @@ static void __attribute__((hot, aligned(64))) scale_plane_thirds_hdr_avx2(
                     uint16_t *restrict out12 = dst_planes[3]
                         + (size_t)out_row[3] * (size_t)ds_el;
 
-                    /* Fused register-resident 12:1 horizontal reduction when
-                     * src_w is a multiple of 48 samples (96 bytes = the
-                     * deinterleave chunk).  Per chunk: 48 source samples ->
-                     * deinterleave_3x16_hdr -> box3_div_hdr (16 3x samples) ->
-                     * avx2_halve_16_to_8_hdr (8 6x) -> halve_8_to_4_hdr (4 12x)
-                     * -> 64-bit store, with the 3x and 6x stages staying in
-                     * registers.  This is chunk-local: 48 = 3*16, 16 = 2*8,
-                     * 8 = 2*4, so every triplet and halving-pair boundary sits
-                     * inside the chunk and each 12x output is the exact 12:1
-                     * average, matching the buffered path in the else branch.
-                     * It writes exactly src_w/12 == dst_widths[3] samples
-                     * (src_w = 48m gives 4m), so nothing past the row edge is
-                     * touched.  Widths that are not a multiple of 48 take the
-                     * buffered path. */
-                    if (src_w % 48 == 0) {
+                    /* Whole chunks were stored component-planar while A6/B6/C6
+                     * were already live.  The between-group average preserves
+                     * that layout, so 12x can go straight through box3 and two
+                     * halves without reconstructing/deinterleaving a raw row. */
+                    if (v6x_planar) {
                         int fc12 = src_w / 48;
                         for (int c = 0; c < fc12; c++) {
                             const uint16_t *cs = v6x_prev + (size_t)c * 48;
-                            __m256i ra = _mm256_loadu_si256((const __m256i *)cs);
-                            __m256i rb = _mm256_loadu_si256(
+                            __m256i A = _mm256_loadu_si256((const __m256i *)cs);
+                            __m256i B = _mm256_loadu_si256(
                                 (const __m256i *)(cs + 16));
-                            __m256i rc = _mm256_loadu_si256(
+                            __m256i C = _mm256_loadu_si256(
                                 (const __m256i *)(cs + 32));
-                            __m256i A, B, C;
-                            deinterleave_3x16_hdr(ra, rb, rc, &A, &B, &C);
                             __m256i box = box3_div_hdr(A, B, C);
                             __m128i six = avx2_halve_16_to_8_hdr(box);
                             __m128i twl = halve_8_to_4_hdr(six);
@@ -1286,6 +1465,69 @@ static void __attribute__((hot, aligned(64))) scale_plane_thirds_hdr_avx2(
     } /* end g6 loop */
 
     /* Scratch buffers are carved from the persistent pool - nothing to free. */
+}
+
+
+/* Keep the two constant-propagated clones in separate functions so only the
+ * selected loop occupies the instruction cache. */
+static void __attribute__((hot, noinline, aligned(64)))
+scale_plane_thirds_hdr_avx2_planar(
+    const uint16_t *restrict src,
+    int src_w, int src_h, int src_stride,
+    uint32_t active_outputs,
+    uint16_t *restrict dst_planes[4],
+    int dst_widths[4],
+    int dst_strides[4],
+    int dst_heights[4],
+    uint8_t *scratch_pool_base,
+    size_t scratch_pool_size)
+{
+    scale_plane_thirds_hdr_avx2_impl(
+        src, src_w, src_h, src_stride, active_outputs,
+        dst_planes, dst_widths, dst_strides, dst_heights,
+        scratch_pool_base, scratch_pool_size, 1);
+}
+
+static void __attribute__((hot, noinline, aligned(64)))
+scale_plane_thirds_hdr_avx2_fallback(
+    const uint16_t *restrict src,
+    int src_w, int src_h, int src_stride,
+    uint32_t active_outputs,
+    uint16_t *restrict dst_planes[4],
+    int dst_widths[4],
+    int dst_strides[4],
+    int dst_heights[4],
+    uint8_t *scratch_pool_base,
+    size_t scratch_pool_size)
+{
+    scale_plane_thirds_hdr_avx2_impl(
+        src, src_w, src_h, src_stride, active_outputs,
+        dst_planes, dst_widths, dst_strides, dst_heights,
+        scratch_pool_base, scratch_pool_size, 0);
+}
+
+static inline __attribute__((always_inline)) void scale_plane_thirds_hdr_avx2(
+    const uint16_t *restrict src,
+    int src_w, int src_h, int src_stride,
+    uint32_t active_outputs,
+    uint16_t *restrict dst_planes[4],
+    int dst_widths[4],
+    int dst_strides[4],
+    int dst_heights[4],
+    uint8_t *scratch_pool_base,
+    size_t scratch_pool_size)
+{
+    if ((active_outputs & (1u << 6)) && src_w % 48 == 0) {
+        scale_plane_thirds_hdr_avx2_planar(
+            src, src_w, src_h, src_stride, active_outputs,
+            dst_planes, dst_widths, dst_strides, dst_heights,
+            scratch_pool_base, scratch_pool_size);
+    } else {
+        scale_plane_thirds_hdr_avx2_fallback(
+            src, src_w, src_h, src_stride, active_outputs,
+            dst_planes, dst_widths, dst_strides, dst_heights,
+            scratch_pool_base, scratch_pool_size);
+    }
 }
 
 

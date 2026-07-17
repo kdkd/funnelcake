@@ -680,6 +680,15 @@ void fused_kernel_upscale_hdr_avx2(const fused_hdr_kernel_params_t *p,
                                    const uint16_t *src_u,
                                    const uint16_t *src_v);
 
+/* Planar-input implementation shared by the combined AVX2/AVX-512 entry
+ * points after their downscale stage has already deinterleaved P010. */
+void fused_kernel_upscale_hdr_planar_avx2(
+    const fused_hdr_kernel_params_t *p,
+    const uint16_t *src_y,
+    const uint16_t *src_u,
+    const uint16_t *src_v,
+    int src_uv_el_stride);
+
 void fused_kernel_thirds_up_hdr_avx2(const fused_hdr_kernel_params_t *p,
                                      const uint16_t *src_y,
                                      const uint16_t *src_u,

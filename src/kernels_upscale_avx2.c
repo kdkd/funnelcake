@@ -1432,6 +1432,22 @@ static void upscale_plane_hdr_avx2(const fused_hdr_kernel_params_t *p,
     }
 }
 
+void fused_kernel_upscale_hdr_planar_avx2(
+    const fused_hdr_kernel_params_t *p,
+    const uint16_t *src_y,
+    const uint16_t *src_u,
+    const uint16_t *src_v,
+    int src_uv_el_stride)
+{
+    upscale_plane_hdr_avx2(p, src_y, p->src_width, p->src_height,
+                           p->src_y_el_stride, 0);
+    upscale_plane_hdr_avx2(p, src_u, p->src_width / 2, p->src_height / 2,
+                           src_uv_el_stride, 1);
+    upscale_plane_hdr_avx2(p, src_v, p->src_width / 2, p->src_height / 2,
+                           src_uv_el_stride, 2);
+    _mm256_zeroupper();
+}
+
 void fused_kernel_upscale_hdr_avx2(const fused_hdr_kernel_params_t *p,
                                    const uint16_t *src_y,
                                    const uint16_t *src_u,
@@ -1448,13 +1464,8 @@ void fused_kernel_upscale_hdr_avx2(const fused_hdr_kernel_params_t *p,
         up_src_uv_el_stride = p->p010_tmp_stride / (int)sizeof(uint16_t);
     }
 
-    upscale_plane_hdr_avx2(p, src_y, p->src_width, p->src_height,
-                           p->src_y_el_stride, 0);
-    upscale_plane_hdr_avx2(p, up_src_u, p->src_width / 2, p->src_height / 2,
-                           up_src_uv_el_stride, 1);
-    upscale_plane_hdr_avx2(p, up_src_v, p->src_width / 2, p->src_height / 2,
-                           up_src_uv_el_stride, 2);
-    _mm256_zeroupper();
+    fused_kernel_upscale_hdr_planar_avx2(
+        p, src_y, up_src_u, up_src_v, up_src_uv_el_stride);
 }
 
 void fused_kernel_thirds_up_hdr_avx2(const fused_hdr_kernel_params_t *p,
@@ -1466,7 +1477,14 @@ void fused_kernel_thirds_up_hdr_avx2(const fused_hdr_kernel_params_t *p,
         fused_kernel_thirds_hdr_avx2(p, src_y, src_u, src_v);
     }
     if (p->upscale_hdr_active != 0) {
-        fused_kernel_upscale_hdr_avx2(p, src_y, src_u, src_v);
+        if (p->active_outputs != 0 && p->is_p010 &&
+            p->p010_tmp_u && p->p010_tmp_v) {
+            fused_kernel_upscale_hdr_planar_avx2(
+                p, src_y, p->p010_tmp_u, p->p010_tmp_v,
+                p->p010_tmp_stride / (int)sizeof(uint16_t));
+        } else {
+            fused_kernel_upscale_hdr_avx2(p, src_y, src_u, src_v);
+        }
     }
 }
 
@@ -1479,7 +1497,14 @@ void fused_kernel_pow2_up_hdr_avx2(const fused_hdr_kernel_params_t *p,
         fused_kernel_pow2_hdr_avx2(p, src_y, src_u, src_v);
     }
     if (p->upscale_hdr_active != 0) {
-        fused_kernel_upscale_hdr_avx2(p, src_y, src_u, src_v);
+        if (p->active_outputs != 0 && p->is_p010 &&
+            p->p010_tmp_u && p->p010_tmp_v) {
+            fused_kernel_upscale_hdr_planar_avx2(
+                p, src_y, p->p010_tmp_u, p->p010_tmp_v,
+                p->p010_tmp_stride / (int)sizeof(uint16_t));
+        } else {
+            fused_kernel_upscale_hdr_avx2(p, src_y, src_u, src_v);
+        }
     }
 }
 

@@ -81,6 +81,21 @@ static const ALIGN64 uint8_t idx_even_b[64] = {
      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
 };
 
+/* vpermt2b indices that interleave R and B into adjacent byte pairs for
+ * vpmaddubsw: [r0,b0,r1,b1,...].  Values 0..63 select R and 64..127 B. */
+static const ALIGN64 uint8_t idx_rb_lo[64] = {
+     0, 64,  1, 65,  2, 66,  3, 67,  4, 68,  5, 69,  6, 70,  7, 71,
+     8, 72,  9, 73, 10, 74, 11, 75, 12, 76, 13, 77, 14, 78, 15, 79,
+    16, 80, 17, 81, 18, 82, 19, 83, 20, 84, 21, 85, 22, 86, 23, 87,
+    24, 88, 25, 89, 26, 90, 27, 91, 28, 92, 29, 93, 30, 94, 31, 95
+};
+static const ALIGN64 uint8_t idx_rb_hi[64] = {
+    32, 96, 33, 97, 34, 98, 35, 99, 36,100, 37,101, 38,102, 39,103,
+    40,104, 41,105, 42,106, 43,107, 44,108, 45,109, 46,110, 47,111,
+    48,112, 49,113, 50,114, 51,115, 52,116, 53,117, 54,118, 55,119,
+    56,120, 57,121, 58,122, 59,123, 60,124, 61,125, 62,126, 63,127
+};
+
 /* vpermt2w: split 64 interleaved UVUV... words into 32 U and 32 V. */
 static const ALIGN64 uint16_t idx_even_w[32] = {
      0, 2, 4, 6, 8,10,12,14,16,18,20,22,24,26,28,30,
@@ -192,30 +207,35 @@ tm_row_avx512(const uint16_t *sy, uint8_t *dy,
     __m512i gb = tm_lut_1024(t, ig_lo, ig_hi);
     __m512i bb = tm_lut_1024(t, ib_lo, ib_hi);
 
-    /* Y_out = (67r + 174g + 15b + 128) >> 8 in modular 16-bit (max value
-     * 65408 < 65536; every product fits 16 bits unsigned). */
-    __m512i r16_lo = _mm512_cvtepu8_epi16(_mm512_castsi512_si256(rb));
-    __m512i r16_hi = _mm512_cvtepu8_epi16(_mm512_extracti64x4_epi64(rb, 1));
+    /* Y_out = (67r + 174g + 15b + 128) >> 8.  Interleave R/B with VBMI and
+     * let vpmaddubsw form 67r+15b directly; the pair sum is at most 20910,
+     * so signed saturation is impossible.  This replaces four widens and
+     * four separate r/b multiply operations with two permutes and two dots. */
+    const __m512i rb_coeff = _mm512_set1_epi16((15 << 8) | 67);
+    __m512i rb16_lo = _mm512_maddubs_epi16(
+        _mm512_permutex2var_epi8(
+            rb, _mm512_load_si512((const void *)idx_rb_lo), bb),
+        rb_coeff);
+    __m512i rb16_hi = _mm512_maddubs_epi16(
+        _mm512_permutex2var_epi8(
+            rb, _mm512_load_si512((const void *)idx_rb_hi), bb),
+        rb_coeff);
     __m512i g16_lo = _mm512_cvtepu8_epi16(_mm512_castsi512_si256(gb));
     __m512i g16_hi = _mm512_cvtepu8_epi16(_mm512_extracti64x4_epi64(gb, 1));
-    __m512i b16_lo = _mm512_cvtepu8_epi16(_mm512_castsi512_si256(bb));
-    __m512i b16_hi = _mm512_cvtepu8_epi16(_mm512_extracti64x4_epi64(bb, 1));
 
-    __m512i c67  = _mm512_set1_epi16(67);
     __m512i c174 = _mm512_set1_epi16(174);
-    __m512i c15  = _mm512_set1_epi16(15);
     __m512i c128 = _mm512_set1_epi16(128);
 
     __m512i ys_lo = _mm512_srli_epi16(
         _mm512_add_epi16(
-            _mm512_add_epi16(_mm512_mullo_epi16(r16_lo, c67),
+            _mm512_add_epi16(rb16_lo,
                              _mm512_mullo_epi16(g16_lo, c174)),
-            _mm512_add_epi16(_mm512_mullo_epi16(b16_lo, c15), c128)), 8);
+            c128), 8);
     __m512i ys_hi = _mm512_srli_epi16(
         _mm512_add_epi16(
-            _mm512_add_epi16(_mm512_mullo_epi16(r16_hi, c67),
+            _mm512_add_epi16(rb16_hi,
                              _mm512_mullo_epi16(g16_hi, c174)),
-            _mm512_add_epi16(_mm512_mullo_epi16(b16_hi, c15), c128)), 8);
+            c128), 8);
 
     __m512i yb = _mm512_inserti64x4(
         _mm512_castsi256_si512(_mm512_cvtepi16_epi8(ys_lo)),

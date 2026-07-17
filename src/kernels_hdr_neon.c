@@ -458,6 +458,19 @@ static inline uint16x4_t h_chunk_6x_hdr(uint16x8_t result_3x,
     return result;
 }
 
+/* Horizontal 12x cascaded from a 3x result (8 elements -> 2 elements).
+ * Two rounded pairwise halvings (3x -> 6x -> 12x), stores 2 uint16_t at dst.
+ * The u16 analog of the SDR kernel's pow2_store_h2. */
+static inline void h_chunk_12x_hdr(uint16x8_t result_3x, uint16_t *restrict dst)
+{
+    uint32x4_t s6  = vpaddlq_u16(result_3x);   /* 8 -> 4 pair sums */
+    uint16x4_t v6  = vrshrn_n_u32(s6, 1);      /* 6x: (sum + 1) >> 1 */
+    uint32x2_t s12 = vpaddl_u16(v6);           /* 4 -> 2 pair sums */
+    uint16x4_t v12 = vrshrn_n_u32(vcombine_u32(s12, s12), 1);  /* 12x */
+    vst1_lane_u16(dst,     v12, 0);
+    vst1_lane_u16(dst + 1, v12, 1);
+}
+
 static void __attribute__((hot)) scale_plane_thirds_hdr_neon(
     const uint16_t *restrict src,
     int src_w, int src_h, int src_stride,
@@ -498,7 +511,10 @@ static void __attribute__((hot)) scale_plane_thirds_hdr_neon(
     fused_scratch_init(&scratch, scratch_pool_base, scratch_pool_size);
 
     /* For 12x: two buffers to hold 6x vertical intermediates across
-     * consecutive 6-row groups.  Ping-pong swap avoids copying. */
+     * consecutive 6-row groups.  Ping-pong swap avoids copying.
+     * On odd groups the chunk loop consumes v6x_prev directly in registers -
+     * no store of the odd group's 6x intermediate and no separate
+     * averaging/horizontal passes over scratch rows. */
     uint16_t *v6x_buf_a = NULL, *v6x_buf_b = NULL;
     uint16_t *v6x_cur = NULL, *v6x_prev = NULL;
     if (need_12x) {
@@ -509,17 +525,9 @@ static void __attribute__((hot)) scale_plane_thirds_hdr_neon(
         v6x_prev = v6x_buf_b;
     }
 
-    /* Horizontal scratch for 12x (3x -> halve -> halve) */
+    /* 12x tail width (3x -> halve -> halve) for the columns outside the
+     * 24-wide NEON chunks. */
     int w_3x = src_w / 3;
-    int w_6x = w_3x / 2;
-    uint16_t *h_3x_buf = NULL, *h_6x_buf = NULL;
-    if (need_12x && (active_outputs & (1u << 6))) {
-        h_3x_buf = (uint16_t *)fused_scratch_alloc(
-            &scratch, (size_t)w_3x * sizeof(uint16_t));
-        h_6x_buf = (uint16_t *)fused_scratch_alloc(
-            &scratch, (size_t)(w_6x > 0 ? w_6x : 1) * sizeof(uint16_t));
-        if (!h_3x_buf || !h_6x_buf) return;
-    }
 
     /* Chunk geometry: 48 bytes = 24 uint16_t = 8 triplets per chunk.
      * Each chunk of 24 elements covers 3 Q registers (3 x 8 elements). */
@@ -577,6 +585,14 @@ static void __attribute__((hot)) scale_plane_thirds_hdr_neon(
             dst_6x_r0 = dst_planes[2] + (size_t)out_row[2] * (size_t)ds_el;
         }
 
+        /* 12x output row, needed on odd groups where the chunk loop emits
+         * the fused 12x output directly from registers. */
+        uint16_t *dst_12x_r0 = NULL;
+        if (need_12x && (g6 & 1)) {
+            int ds_el = dst_strides[3] / (int)sizeof(uint16_t);
+            dst_12x_r0 = dst_planes[3] + (size_t)out_row[3] * (size_t)ds_el;
+        }
+
         /* ============================================================
          * MAIN CHUNK LOOP: process 24 source elements (8 triplets) at
          * a time.  Each chunk is 3 Q registers of uint16x8_t.
@@ -585,11 +601,6 @@ static void __attribute__((hot)) scale_plane_thirds_hdr_neon(
          * filtering is applied immediately per chunk.  A 6-source-row
          * group produces 4 output rows at 1.5x, 2 at 3x, and 1 at 6x.
          * ============================================================ */
-#if defined(__clang__)
-        #pragma clang loop unroll_count(2)
-#elif defined(__GNUC__)
-        #pragma GCC unroll 2
-#endif
         for (int ci = 0; ci < full_chunks; ci++) {
             int cx = ci * 24;           /* element offset into source row */
             int out_off_1_5x = ci * 16; /* 24 -> 16 output elements */
@@ -680,11 +691,28 @@ static void __attribute__((hot)) scale_plane_thirds_hdr_neon(
                 uint16x8_t v6xb = vrhaddq_u16(v3x0b, v3x1b);
                 uint16x8_t v6xc = vrhaddq_u16(v3x0c, v3x1c);
 
-                /* Save 6x vertical intermediate for 12x pairing */
+                /* 12x pairing.  On even groups: save the 6x vertical
+                 * intermediate; it becomes v6x_prev for the next group.
+                 * On odd groups: average with v6x_prev in registers and emit
+                 * the 12x output immediately (3x box filter followed by two
+                 * in-register rounded halvings), avoiding both the odd group's
+                 * intermediate store and the separate averaging + horizontal
+                 * scratch passes. */
                 if (need_12x) {
-                    vst1q_u16(v6x_cur + cx,      v6xa);
-                    vst1q_u16(v6x_cur + cx + 8,  v6xb);
-                    vst1q_u16(v6x_cur + cx + 16, v6xc);
+                    if ((g6 & 1) == 0) {
+                        vst1q_u16(v6x_cur + cx,      v6xa);
+                        vst1q_u16(v6x_cur + cx + 8,  v6xb);
+                        vst1q_u16(v6x_cur + cx + 16, v6xc);
+                    } else {
+                        uint16x8_t p6a = vld1q_u16(v6x_prev + cx);
+                        uint16x8_t p6b = vld1q_u16(v6x_prev + cx + 8);
+                        uint16x8_t p6c = vld1q_u16(v6x_prev + cx + 16);
+                        uint16x8_t r3x = h_chunk_3x_hdr_reg(
+                            vrhaddq_u16(p6a, v6xa),
+                            vrhaddq_u16(p6b, v6xb),
+                            vrhaddq_u16(p6c, v6xc));
+                        h_chunk_12x_hdr(r3x, dst_12x_r0 + ci * 2);
+                    }
                 }
 
                 if (active_outputs & (1u << 4)) {
@@ -796,41 +824,23 @@ static void __attribute__((hot)) scale_plane_thirds_hdr_neon(
                 v6x_prev = v6x_cur;
                 v6x_cur  = tmp;
             } else {
-                /* Average v6x_prev (even group) with v6x_cur (odd group) */
-                int neon8 = src_w / 8;
-                int x = 0;
-                for (int c = 0; c < neon8; c++, x += 8) {
-                    uint16x8_t a = vld1q_u16(v6x_prev + x);
-                    uint16x8_t b = vld1q_u16(v6x_cur + x);
-                    vst1q_u16(v6x_prev + x, vrhaddq_u16(a, b));
-                }
-                for (; x < src_w; x++) {
-                    v6x_prev[x] = avg_u16(v6x_prev[x], v6x_cur[x]);
-                }
+                if (tail_cols > 0) {
+                    /* Average the two groups' 6x intermediates over the tail
+                     * columns only (full chunks were fused in the chunk loop),
+                     * then 3x -> halve -> halve. */
+                    for (int x = tail_start; x < src_w; x++)
+                        v6x_prev[x] = avg_u16(v6x_prev[x], v6x_cur[x]);
 
-                if (active_outputs & (1u << 6)) {
-                    int dw = dst_widths[3];
-                    int ds_el = dst_strides[3] / (int)sizeof(uint16_t);
-
-                    /* Full chunks remain deinterleaved in v6x_prev.  Convert
-                     * those directly; only the scalar tail is in row order. */
-                    for (int ci = 0; ci < full_chunks; ci++) {
-                        int cx = ci * 24;
-                        uint16x8_t A = vld1q_u16(v6x_prev + cx);
-                        uint16x8_t B = vld1q_u16(v6x_prev + cx + 8);
-                        uint16x8_t C = vld1q_u16(v6x_prev + cx + 16);
-                        h_chunk_3x_hdr(A, B, C, h_3x_buf + ci * 8);
-                    }
-                    if (tail_cols > 0) {
-                        int tail_w3 = w_3x - full_chunks * 8;
-                        h_filter_3x_hdr(v6x_prev + tail_start, tail_cols,
-                                        h_3x_buf + full_chunks * 8, tail_w3);
-                    }
-                    h_filter_halve_hdr(h_3x_buf, h_6x_buf, w_6x);
-                    h_filter_halve_hdr(h_6x_buf,
-                                        dst_planes[3] + (size_t)out_row[3] * (size_t)ds_el, dw);
-                    out_row[3]++;
+                    int tail_w3 = w_3x - full_chunks * 8;
+                    uint16_t h3_tail[8];
+                    uint16_t h6_tail[4];
+                    h_filter_3x_hdr(v6x_prev + tail_start, tail_cols,
+                                    h3_tail, tail_w3);
+                    h_filter_halve_hdr(h3_tail, h6_tail, tail_w3 / 2);
+                    h_filter_halve_hdr(h6_tail, dst_12x_r0 + full_chunks * 2,
+                                       dst_widths[3] - full_chunks * 2);
                 }
+                out_row[3]++;
             }
         }
     } /* end g6 loop */

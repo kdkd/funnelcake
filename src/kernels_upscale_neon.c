@@ -153,19 +153,18 @@ static inline void up_vblend_21_row_neon(const uint8_t *a_row,
     int x = 0;
     const uint8x8_t w85_8  = vdup_n_u8(85);
     const uint8x8_t w171_8 = vdup_n_u8(171);
-    const uint16x8_t r128  = vdupq_n_u16(128);
 
     for (; x + 16 <= w; x += 16) {
         uint8x16_t av = vld1q_u8(a_row + x);
         uint8x16_t bv = vld1q_u8(b_row + x);
+        /* vrshrn folds the +128 rounding into the narrowing shift, so no
+         * separate vaddq against a constant is needed. */
         uint16x8_t lo = vmull_u8(vget_low_u8(av),  w85_8);
         lo = vmlal_u8(lo, vget_low_u8(bv),  w171_8);
-        lo = vaddq_u16(lo, r128);
         uint16x8_t hi = vmull_u8(vget_high_u8(av), w85_8);
         hi = vmlal_u8(hi, vget_high_u8(bv), w171_8);
-        hi = vaddq_u16(hi, r128);
-        uint8x8_t  lo_u8 = vshrn_n_u16(lo, 8);
-        uint8x8_t  hi_u8 = vshrn_n_u16(hi, 8);
+        uint8x8_t  lo_u8 = vrshrn_n_u16(lo, 8);
+        uint8x8_t  hi_u8 = vrshrn_n_u16(hi, 8);
         vst1q_u8(out + x, vcombine_u8(lo_u8, hi_u8));
     }
     for (; x < w; x++) {
@@ -198,7 +197,6 @@ static void up_h_1_5x_row_neon(const uint8_t *src, int w, uint8_t *dst)
 
     const uint8x8_t  w85_8  = vdup_n_u8(85);
     const uint8x8_t  w171_8 = vdup_n_u8(171);
-    const uint16x8_t r128   = vdupq_n_u16(128);
 
     for (int c = 0; c < full_chunks; c++) {
         uint8x16x2_t ab = vld2q_u8(src + 2 * p);
@@ -211,25 +209,21 @@ static void up_h_1_5x_row_neon(const uint8_t *src, int w, uint8_t *dst)
         uint8_t next_a = (next_idx < w) ? src[next_idx] : src[w - 1];
         uint8x16_t c_vec = vextq_u8(a, vdupq_n_u8(next_a), 1);
 
-        /* m1 = (a*85 + b*171 + 128) >> 8 */
-        uint16x8_t m1_lo = vmull_u8(vget_low_u8(a),  w85_8);
-        m1_lo = vmlal_u8(m1_lo, vget_low_u8(b),  w171_8);
-        m1_lo = vaddq_u16(m1_lo, r128);
-        uint16x8_t m1_hi = vmull_u8(vget_high_u8(a), w85_8);
-        m1_hi = vmlal_u8(m1_hi, vget_high_u8(b), w171_8);
-        m1_hi = vaddq_u16(m1_hi, r128);
-        uint8x16_t m1 = vcombine_u8(vshrn_n_u16(m1_lo, 8),
-                                    vshrn_n_u16(m1_hi, 8));
+        /* Both midpoints share b*171; vrshrn folds the +128 rounding into
+         * the narrowing shift.  m1 = (a*85 + b*171 + 128) >> 8,
+         * m2 = (c*85 + b*171 + 128) >> 8. */
+        uint16x8_t base_lo = vmull_u8(vget_low_u8(b),  w171_8);
+        uint16x8_t base_hi = vmull_u8(vget_high_u8(b), w171_8);
 
-        /* m2 = (c*85 + b*171 + 128) >> 8 */
-        uint16x8_t m2_lo = vmull_u8(vget_low_u8(c_vec),  w85_8);
-        m2_lo = vmlal_u8(m2_lo, vget_low_u8(b),  w171_8);
-        m2_lo = vaddq_u16(m2_lo, r128);
-        uint16x8_t m2_hi = vmull_u8(vget_high_u8(c_vec), w85_8);
-        m2_hi = vmlal_u8(m2_hi, vget_high_u8(b), w171_8);
-        m2_hi = vaddq_u16(m2_hi, r128);
-        uint8x16_t m2 = vcombine_u8(vshrn_n_u16(m2_lo, 8),
-                                    vshrn_n_u16(m2_hi, 8));
+        uint16x8_t m1_lo = vmlal_u8(base_lo, vget_low_u8(a),     w85_8);
+        uint16x8_t m1_hi = vmlal_u8(base_hi, vget_high_u8(a),    w85_8);
+        uint8x16_t m1 = vcombine_u8(vrshrn_n_u16(m1_lo, 8),
+                                    vrshrn_n_u16(m1_hi, 8));
+
+        uint16x8_t m2_lo = vmlal_u8(base_lo, vget_low_u8(c_vec),  w85_8);
+        uint16x8_t m2_hi = vmlal_u8(base_hi, vget_high_u8(c_vec), w85_8);
+        uint8x16_t m2 = vcombine_u8(vrshrn_n_u16(m2_lo, 8),
+                                    vrshrn_n_u16(m2_hi, 8));
 
         /* Store a, m1, m2 interleaved as 48 consecutive bytes. */
         uint8x16x3_t triple = { { a, m1, m2 } };

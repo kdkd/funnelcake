@@ -119,19 +119,20 @@ static void h_filter_1_5x(const uint8_t *restrict src, int src_w,
         uint8x16_t B = loaded.val[1];  /* second of each triple */
         uint8x16_t C = loaded.val[2];  /* third of each triple */
 
+        /* Both outputs contain B*85.  Keep that product live and accumulate
+         * the independently weighted A/C terms into copies. */
+        uint16x8_t base_lo = vmull_u8(vget_low_u8(B), w85);
+        uint16x8_t base_hi = vmull_u8(vget_high_u8(B), w85);
+
         /* Output 0: pixel at 1/3 position, weighted toward A */
-        uint16x8_t t0_lo = vmull_u8(vget_low_u8(A), w171);
-        t0_lo = vmlal_u8(t0_lo, vget_low_u8(B), w85);
-        uint16x8_t t0_hi = vmull_u8(vget_high_u8(A), w171);
-        t0_hi = vmlal_u8(t0_hi, vget_high_u8(B), w85);
+        uint16x8_t t0_lo = vmlal_u8(base_lo, vget_low_u8(A), w171);
+        uint16x8_t t0_hi = vmlal_u8(base_hi, vget_high_u8(A), w171);
         uint8x16_t out0 = vcombine_u8(vrshrn_n_u16(t0_lo, 8),
                                        vrshrn_n_u16(t0_hi, 8));
 
         /* Output 1: pixel at 2/3 position, weighted toward C */
-        uint16x8_t t1_lo = vmull_u8(vget_low_u8(C), w171);
-        t1_lo = vmlal_u8(t1_lo, vget_low_u8(B), w85);
-        uint16x8_t t1_hi = vmull_u8(vget_high_u8(C), w171);
-        t1_hi = vmlal_u8(t1_hi, vget_high_u8(B), w85);
+        uint16x8_t t1_lo = vmlal_u8(base_lo, vget_low_u8(C), w171);
+        uint16x8_t t1_hi = vmlal_u8(base_hi, vget_high_u8(C), w171);
         uint8x16_t out1 = vcombine_u8(vrshrn_n_u16(t1_lo, 8),
                                        vrshrn_n_u16(t1_hi, 8));
 
@@ -631,16 +632,18 @@ static void __attribute__((hot)) scale_plane_pow2_neon(
  * vertically reduced in registers.
  * ----------------------------------------------------------------------- */
 
-/* NEON divide-by-3 for a uint16x8 of sums (each max 765).
- * Returns uint8x8_t: (sum * 0x5556) >> 16, narrowed to u8. */
+/* NEON divide-by-3 for a uint16x8 of sums (each max 765), narrowed to u8.
+ * Mirrors the HDR kernel's neon_div3_u16x8_hdr: SQDMULH doubles, so it
+ * computes floor(sum * 21846 / 65536) = floor(sum * 10923 / 32768).  10923 is
+ * ceil(32768 / 3), and its positive error stays below 0.032 over [0, 765], so
+ * the product never crosses the next integer for any residue modulo three.
+ * Verified exhaustively against floor(sum / 3) over the whole range.  The
+ * result is in [0, 255], so the saturating narrow is exact.  This avoids
+ * widening each half to u32 solely to take the high product. */
 static inline uint8x8_t neon_div3_u16x8(uint16x8_t sum)
 {
-    uint16x8_t magic = vdupq_n_u16(0x5556);
-    uint32x4_t p0 = vmull_u16(vget_low_u16(sum),  vget_low_u16(magic));
-    uint32x4_t p1 = vmull_u16(vget_high_u16(sum), vget_high_u16(magic));
-    uint16x4_t d0 = vshrn_n_u32(p0, 16);
-    uint16x4_t d1 = vshrn_n_u32(p1, 16);
-    return vmovn_u16(vcombine_u16(d0, d1));
+    int16x8_t q = vqdmulhq_n_s16(vreinterpretq_s16_u16(sum), 10923);
+    return vqmovun_s16(q);
 }
 
 /* Horizontal 1.5x on one deinterleaved chunk (A, B, C each 16 bytes).
@@ -649,19 +652,20 @@ static inline void h_chunk_1_5x(uint8x16_t A, uint8x16_t B, uint8x16_t C,
                                  uint8_t *restrict dst,
                                  uint8x8_t w171, uint8x8_t w85)
 {
+    /* Both outputs contain B*85.  Keep that product live and accumulate the
+     * independently weighted A/C terms into copies. */
+    uint16x8_t base_lo = vmull_u8(vget_low_u8(B), w85);
+    uint16x8_t base_hi = vmull_u8(vget_high_u8(B), w85);
+
     /* out0 = (A*171 + B*85 + 128) >> 8 */
-    uint16x8_t t0_lo = vmull_u8(vget_low_u8(A), w171);
-    t0_lo = vmlal_u8(t0_lo, vget_low_u8(B), w85);
-    uint16x8_t t0_hi = vmull_u8(vget_high_u8(A), w171);
-    t0_hi = vmlal_u8(t0_hi, vget_high_u8(B), w85);
+    uint16x8_t t0_lo = vmlal_u8(base_lo, vget_low_u8(A), w171);
+    uint16x8_t t0_hi = vmlal_u8(base_hi, vget_high_u8(A), w171);
     uint8x16_t out0 = vcombine_u8(vrshrn_n_u16(t0_lo, 8),
                                    vrshrn_n_u16(t0_hi, 8));
 
     /* out1 = (C*171 + B*85 + 128) >> 8 */
-    uint16x8_t t1_lo = vmull_u8(vget_low_u8(C), w171);
-    t1_lo = vmlal_u8(t1_lo, vget_low_u8(B), w85);
-    uint16x8_t t1_hi = vmull_u8(vget_high_u8(C), w171);
-    t1_hi = vmlal_u8(t1_hi, vget_high_u8(B), w85);
+    uint16x8_t t1_lo = vmlal_u8(base_lo, vget_low_u8(C), w171);
+    uint16x8_t t1_hi = vmlal_u8(base_hi, vget_high_u8(C), w171);
     uint8x16_t out1 = vcombine_u8(vrshrn_n_u16(t1_lo, 8),
                                    vrshrn_n_u16(t1_hi, 8));
 
@@ -765,7 +769,10 @@ static void __attribute__((hot)) scale_plane_thirds_neon(
 
     /* For 12x: two buffers to hold 6x vertical intermediates across
      * consecutive 6-row groups. On even groups we write to v6x_cur,
-     * then swap pointers so the odd group can read the previous. */
+     * then swap pointers so the odd group can read the previous.
+     * On odd groups the chunk loop consumes v6x_prev directly in
+     * registers - no store of the odd group's 6x intermediate and no
+     * separate averaging/horizontal passes over scratch rows. */
     uint8_t *v6x_buf_a = NULL, *v6x_buf_b = NULL;
     uint8_t *v6x_cur = NULL, *v6x_prev = NULL;
     if (need_12x) {
@@ -776,16 +783,9 @@ static void __attribute__((hot)) scale_plane_thirds_neon(
         v6x_prev = v6x_buf_b;
     }
 
-    /* Horizontal scratch for 12x (3x -> halve -> halve) */
+    /* 12x tail widths (3x -> halve -> halve) for the columns outside the
+     * 48-wide NEON chunks. */
     int w_3x = src_w / 3;
-    int w_6x = w_3x / 2;
-    uint8_t *h_3x_buf = NULL, *h_6x_buf = NULL;
-    if (need_12x && (active_outputs & (1u << 6))) {
-        h_3x_buf = (uint8_t *)fused_scratch_alloc(&scratch, (size_t)w_3x);
-        h_6x_buf = (uint8_t *)fused_scratch_alloc(
-            &scratch, (size_t)(w_6x > 0 ? w_6x : 1));
-        if (!h_3x_buf || !h_6x_buf) return;
-    }
 
     /* NEON weight constants */
     uint8x8_t w171 = vdup_n_u8(171);
@@ -832,6 +832,13 @@ static void __attribute__((hot)) scale_plane_thirds_neon(
             dst_6x_r0 = dst_planes[2] + (size_t)out_row[2] * (size_t)dst_strides[2];
         }
 
+        /* 12x output row, needed on odd groups where the chunk loop emits
+         * the fused 12x output directly from registers. */
+        uint8_t *dst_12x_r0 = NULL;
+        if (need_12x && (g6 & 1)) {
+            dst_12x_r0 = dst_planes[3] + (size_t)out_row[3] * (size_t)dst_strides[3];
+        }
+
         /* ============================================================
          * MAIN CHUNK LOOP: process 48 source columns at a time.
          * Vertical intermediates stay in NEON registers; horizontal
@@ -839,11 +846,6 @@ static void __attribute__((hot)) scale_plane_thirds_neon(
          * row buffers are needed.  A 6-source-row group produces 4 output
          * rows at 1.5x, 2 rows at 3x, and 1 row at 6x.
          * ============================================================ */
-#if defined(__clang__)
-        #pragma clang loop unroll_count(2)
-#elif defined(__GNUC__)
-        #pragma GCC unroll 2
-#endif
         for (int ci = 0; ci < full_chunks; ci++) {
             int cx = ci * 48;
             int out_off_1_5x = ci * 32;  /* 48 -> 32 output bytes */
@@ -944,11 +946,28 @@ static void __attribute__((hot)) scale_plane_thirds_neon(
                 uint8x16_t v6xb = vrhaddq_u8(v3x0b, v3x1b);
                 uint8x16_t v6xc = vrhaddq_u8(v3x0c, v3x1c);
 
-                /* Save 6x vertical intermediate for 12x pairing */
+                /* 12x pairing.  On even groups: save the 6x vertical
+                 * intermediate; it becomes v6x_prev for the next group.
+                 * On odd groups: average with v6x_prev in registers and
+                 * emit the 12x output immediately (3x box filter followed
+                 * by two in-register rounded halvings), avoiding both the
+                 * odd group's intermediate store and the separate
+                 * averaging + horizontal scratch passes. */
                 if (need_12x) {
-                    vst1q_u8(v6x_cur + cx,      v6xa);
-                    vst1q_u8(v6x_cur + cx + 16, v6xb);
-                    vst1q_u8(v6x_cur + cx + 32, v6xc);
+                    if ((g6 & 1) == 0) {
+                        vst1q_u8(v6x_cur + cx,      v6xa);
+                        vst1q_u8(v6x_cur + cx + 16, v6xb);
+                        vst1q_u8(v6x_cur + cx + 32, v6xc);
+                    } else {
+                        uint8x16_t p6a = vld1q_u8(v6x_prev + cx);
+                        uint8x16_t p6b = vld1q_u8(v6x_prev + cx + 16);
+                        uint8x16_t p6c = vld1q_u8(v6x_prev + cx + 32);
+                        uint8x16_t r3x = h_chunk_3x_reg(
+                            vrhaddq_u8(p6a, v6xa),
+                            vrhaddq_u8(p6b, v6xb),
+                            vrhaddq_u8(p6c, v6xc));
+                        pow2_store_h2(r3x, dst_12x_r0 + ci * 4);
+                    }
                 }
 
                 if (active_outputs & (1u << 4)) {
@@ -1044,13 +1063,9 @@ static void __attribute__((hot)) scale_plane_thirds_neon(
          * 12x handling: pair two consecutive 6-row groups.
          * v6x_cur holds this group's 6x vertical intermediate (src_w bytes).
          * On even groups: swap pointers so current becomes previous.
-         * On odd groups: average prev with current, apply horizontal, output.
-         *
-         * 12x requires averaging two consecutive 6x rows, each derived from
-         * a different 6-row source group.  Since the two 6x rows come from
-         * different iterations of the outer loop, we save each 6x
-         * intermediate in v6x_cur and pair them every two iterations.
-         * The ping-pong swap avoids copying.
+         * On odd groups: the chunk loop already averaged each full chunk
+         * with v6x_prev in registers and emitted the 12x output inline;
+         * only the scalar tail columns remain to be paired and filtered.
          * ============================================================ */
         if (need_12x) {
             if ((g6 & 1) == 0) {
@@ -1059,43 +1074,23 @@ static void __attribute__((hot)) scale_plane_thirds_neon(
                 v6x_prev = v6x_cur;
                 v6x_cur  = tmp;
             } else {
-                /* Average v6x_prev (even group) with v6x_cur (odd group) */
-                /* Compute 12x vertical into v6x_prev (reuse as scratch) */
-                int neon16 = src_w / 16;
-                int x = 0;
-                for (int c = 0; c < neon16; c++, x += 16) {
-                    uint8x16_t a = vld1q_u8(v6x_prev + x);
-                    uint8x16_t b = vld1q_u8(v6x_cur + x);
-                    vst1q_u8(v6x_prev + x, vrhaddq_u8(a, b));
-                }
-                for (; x < src_w; x++) {
-                    v6x_prev[x] = avg_u8(v6x_prev[x], v6x_cur[x]);
-                }
+                if (tail_cols > 0) {
+                    /* Average the two groups' 6x intermediates over the
+                     * tail columns only (full chunks were fused in the
+                     * chunk loop), then 3x -> halve -> halve. */
+                    for (int x = tail_start; x < src_w; x++)
+                        v6x_prev[x] = avg_u8(v6x_prev[x], v6x_cur[x]);
 
-                if (active_outputs & (1u << 6)) {
-                    int dw = dst_widths[3];
-                    int ds = dst_strides[3];
-
-                    /* Full chunks are already deinterleaved in v6x_prev.
-                     * Convert each directly to its 3x horizontal result;
-                     * the scalar tail remains in ordinary row order. */
-                    for (int ci = 0; ci < full_chunks; ci++) {
-                        int cx = ci * 48;
-                        uint8x16_t A = vld1q_u8(v6x_prev + cx);
-                        uint8x16_t B = vld1q_u8(v6x_prev + cx + 16);
-                        uint8x16_t C = vld1q_u8(v6x_prev + cx + 32);
-                        h_chunk_3x(A, B, C, h_3x_buf + ci * 16);
-                    }
-                    if (tail_cols > 0) {
-                        int tail_w3 = w_3x - full_chunks * 16;
-                        h_filter_3x(v6x_prev + tail_start, tail_cols,
-                                    h_3x_buf + full_chunks * 16, tail_w3);
-                    }
-                    h_filter_halve(h_3x_buf, h_6x_buf, w_6x);
-                    h_filter_halve(h_6x_buf,
-                                   dst_planes[3] + (size_t)out_row[3] * (size_t)ds, dw);
-                    out_row[3]++;
+                    int tail_w3 = w_3x - full_chunks * 16;
+                    uint8_t h3_tail[16];
+                    uint8_t h6_tail[8];
+                    h_filter_3x(v6x_prev + tail_start, tail_cols,
+                                h3_tail, tail_w3);
+                    h_filter_halve(h3_tail, h6_tail, tail_w3 / 2);
+                    h_filter_halve(h6_tail, dst_12x_r0 + full_chunks * 4,
+                                   dst_widths[3] - full_chunks * 4);
                 }
+                out_row[3]++;
             }
         }
     } /* end g6 loop */

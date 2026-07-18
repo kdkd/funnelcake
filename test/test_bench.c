@@ -191,6 +191,8 @@ typedef struct {
     int         up_tail;        /* 1.5x tail */
 } bench_entry_t;
 
+#define AVX512_CHROMA64_BENCH "1920x1088 down:2x,4x,8x,16x"
+
 /* Label format:
  *   {WxH} [down:scales] [up:scales]
  *
@@ -208,6 +210,9 @@ static const bench_entry_t bench_configs[] = {
       FUSED_SCALE_1_5X | FUSED_SCALE_3X, 0, 0 },
     { "1280x720 down:2x,4x",              1280,  720,
       FUSED_SCALE_2X  | FUSED_SCALE_4X, 0, 0 },
+    { AVX512_CHROMA64_BENCH,               1920, 1088,
+      FUSED_SCALE_2X  | FUSED_SCALE_4X | FUSED_SCALE_8X |
+      FUSED_SCALE_16X, 0, 0 },
     { "1920x1080 down:1.5x,3x,6x",        1920, 1080,
       FUSED_SCALE_1_5X | FUSED_SCALE_3X | FUSED_SCALE_6X, 0, 0 },
     { "2560x1440 down:2x,4x,8x",          2560, 1440,
@@ -254,6 +259,10 @@ void run_bench_tests(const char *filter)
 {
     for (int i = 0; i < BENCH_CONFIG_COUNT; i++) {
         const bench_entry_t *e = &bench_configs[i];
+        /* Keep the diagnostic 64-byte-tail workload out of normal PGO
+         * training.  It remains available when selected explicitly. */
+        if (filter == NULL && strcmp(e->label, AVX512_CHROMA64_BENCH) == 0)
+            continue;
         if (filter != NULL && strstr(e->label, filter) == NULL)
             continue;
         bench_config(e->label, e->width, e->height, e->flags,

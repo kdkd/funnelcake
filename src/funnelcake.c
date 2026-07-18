@@ -231,6 +231,7 @@ int fused_scaler_init(fused_scaler_ctx_t *ctx)
     fused_kernel_fn simd_upscale_fn   = NULL;
     fused_kernel_fn simd_thirds_up_fn = NULL;
     fused_kernel_fn simd_pow2_up_fn   = NULL;
+    fused_kernel_fn simd_pow2_chroma64_fn = NULL;
 
 #if defined(__aarch64__)
     if (caps->has_neon) {
@@ -258,6 +259,7 @@ int fused_scaler_init(fused_scaler_ctx_t *ctx)
         if (caps->has_avx512 && fused_avx512_compiled()) {
             simd_thirds_fn    = fused_kernel_thirds_avx512;
             simd_pow2_fn      = fused_kernel_pow2_avx512;
+            simd_pow2_chroma64_fn = fused_kernel_pow2_chroma64_avx512;
             simd_upscale_fn   = fused_kernel_upscale_avx512;
             simd_thirds_up_fn = fused_kernel_thirds_up_avx512;
             simd_pow2_up_fn   = fused_kernel_pow2_up_avx512;
@@ -707,8 +709,16 @@ tail_done:
         } else if (want_up) {
             state->kernel_fn = simd_upscale_fn;
         } else {
-            state->kernel_fn = (family == FUSED_FAMILY_THIRDS)
-                                   ? simd_thirds_fn : simd_pow2_fn;
+            const uint32_t deep_pow2 = (1u << 3) | (1u << 5) | (1u << 7);
+            if (family == FUSED_FAMILY_POW2
+                    && simd_pow2_chroma64_fn != NULL
+                    && (achieved & deep_pow2) != 0
+                    && ((eff_w / 2) & 127) == 64) {
+                state->kernel_fn = simd_pow2_chroma64_fn;
+            } else {
+                state->kernel_fn = (family == FUSED_FAMILY_THIRDS)
+                                       ? simd_thirds_fn : simd_pow2_fn;
+            }
         }
     } else {
         if (want_down && want_up) {

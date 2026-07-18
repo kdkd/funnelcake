@@ -365,6 +365,11 @@ static const sdr_workload_t k_sdr_workloads[] = {
     /* Pow2 down only */
     { "1280x720 down:2x,4x",
       1280, 720, FUSED_SCALE_2X | FUSED_SCALE_4X, 0, 0 },
+    { "640x512 down:2x,4x,8x,16x",
+      640, 512, FUSED_SCALE_2X | FUSED_SCALE_4X | FUSED_SCALE_8X |
+      FUSED_SCALE_16X, 0, 0 },
+    { "640x512 down:16x only",
+      640, 512, FUSED_SCALE_16X, 0, 0 },
     /* Thirds down only */
     { "1280x720 down:1.5x,3x",
       1280, 720, FUSED_SCALE_1_5X | FUSED_SCALE_3X, 0, 0 },

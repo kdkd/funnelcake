@@ -640,6 +640,11 @@ clean:
 # and test profiles don't overwrite each other on clang (clang's default
 # `default.profraw` would be truncated by the second run, discarding the
 # bench data which is what we actually want to optimize for).
+PGO_RAW_PROFILES = pgo-bench.profraw pgo-tests.profraw
+ifeq ($(UNAME_M),x86_64)
+  PGO_RAW_PROFILES += pgo-targeted.profraw
+endif
+
 pgo: pgo-clean
 ifeq ($(CC_FAMILY_IS_CLANG),1)
 	@command -v $(firstword $(LLVM_PROFDATA)) >/dev/null 2>&1 || { \
@@ -665,11 +670,14 @@ endif
 	$(MAKE) funnelcake_test LIB_OPT="-O3 -fprofile-generate" EXTRA_LDFLAGS="-fprofile-generate"
 	@echo "=== PGO Step 2: Run benchmarks to collect profile ==="
 	LLVM_PROFILE_FILE="pgo-bench.profraw" ./funnelcake_test --bench
+ifeq ($(UNAME_M),x86_64)
+	LLVM_PROFILE_FILE="pgo-targeted.profraw" ./funnelcake_test --bench-sdr \
+	    "1920x1088 down:2x,4x,8x,16x" --skip-bench-swscale
+endif
 	LLVM_PROFILE_FILE="pgo-tests.profraw" ./funnelcake_test
 ifeq ($(CC_FAMILY_IS_CLANG),1)
 	@echo "=== PGO Step 2a: Merge raw profiles (clang) ==="
-	$(LLVM_PROFDATA) merge -output=default.profdata \
-	    pgo-bench.profraw pgo-tests.profraw
+	$(LLVM_PROFDATA) merge -output=default.profdata $(PGO_RAW_PROFILES)
 endif
 	@echo "=== PGO Step 3: Recompile library with profile data ==="
 ifeq ($(CC_FAMILY_IS_CLANG),1)
@@ -703,7 +711,8 @@ src/tonemap_avx2.o: src/tonemap_avx2.c
 # when the compiler can't build AVX-512 (the files then self-stub).  These
 # rules use $(LIB_CFLAGS), so PGO's LIB_OPT override flows through them the
 # same as every other kernel.
-src/kernels_avx512.o: src/kernels_avx512.c
+src/kernels_avx512.o: src/kernels_avx512.c \
+                          src/kernels_avx512_pow2_tree_128.inc
 	$(CC) $(LIB_CFLAGS) $(AVX512_KERNEL_CFLAGS) -c -o $@ $<
 
 src/kernels_hdr_avx512.o: src/kernels_hdr_avx512.c

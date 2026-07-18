@@ -253,6 +253,11 @@ void fused_kernel_pow2_avx512(const fused_kernel_params_t *p,
                               const uint8_t *src_y,
                               const uint8_t *src_u,
                               const uint8_t *src_v);
+
+void fused_kernel_pow2_chroma64_avx512(const fused_kernel_params_t *p,
+                                       const uint8_t *src_y,
+                                       const uint8_t *src_u,
+                                       const uint8_t *src_v);
 #endif /* __x86_64__ */
 
 #if defined(__aarch64__)

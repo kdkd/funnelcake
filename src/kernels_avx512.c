@@ -8,9 +8,11 @@
 /*
  * kernels_avx512.c - AVX-512 (x86_64) fused downscale kernels.
  *
- * Two entry points, mirroring kernels_avx2.c:
- *   fused_kernel_pow2_avx512   - power-of-two family (2x/4x/8x/16x)
- *   fused_kernel_thirds_avx512 - thirds family (1.5x/3x/6x/12x)
+ * Entry points mirroring kernels_avx2.c, plus a specialized power-of-two
+ * path for I420 frames whose chroma planes end in one 64-byte column:
+ *   fused_kernel_pow2_avx512          - power-of-two family
+ *   fused_kernel_pow2_chroma64_avx512 - power-of-two 64-byte chroma tail
+ *   fused_kernel_thirds_avx512        - thirds family
  *
  * These kernels target the F+BW+VL+VBMI feature set (Ice Lake and newer
  * Intel, Zen 4 and newer AMD).  Runtime dispatch (funnelcake.c) selects
@@ -188,6 +190,28 @@ static inline void store_pow2_64_avx512(__m512i v, int level,
     memcpy(dst, &packed, sizeof(packed));
 }
 
+/* Constant-depth forms used by the 64-byte register tree.  Keeping these
+ * always inlined avoids spilling a live vertical subtree around the generic
+ * helper call when GCC outlines its deeper cases. */
+static inline __attribute__((always_inline)) void store_pow2_64_level2_avx512(
+    __m512i v, uint8_t *restrict dst)
+{
+    __m256i h1 = avx512_halve_64_to_32(v);
+    __m128i h2 = avx512_halve_32_to_16(h1);
+    _mm_storel_epi64((__m128i *)dst, avx512_halve_16_to_8(h2));
+}
+
+static inline __attribute__((always_inline)) void store_pow2_64_level3_avx512(
+    __m512i v, uint8_t *restrict dst)
+{
+    __m256i h1 = avx512_halve_64_to_32(v);
+    __m128i h2 = avx512_halve_32_to_16(h1);
+    __m128i h3 = avx512_halve_16_to_8(h2);
+    uint32_t packed = (uint32_t)_mm_cvtsi128_si32(
+        avx512_halve_16_to_8(h3));
+    memcpy(dst, &packed, sizeof(packed));
+}
+
 static inline uint8_t reduce_pow2_scalar_avx512(const uint8_t *src, int level)
 {
     uint8_t values[16];
@@ -226,6 +250,107 @@ static inline __attribute__((always_inline)) void avg_nodes_128_avx512(
     *hi = _mm512_avg_epu8(a_hi, b_hi);
 }
 
+static inline __attribute__((always_inline)) __m512i avg_rows_64_avx512(
+    const uint8_t *restrict a, const uint8_t *restrict b, int x)
+{
+    return _mm512_avg_epu8(
+        _mm512_loadu_si512((const void *)(a + x)),
+        _mm512_loadu_si512((const void *)(b + x)));
+}
+
+/* Process the single 64-byte residual after the paired 128-byte tiles.  The
+ * vertical tree uses the same bottom-up rounded averages as the main loop;
+ * store_pow2_64_avx512 completes the matching horizontal tree. */
+static inline __attribute__((always_inline)) void pow2_tree_tile_64_avx512(
+    const uint8_t *restrict grp, int src_stride, int x, int deepest,
+    int emit0, int emit1, int emit2, int emit3,
+    uint8_t *restrict out0, uint8_t *restrict out1,
+    uint8_t *restrict out2, uint8_t *restrict out3,
+    int dst_strides[4])
+{
+    __m512i n0 = avg_rows_64_avx512(
+        grp, grp + (size_t)src_stride, x);
+    if (emit0)
+        store_pow2_64_avx512(n0, 0, out0 + (size_t)x / 2);
+    if (deepest == 0)
+        return;
+
+    __m512i n1 = avg_rows_64_avx512(
+        grp + (size_t)2 * (size_t)src_stride,
+        grp + (size_t)3 * (size_t)src_stride, x);
+    if (emit0)
+        store_pow2_64_avx512(n1, 0,
+            out0 + (size_t)dst_strides[0] + (size_t)x / 2);
+    __m512i p0 = _mm512_avg_epu8(n0, n1);
+    if (emit1)
+        store_pow2_64_avx512(p0, 1, out1 + (size_t)x / 4);
+    if (deepest == 1)
+        return;
+
+    __m512i n2 = avg_rows_64_avx512(
+        grp + (size_t)4 * (size_t)src_stride,
+        grp + (size_t)5 * (size_t)src_stride, x);
+    if (emit0)
+        store_pow2_64_avx512(n2, 0,
+            out0 + (size_t)2 * (size_t)dst_strides[0] + (size_t)x / 2);
+    __m512i n3 = avg_rows_64_avx512(
+        grp + (size_t)6 * (size_t)src_stride,
+        grp + (size_t)7 * (size_t)src_stride, x);
+    if (emit0)
+        store_pow2_64_avx512(n3, 0,
+            out0 + (size_t)3 * (size_t)dst_strides[0] + (size_t)x / 2);
+    __m512i p1 = _mm512_avg_epu8(n2, n3);
+    if (emit1)
+        store_pow2_64_avx512(p1, 1,
+            out1 + (size_t)dst_strides[1] + (size_t)x / 4);
+    __m512i q0 = _mm512_avg_epu8(p0, p1);
+    if (emit2)
+        store_pow2_64_level2_avx512(q0, out2 + (size_t)x / 8);
+    if (deepest == 2)
+        return;
+
+    __m512i n4 = avg_rows_64_avx512(
+        grp + (size_t)8 * (size_t)src_stride,
+        grp + (size_t)9 * (size_t)src_stride, x);
+    if (emit0)
+        store_pow2_64_avx512(n4, 0,
+            out0 + (size_t)4 * (size_t)dst_strides[0] + (size_t)x / 2);
+    __m512i n5 = avg_rows_64_avx512(
+        grp + (size_t)10 * (size_t)src_stride,
+        grp + (size_t)11 * (size_t)src_stride, x);
+    if (emit0)
+        store_pow2_64_avx512(n5, 0,
+            out0 + (size_t)5 * (size_t)dst_strides[0] + (size_t)x / 2);
+    __m512i p2 = _mm512_avg_epu8(n4, n5);
+    if (emit1)
+        store_pow2_64_avx512(p2, 1,
+            out1 + (size_t)2 * (size_t)dst_strides[1] + (size_t)x / 4);
+
+    __m512i n6 = avg_rows_64_avx512(
+        grp + (size_t)12 * (size_t)src_stride,
+        grp + (size_t)13 * (size_t)src_stride, x);
+    if (emit0)
+        store_pow2_64_avx512(n6, 0,
+            out0 + (size_t)6 * (size_t)dst_strides[0] + (size_t)x / 2);
+    __m512i n7 = avg_rows_64_avx512(
+        grp + (size_t)14 * (size_t)src_stride,
+        grp + (size_t)15 * (size_t)src_stride, x);
+    if (emit0)
+        store_pow2_64_avx512(n7, 0,
+            out0 + (size_t)7 * (size_t)dst_strides[0] + (size_t)x / 2);
+    __m512i p3 = _mm512_avg_epu8(n6, n7);
+    if (emit1)
+        store_pow2_64_avx512(p3, 1,
+            out1 + (size_t)3 * (size_t)dst_strides[1] + (size_t)x / 4);
+    __m512i q1 = _mm512_avg_epu8(p2, p3);
+    if (emit2)
+        store_pow2_64_level2_avx512(q1,
+            out2 + (size_t)dst_strides[2] + (size_t)x / 8);
+    if (emit3)
+        store_pow2_64_level3_avx512(_mm512_avg_epu8(q0, q1),
+            out3 + (size_t)x / 16);
+}
+
 /* Scratch-free fast path for regular 128-byte widths.  The tree is built in
  * the same bottom-up order as the row-at-a-time implementation, so rounded
  * averages remain bit exact.  Subtrees are completed before the next source
@@ -237,6 +362,30 @@ static inline __attribute__((always_inline)) void avg_nodes_128_avx512(
 static void __attribute__((hot)) scale_plane_pow2_tree_128_avx512(
     const uint8_t *restrict src,
     int src_w, int src_h, int src_stride,
+    uint32_t active_outputs, int deepest,
+    uint8_t *restrict dst_planes[4], int dst_strides[4])
+{
+#include "kernels_avx512_pow2_tree_128.inc"
+}
+
+/* Keep a compiler-independent copy for the chroma64 entry point.  Sharing
+ * the original helper gives GCC a second caller and changes PGO codegen for
+ * common aligned and 2x-only workloads. */
+static void __attribute__((hot)) scale_plane_pow2_tree_128_chroma64_avx512(
+    const uint8_t *restrict src,
+    int src_w, int src_h, int src_stride,
+    uint32_t active_outputs, int deepest,
+    uint8_t *restrict dst_planes[4], int dst_strides[4])
+{
+#include "kernels_avx512_pow2_tree_128.inc"
+}
+
+/* Process one 64-byte column after the regular 128-byte tree has completed
+ * the paired portion of the plane.  Keeping this in a separate function
+ * leaves the established aligned-width loop unchanged. */
+static void __attribute__((noinline, hot)) scale_plane_pow2_tree_tail_64_avx512(
+    const uint8_t *restrict src,
+    int x, int src_h, int src_stride,
     uint32_t active_outputs, int deepest,
     uint8_t *restrict dst_planes[4], int dst_strides[4])
 {
@@ -263,125 +412,48 @@ static void __attribute__((hot)) scale_plane_pow2_tree_128_avx512(
             + (size_t)g * (size_t)(group_rows >> 4)
               * (size_t)dst_strides[3] : NULL;
 
-        for (int x = 0; x < src_w; x += 128) {
-            __m512i n0_lo, n0_hi, n1_lo, n1_hi;
-            __m512i p0_lo, p0_hi;
+        pow2_tree_tile_64_avx512(
+            grp, src_stride, x, deepest,
+            emit0, emit1, emit2, emit3,
+            out0, out1, out2, out3, dst_strides);
+    }
+}
 
-            avg_rows_128_avx512(grp,
-                grp + (size_t)src_stride, x, &n0_lo, &n0_hi);
-            if (emit0)
-                store_pow2_128_avx512(n0_lo, n0_hi, 0,
-                    out0 + (size_t)x / 2);
-            if (deepest == 0)
-                continue;
-
-            avg_rows_128_avx512(
-                grp + (size_t)2 * (size_t)src_stride,
-                grp + (size_t)3 * (size_t)src_stride,
-                x, &n1_lo, &n1_hi);
-            if (emit0)
-                store_pow2_128_avx512(n1_lo, n1_hi, 0,
-                    out0 + (size_t)dst_strides[0] + (size_t)x / 2);
-            avg_nodes_128_avx512(n0_lo, n0_hi, n1_lo, n1_hi,
-                                 &p0_lo, &p0_hi);
-            if (emit1)
-                store_pow2_128_avx512(p0_lo, p0_hi, 1,
-                    out1 + (size_t)x / 4);
-            if (deepest == 1)
-                continue;
-
-            __m512i n2_lo, n2_hi, n3_lo, n3_hi;
-            __m512i p1_lo, p1_hi, q0_lo, q0_hi;
-            avg_rows_128_avx512(
-                grp + (size_t)4 * (size_t)src_stride,
-                grp + (size_t)5 * (size_t)src_stride,
-                x, &n2_lo, &n2_hi);
-            if (emit0)
-                store_pow2_128_avx512(n2_lo, n2_hi, 0,
-                    out0 + (size_t)2 * (size_t)dst_strides[0]
-                         + (size_t)x / 2);
-            avg_rows_128_avx512(
-                grp + (size_t)6 * (size_t)src_stride,
-                grp + (size_t)7 * (size_t)src_stride,
-                x, &n3_lo, &n3_hi);
-            if (emit0)
-                store_pow2_128_avx512(n3_lo, n3_hi, 0,
-                    out0 + (size_t)3 * (size_t)dst_strides[0]
-                         + (size_t)x / 2);
-            avg_nodes_128_avx512(n2_lo, n2_hi, n3_lo, n3_hi,
-                                 &p1_lo, &p1_hi);
-            if (emit1)
-                store_pow2_128_avx512(p1_lo, p1_hi, 1,
-                    out1 + (size_t)dst_strides[1] + (size_t)x / 4);
-            avg_nodes_128_avx512(p0_lo, p0_hi, p1_lo, p1_hi,
-                                 &q0_lo, &q0_hi);
-            if (emit2)
-                store_pow2_128_avx512(q0_lo, q0_hi, 2,
-                    out2 + (size_t)x / 8);
-            if (deepest == 2)
-                continue;
-
-            __m512i n4_lo, n4_hi, n5_lo, n5_hi;
-            __m512i n6_lo, n6_hi, n7_lo, n7_hi;
-            __m512i p2_lo, p2_hi, p3_lo, p3_hi;
-            __m512i q1_lo, q1_hi, root_lo, root_hi;
-            avg_rows_128_avx512(
-                grp + (size_t)8 * (size_t)src_stride,
-                grp + (size_t)9 * (size_t)src_stride,
-                x, &n4_lo, &n4_hi);
-            if (emit0)
-                store_pow2_128_avx512(n4_lo, n4_hi, 0,
-                    out0 + (size_t)4 * (size_t)dst_strides[0]
-                         + (size_t)x / 2);
-            avg_rows_128_avx512(
-                grp + (size_t)10 * (size_t)src_stride,
-                grp + (size_t)11 * (size_t)src_stride,
-                x, &n5_lo, &n5_hi);
-            if (emit0)
-                store_pow2_128_avx512(n5_lo, n5_hi, 0,
-                    out0 + (size_t)5 * (size_t)dst_strides[0]
-                         + (size_t)x / 2);
-            avg_nodes_128_avx512(n4_lo, n4_hi, n5_lo, n5_hi,
-                                 &p2_lo, &p2_hi);
-            if (emit1)
-                store_pow2_128_avx512(p2_lo, p2_hi, 1,
-                    out1 + (size_t)2 * (size_t)dst_strides[1]
-                         + (size_t)x / 4);
-
-            avg_rows_128_avx512(
-                grp + (size_t)12 * (size_t)src_stride,
-                grp + (size_t)13 * (size_t)src_stride,
-                x, &n6_lo, &n6_hi);
-            if (emit0)
-                store_pow2_128_avx512(n6_lo, n6_hi, 0,
-                    out0 + (size_t)6 * (size_t)dst_strides[0]
-                         + (size_t)x / 2);
-            avg_rows_128_avx512(
-                grp + (size_t)14 * (size_t)src_stride,
-                grp + (size_t)15 * (size_t)src_stride,
-                x, &n7_lo, &n7_hi);
-            if (emit0)
-                store_pow2_128_avx512(n7_lo, n7_hi, 0,
-                    out0 + (size_t)7 * (size_t)dst_strides[0]
-                         + (size_t)x / 2);
-            avg_nodes_128_avx512(n6_lo, n6_hi, n7_lo, n7_hi,
-                                 &p3_lo, &p3_hi);
-            if (emit1)
-                store_pow2_128_avx512(p3_lo, p3_hi, 1,
-                    out1 + (size_t)3 * (size_t)dst_strides[1]
-                         + (size_t)x / 4);
-            avg_nodes_128_avx512(p2_lo, p2_hi, p3_lo, p3_hi,
-                                 &q1_lo, &q1_hi);
-            if (emit2)
-                store_pow2_128_avx512(q1_lo, q1_hi, 2,
-                    out2 + (size_t)dst_strides[2] + (size_t)x / 8);
-            avg_nodes_128_avx512(q0_lo, q0_hi, q1_lo, q1_hi,
-                                 &root_lo, &root_hi);
-            if (emit3)
-                store_pow2_128_avx512(root_lo, root_hi, 3,
-                    out3 + (size_t)x / 16);
+/* Plane-level shape matching the proven integrated tree, kept separate so
+ * PGO cannot perturb the ordinary plane scaler. */
+static void __attribute__((hot)) scale_plane_pow2_chroma64_plane_avx512(
+    const uint8_t *restrict src,
+    int src_w, int src_h, int src_stride,
+    uint32_t active_outputs,
+    uint8_t *restrict dst_planes[4], int dst_strides[4])
+{
+    static const int bit_pos[4] = { 1, 3, 5, 7 };
+    int deepest = -1;
+    for (int k = 3; k >= 0; k--) {
+        if (active_outputs & (1u << bit_pos[k])) {
+            deepest = k;
+            break;
         }
     }
+    if (deepest < 0)
+        return;
+
+    if ((src_w & 127) == 0) {
+        scale_plane_pow2_tree_128_chroma64_avx512(
+            src, src_w, src_h, src_stride,
+            active_outputs, deepest, dst_planes, dst_strides);
+        return;
+    }
+
+    int paired_w = src_w & ~127;
+    if (paired_w > 0) {
+        scale_plane_pow2_tree_128_chroma64_avx512(
+            src, paired_w, src_h, src_stride,
+            active_outputs, deepest, dst_planes, dst_strides);
+    }
+    scale_plane_pow2_tree_tail_64_avx512(
+        src, paired_w, src_h, src_stride,
+        active_outputs, deepest, dst_planes, dst_strides);
 }
 
 /* -----------------------------------------------------------------------
@@ -556,7 +628,6 @@ static void __attribute__((hot)) scale_plane_pow2_avx512(
 
     /* Scratch buffers are carved from the persistent pool - nothing to free. */
 }
-
 
 /* =========================================================================
  * Thirds family (1.5x/3x/6x/12x) - the VBMI showcase.
@@ -1208,6 +1279,52 @@ void __attribute__((hot)) fused_kernel_pow2_avx512(const fused_kernel_params_t *
     _mm256_zeroupper();
 }
 
+void __attribute__((hot)) fused_kernel_pow2_chroma64_avx512(
+                              const fused_kernel_params_t *p,
+                              const uint8_t *src_y,
+                              const uint8_t *src_u,
+                              const uint8_t *src_v)
+{
+    static const int bit_pos[4] = { 1, 3, 5, 7 };
+
+    uint8_t *y_planes[4], *u_planes[4], *v_planes[4];
+    int y_strides[4], uv_strides[4];
+
+    for (int k = 0; k < 4; k++) {
+        int b = bit_pos[k];
+        if (p->active_outputs & (1u << b)) {
+            y_planes[k] = p->out[b].plane_y;
+            u_planes[k] = p->out[b].plane_u;
+            v_planes[k] = p->out[b].plane_v;
+            y_strides[k] = p->out[b].y_stride;
+            uv_strides[k] = p->out[b].uv_stride;
+        } else {
+            y_planes[k] = u_planes[k] = v_planes[k] = NULL;
+            y_strides[k] = uv_strides[k] = 0;
+        }
+    }
+
+    int uv_src_width = p->src_width / 2;
+
+    scale_plane_pow2_chroma64_plane_avx512(
+                            src_y,
+                            p->src_width, p->src_height, p->src_y_stride,
+                            p->active_outputs,
+                            y_planes, y_strides);
+    scale_plane_pow2_chroma64_plane_avx512(
+                            src_u,
+                            uv_src_width, p->src_height / 2, p->src_uv_stride,
+                            p->active_outputs,
+                            u_planes, uv_strides);
+    scale_plane_pow2_chroma64_plane_avx512(
+                            src_v,
+                            uv_src_width, p->src_height / 2, p->src_uv_stride,
+                            p->active_outputs,
+                            v_planes, uv_strides);
+
+    _mm256_zeroupper();
+}
+
 void __attribute__((hot)) fused_kernel_thirds_avx512(const fused_kernel_params_t *p,
                                 const uint8_t *src_y,
                                 const uint8_t *src_u,
@@ -1279,6 +1396,14 @@ void fused_kernel_pow2_avx512(const fused_kernel_params_t *p,
                               const uint8_t *src_y,
                               const uint8_t *src_u,
                               const uint8_t *src_v)
+{
+    fused_kernel_pow2_avx2(p, src_y, src_u, src_v);
+}
+
+void fused_kernel_pow2_chroma64_avx512(const fused_kernel_params_t *p,
+                                       const uint8_t *src_y,
+                                       const uint8_t *src_u,
+                                       const uint8_t *src_v)
 {
     fused_kernel_pow2_avx2(p, src_y, src_u, src_v);
 }

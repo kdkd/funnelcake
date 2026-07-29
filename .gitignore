@@ -3,6 +3,7 @@
 *.a
 *.d
 *.S
+*.dylib
 build/
 dist/
 funnelcake_test

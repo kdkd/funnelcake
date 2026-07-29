@@ -44,6 +44,11 @@ INCLUDEDIR ?= $(PREFIX)/include
 PKGCONFDIR ?= $(LIBDIR)/pkgconfig
 INSTALL    ?= install
 
+# Optional out-of-tree directory for library objects and library artifacts.
+# Leave empty for the traditional in-tree layout.
+BUILD_DIR ?=
+BUILD_PREFIX := $(if $(strip $(BUILD_DIR)),$(patsubst %/,%,$(BUILD_DIR))/)
+
 # Shared-library naming and link flags differ between Darwin and ELF systems.
 ifeq ($(UNAME_S),Darwin)
   SHLIB         = libfunnelcake.$(SOVERSION).dylib
@@ -308,7 +313,16 @@ else ifeq ($(UNAME_M),riscv64)
   LINK_MARCH = -march=rv64gcv
 endif
 
-LIB_OBJS = $(LIB_SRCS:.c=.o)
+LIB_OBJS = $(addprefix $(BUILD_PREFIX),$(LIB_SRCS:.c=.o))
+STATIC_LIB = $(BUILD_PREFIX)libfunnelcake.a
+SHARED_LIB = $(BUILD_PREFIX)$(SHLIB)
+
+ifneq ($(strip $(BUILD_DIR)),)
+$(LIB_OBJS): | $(BUILD_PREFIX)src
+
+$(BUILD_PREFIX)src:
+	mkdir -p $@
+endif
 
 # Test sources
 TEST_SRCS = test/test_main.c test/test_validation.c test/test_correctness.c \
@@ -331,20 +345,20 @@ JAVAC ?= javac
 CARGO ?= cargo
 
 # Default target
-.PHONY: all lib shared test bench bench-sdr bench-hdr bench-swscale visual asm fetch-samples clean pgo pgo-clean install bindings-go test-go bindings-java test-java bindings-rust test-rust bindings-python test-python
+.PHONY: all lib shared test test-build-dir bench bench-sdr bench-hdr bench-swscale visual asm fetch-samples clean pgo pgo-clean install bindings-go test-go bindings-java test-java bindings-rust test-rust bindings-python test-python
 
 all: lib
 
-lib: libfunnelcake.a
+lib: $(STATIC_LIB)
 
-libfunnelcake.a: $(LIB_OBJS)
+$(STATIC_LIB): $(LIB_OBJS)
 	$(AR) rcs $@ $^
 
 # Shared library (built on demand, e.g. for `make install`). The library
 # objects are already compiled with -fPIC, so they can be reused as-is.
-shared: $(SHLIB)
+shared: $(SHARED_LIB)
 
-$(SHLIB): $(LIB_OBJS)
+$(SHARED_LIB): $(LIB_OBJS)
 	$(CC) $(SHLIB_LDFLAGS) $(LINK_MARCH) -o $@ $^ $(LDFLAGS)
 
 # pkg-config file generated at build time so that downstream consumers
@@ -366,18 +380,21 @@ install: lib shared funnelcake.pc
 	$(INSTALL) -d $(DESTDIR)$(LIBDIR)
 	$(INSTALL) -d $(DESTDIR)$(INCLUDEDIR)
 	$(INSTALL) -d $(DESTDIR)$(PKGCONFDIR)
-	$(INSTALL) -m 644 libfunnelcake.a $(DESTDIR)$(LIBDIR)/
-	$(INSTALL) -m 755 $(SHLIB) $(DESTDIR)$(LIBDIR)/
+	$(INSTALL) -m 644 $(STATIC_LIB) $(DESTDIR)$(LIBDIR)/libfunnelcake.a
+	$(INSTALL) -m 755 $(SHARED_LIB) $(DESTDIR)$(LIBDIR)/$(SHLIB)
 	ln -sf $(SHLIB) $(DESTDIR)$(LIBDIR)/$(SHLIB_LINK)
 	$(INSTALL) -m 644 include/funnelcake.h $(DESTDIR)$(INCLUDEDIR)/
 	$(INSTALL) -m 644 include/funnelcake_helpers.h $(DESTDIR)$(INCLUDEDIR)/
 	$(INSTALL) -m 644 funnelcake.pc $(DESTDIR)$(PKGCONFDIR)/
 
-funnelcake_test: $(TEST_OBJS) libfunnelcake.a
-	$(CC) $(TEST_CFLAGS) $(LINK_MARCH) $(EXTRA_LDFLAGS) -o $@ $(TEST_OBJS) -L. -lfunnelcake $(LDFLAGS) $(SWSCALE_TEST_LDFLAGS)
+funnelcake_test: $(TEST_OBJS) $(STATIC_LIB)
+	$(CC) $(TEST_CFLAGS) $(LINK_MARCH) $(EXTRA_LDFLAGS) -o $@ $(TEST_OBJS) $(STATIC_LIB) $(LDFLAGS) $(SWSCALE_TEST_LDFLAGS)
 
 test: funnelcake_test
 	./funnelcake_test
+
+test-build-dir:
+	./test/test_build_dir.sh
 
 bench: funnelcake_test
 	./funnelcake_test --bench
@@ -620,8 +637,8 @@ fetch-samples:
 	@echo ""
 
 clean:
-	rm -f $(LIB_OBJS) $(TEST_OBJS) libfunnelcake.a funnelcake_test
-	rm -f libfunnelcake.so libfunnelcake.so.* libfunnelcake.*.dylib libfunnelcake.dylib
+	rm -f $(LIB_OBJS) $(TEST_OBJS) $(STATIC_LIB) funnelcake_test
+	rm -f $(BUILD_PREFIX)libfunnelcake.so $(BUILD_PREFIX)libfunnelcake.so.* $(BUILD_PREFIX)libfunnelcake.*.dylib $(BUILD_PREFIX)libfunnelcake.dylib
 	rm -f funnelcake.pc
 	rm -f src/*.gcda test/*.gcda
 	rm -f src/*.profraw default.profdata
@@ -684,7 +701,7 @@ ifeq ($(CC_FAMILY_IS_CLANG),1)
 	@echo "    SIMD) was never exercised during profiling, so it has no profile"
 	@echo "    data.  Those kernels are still built correctly."
 endif
-	rm -f $(LIB_OBJS) libfunnelcake.a funnelcake_test
+	rm -f $(LIB_OBJS) $(STATIC_LIB) funnelcake_test
 	$(MAKE) funnelcake_test LIB_OPT="-O3 $(PGO_USE_FLAGS)"
 	@echo "=== PGO complete. Run 'make bench' to see results. ==="
 
@@ -694,90 +711,90 @@ pgo-clean:
 	rm -f pgo-bench.profraw pgo-tests.profraw
 
 # --- Per-file flag overrides ---
-src/kernels_scalar.o: src/kernels_scalar.c
+$(BUILD_PREFIX)src/kernels_scalar.o: src/kernels_scalar.c
 	$(CC) $(LIB_CFLAGS) $(SCALAR_CFLAGS) -c -o $@ $<
 
-src/kernels_avx2.o: src/kernels_avx2.c
+$(BUILD_PREFIX)src/kernels_avx2.o: src/kernels_avx2.c
 	$(CC) $(LIB_CFLAGS) -mavx2 -c -o $@ $<
 
-src/tonemap_avx2.o: src/tonemap_avx2.c
+$(BUILD_PREFIX)src/tonemap_avx2.o: src/tonemap_avx2.c
 	$(CC) $(LIB_CFLAGS) -mavx2 -c -o $@ $<
 
 # AVX-512 kernels: $(AVX512_KERNEL_CFLAGS) is the probed flag set, or empty
 # when the compiler can't build AVX-512 (the files then self-stub).  These
 # rules use $(LIB_CFLAGS), so PGO's LIB_OPT override flows through them the
 # same as every other kernel.
-src/kernels_avx512.o: src/kernels_avx512.c
+$(BUILD_PREFIX)src/kernels_avx512.o: src/kernels_avx512.c
 	$(CC) $(LIB_CFLAGS) $(AVX512_KERNEL_CFLAGS) -c -o $@ $<
 
-src/kernels_hdr_avx512.o: src/kernels_hdr_avx512.c
+$(BUILD_PREFIX)src/kernels_hdr_avx512.o: src/kernels_hdr_avx512.c
 	$(CC) $(LIB_CFLAGS) $(AVX512_KERNEL_CFLAGS) -c -o $@ $<
 
-src/kernels_upscale_avx512.o: src/kernels_upscale_avx512.c
+$(BUILD_PREFIX)src/kernels_upscale_avx512.o: src/kernels_upscale_avx512.c
 	$(CC) $(LIB_CFLAGS) $(AVX512_KERNEL_CFLAGS) -c -o $@ $<
 
-src/tonemap_avx512.o: src/tonemap_avx512.c
+$(BUILD_PREFIX)src/tonemap_avx512.o: src/tonemap_avx512.c
 	$(CC) $(LIB_CFLAGS) $(AVX512_KERNEL_CFLAGS) -c -o $@ $<
 
-src/kernels_neon.o: src/kernels_neon.c
+$(BUILD_PREFIX)src/kernels_neon.o: src/kernels_neon.c
 	$(CC) $(LIB_CFLAGS) -c -o $@ $<
 
-src/tonemap_neon.o: src/tonemap_neon.c
+$(BUILD_PREFIX)src/tonemap_neon.o: src/tonemap_neon.c
 	$(CC) $(LIB_CFLAGS) -c -o $@ $<
 
 # Library source files use LIB_CFLAGS (O3)
-src/funnelcake.o: src/funnelcake.c
+$(BUILD_PREFIX)src/funnelcake.o: src/funnelcake.c
 	$(CC) $(LIB_CFLAGS) -c -o $@ $<
 
 # Binding helper surface (standalone utilities; not on any scaling path).
-src/bindings_support.o: src/bindings_support.c include/funnelcake_helpers.h include/funnelcake.h
+$(BUILD_PREFIX)src/bindings_support.o: src/bindings_support.c include/funnelcake_helpers.h include/funnelcake.h
 	$(CC) $(LIB_CFLAGS) -c -o $@ $<
 
-src/log.o: src/log.c
+$(BUILD_PREFIX)src/log.o: src/log.c
 	$(CC) $(LIB_CFLAGS) -c -o $@ $<
 
-src/detect.o: src/detect.c
+$(BUILD_PREFIX)src/detect.o: src/detect.c
 	$(CC) $(DETECT_CFLAGS) -c -o $@ $<
 
 # HDR library sources use LIB_CFLAGS (O3)
-src/funnelcake_hdr.o: src/funnelcake_hdr.c
+$(BUILD_PREFIX)src/funnelcake_hdr.o: src/funnelcake_hdr.c
 	$(CC) $(LIB_CFLAGS) -c -o $@ $<
 
-src/tonemap.o: src/tonemap.c
+$(BUILD_PREFIX)src/tonemap.o: src/tonemap.c
 	$(CC) $(LIB_CFLAGS) -c -o $@ $<
 
-src/kernels_hdr_scalar.o: src/kernels_hdr_scalar.c
+$(BUILD_PREFIX)src/kernels_hdr_scalar.o: src/kernels_hdr_scalar.c
 	$(CC) $(LIB_CFLAGS) $(SCALAR_CFLAGS) -c -o $@ $<
 
-src/kernels_hdr_avx2.o: src/kernels_hdr_avx2.c
+$(BUILD_PREFIX)src/kernels_hdr_avx2.o: src/kernels_hdr_avx2.c
 	$(CC) $(LIB_CFLAGS) -mavx2 -c -o $@ $<
 
-src/kernels_hdr_neon.o: src/kernels_hdr_neon.c
+$(BUILD_PREFIX)src/kernels_hdr_neon.o: src/kernels_hdr_neon.c
 	$(CC) $(LIB_CFLAGS) -c -o $@ $<
 
 # Upscale kernels
-src/kernels_upscale_scalar.o: src/kernels_upscale_scalar.c
+$(BUILD_PREFIX)src/kernels_upscale_scalar.o: src/kernels_upscale_scalar.c
 	$(CC) $(LIB_CFLAGS) $(SCALAR_CFLAGS) -c -o $@ $<
 
-src/kernels_upscale_avx2.o: src/kernels_upscale_avx2.c
+$(BUILD_PREFIX)src/kernels_upscale_avx2.o: src/kernels_upscale_avx2.c
 	$(CC) $(LIB_CFLAGS) -mavx2 -c -o $@ $<
 
-src/kernels_upscale_neon.o: src/kernels_upscale_neon.c
+$(BUILD_PREFIX)src/kernels_upscale_neon.o: src/kernels_upscale_neon.c
 	$(CC) $(LIB_CFLAGS) -c -o $@ $<
 
 # RVV kernels (riscv64). -march=rv64gcv enables full RVV 1.0 (the V
 # extension); the kernels are written vector-length-agnostic so they run on
 # any V-capable chip.
-src/kernels_rvv.o: src/kernels_rvv.c
+$(BUILD_PREFIX)src/kernels_rvv.o: src/kernels_rvv.c
 	$(CC) $(LIB_CFLAGS) -march=rv64gcv -c -o $@ $<
 
-src/kernels_hdr_rvv.o: src/kernels_hdr_rvv.c
+$(BUILD_PREFIX)src/kernels_hdr_rvv.o: src/kernels_hdr_rvv.c
 	$(CC) $(LIB_CFLAGS) -march=rv64gcv -c -o $@ $<
 
-src/kernels_upscale_rvv.o: src/kernels_upscale_rvv.c
+$(BUILD_PREFIX)src/kernels_upscale_rvv.o: src/kernels_upscale_rvv.c
 	$(CC) $(LIB_CFLAGS) -march=rv64gcv -c -o $@ $<
 
-src/tonemap_rvv.o: src/tonemap_rvv.c
+$(BUILD_PREFIX)src/tonemap_rvv.o: src/tonemap_rvv.c
 	$(CC) $(LIB_CFLAGS) -march=rv64gcv -c -o $@ $<
 
 # Test source files use TEST_CFLAGS (O2)

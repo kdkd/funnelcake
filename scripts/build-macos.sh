@@ -7,6 +7,7 @@ DIST_DIR="${REPO_ROOT}/dist"
 BUILD_DATE="$(date -u +%Y%m%dT%H%M%SZ)"
 HOST_OS="$(uname -s)"
 HOST_ARCH="$(uname -m)"
+BUILD_DIR="${DIST_DIR}/build/macos-${HOST_ARCH}"
 
 usage() {
   cat <<'EOF'
@@ -50,15 +51,20 @@ mkdir -p "${DIST_DIR}"
 package_dir="funnelcake-macos-${HOST_ARCH}"
 
 echo "==> Building macOS ${HOST_ARCH} artifact"
+rm -rf "${BUILD_DIR}"
 (
   cd "${REPO_ROOT}"
-  make clean
-  make lib CC=clang LTO=0 UNAME_S=Darwin UNAME_M="${HOST_ARCH}"
+  make lib \
+    BUILD_DIR="${BUILD_DIR}" \
+    CC=clang \
+    LTO=0 \
+    UNAME_S=Darwin \
+    UNAME_M="${HOST_ARCH}"
 )
 
 rm -rf "${DIST_DIR}/${package_dir}"
 mkdir -p "${DIST_DIR}/${package_dir}/include"
-cp "${REPO_ROOT}/libfunnelcake.a" "${DIST_DIR}/${package_dir}/"
+cp "${BUILD_DIR}/libfunnelcake.a" "${DIST_DIR}/${package_dir}/"
 cp "${REPO_ROOT}/include/funnelcake.h" "${DIST_DIR}/${package_dir}/include/"
 cp "${REPO_ROOT}/include/funnelcake_helpers.h" "${DIST_DIR}/${package_dir}/include/"
 cp "${REPO_ROOT}/README.md" "${REPO_ROOT}/INSTALL.md" "${DIST_DIR}/${package_dir}/"
@@ -79,12 +85,8 @@ rm -f "${DIST_DIR}/${package_dir}.tar.gz" "${DIST_DIR}/${package_dir}.tar.gz.sha
   shasum -a 256 "${package_dir}.tar.gz" > "${package_dir}.tar.gz.sha256"
 )
 
-(
-  cd "${REPO_ROOT}"
-  make clean
-)
-
 echo ""
 echo "Artifacts written to ${DIST_DIR}:"
+echo "  build/macos-${HOST_ARCH}/"
 echo "  ${package_dir}.tar.gz"
 echo "  ${package_dir}.tar.gz.sha256"

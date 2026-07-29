@@ -121,10 +121,10 @@ from any Docker host with `buildx` enabled:
     ./scripts/build-linux-ubuntu20.sh
 
 Artifacts are written to `dist/` as per-architecture tarballs containing
-`libfunnelcake.a`, `include/funnelcake.h`, and basic build metadata. These
-release archives are built with `CC=clang LTO=0` so the static library contains
-standard object files suitable for downstream linkers that do not understand
-Clang LTO bitcode.
+`libfunnelcake.a`, `include/funnelcake.h`, `include/funnelcake_helpers.h`, and
+basic build metadata. These release archives are built with `CC=clang LTO=0`
+so the static library contains standard object files suitable for downstream
+linkers that do not understand Clang LTO bitcode.
 
 ## macOS Release Artifacts
 

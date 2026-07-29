@@ -30,7 +30,7 @@ endif
 # --- Versioning and install layout ---
 # VERSION is the project version string used in funnelcake.pc and elsewhere.
 # Bump this whenever you cut a release (see README.md, "Release process").
-VERSION    ?= 0.1.0
+VERSION    ?= 0.1.1
 
 # SOVERSION is the shared-library major version. Bump only on ABI breaks.
 SOVERSION  ?= 1
@@ -109,6 +109,10 @@ LTO ?= 0
 # To keep the Makefile readable we resolve it here using the same probe.
 CC_FAMILY_IS_CLANG := $(shell $(CC) --version 2>/dev/null | grep -qi clang && echo 1)
 
+# Clang major version (e.g. 18), used to locate the matching versioned LLVM
+# tools that Debian/Ubuntu install (llvm-profdata-18, etc.).  Empty for GCC.
+CLANG_MAJOR := $(shell $(CC) --version 2>/dev/null | sed -n 's/.*clang version \([0-9][0-9]*\).*/\1/p' | head -1)
+
 ifeq ($(LTO),1)
   # LTO + RVV intrinsics is currently broken on every GCC we've tested:
   # GCC 13 lacks target-builtin info during the LTO link, and GCC 14 hits
@@ -159,21 +163,43 @@ DETECT_CFLAGS = $(CFLAGS_BASE) -O2 $(TUNE_CFLAGS)
 
 # llvm-profdata lookup: on macOS the Xcode toolchain ships it alongside
 # clang but not always in PATH, so prefer `xcrun` there. On Linux the
-# tool is typically in PATH as `llvm-profdata`; if the user installed
-# a versioned package (e.g. llvm-profdata-17) they can override via
-# `make LLVM_PROFDATA=llvm-profdata-17 pgo`.
-ifeq ($(UNAME_S),Darwin)
-  LLVM_PROFDATA ?= xcrun llvm-profdata
+# tool is usually in PATH as `llvm-profdata`, but Debian/Ubuntu ship it
+# only as a versioned binary (e.g. llvm-profdata-18) unless the unversioned
+# `llvm` meta-package is installed - so fall back to the version matching
+# the active clang. Override explicitly with `make LLVM_PROFDATA=... pgo`.
+ifndef LLVM_PROFDATA
+  ifeq ($(UNAME_S),Darwin)
+    LLVM_PROFDATA := xcrun llvm-profdata
+  else
+    LLVM_PROFDATA := $(shell command -v llvm-profdata 2>/dev/null \
+                       || command -v llvm-profdata-$(CLANG_MAJOR) 2>/dev/null \
+                       || echo llvm-profdata)
+  endif
+endif
+
+# Package-name suffix for the install hints below: "-18" when the clang
+# version is known, empty otherwise (so the hint reads "llvm" not "llvm-").
+ifeq ($(CLANG_MAJOR),)
+  LLVM_PKG_SUFFIX :=
 else
-  LLVM_PROFDATA ?= llvm-profdata
+  LLVM_PKG_SUFFIX := -$(CLANG_MAJOR)
 endif
 
 # Suppress the "no profile data for this TU" warning that both compilers
 # emit for files that weren't exercised by the PGO training run (e.g. the
 # test harness, cold-path code, detect.c which is deliberately excluded).
 # GCC and clang spell the flag differently.
+#
+# clang also emits "Function X is annotated as a hot function but the
+# profile is cold" (-Wbackend-plugin) for the SIMD kernels that carry
+# __attribute__((hot)) but never ran during training - which is exactly
+# what happens when PGO is trained on a CPU whose SIMD path isn't the
+# native one (e.g. collecting a profile on an AVX2-less host leaves the
+# AVX2 kernels cold, and vice versa). That mismatch is expected for a
+# multi-arch library, so downgrade it from error to a (still visible)
+# warning rather than failing the build.
 ifeq ($(CC_FAMILY_IS_CLANG),1)
-  PGO_USE_FLAGS = -fprofile-use -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date
+  PGO_USE_FLAGS = -fprofile-use -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date -Wno-error=backend-plugin
 else
   PGO_USE_FLAGS = -fprofile-use -Wno-missing-profile
 endif
@@ -224,24 +250,56 @@ ifneq ($(SWSCALE_LIBS),)
   SWSCALE_TEST_LDFLAGS = $(SWSCALE_LIBS)
 endif
 
+# --- AVX-512 kernel support (x86_64 only) ---
+# The AVX-512 kernels need a compiler that accepts the F/BW/VL/VBMI flag set
+# (gcc >= 8, clang >= 7).  Feature-probe by try-compiling rather than
+# version-sniffing: distro backports and Apple clang's renumbering make
+# version checks unreliable, and the compiler itself is the authority on
+# what it supports.  When the probe fails the same kernels_*_avx512.c files
+# are still compiled, just WITHOUT these flags - they detect the missing
+# __AVX512*__ macros and build as stubs that runtime dispatch never selects
+# (fused_avx512_compiled() returns 0).  Old compilers therefore keep
+# building a fully working library; they only omit a fast path their host
+# CPU most likely cannot run anyway.  The minimum compiler version for the
+# project is unchanged.
+ifeq ($(UNAME_M),x86_64)
+  AVX512_KERNEL_CFLAGS := -mavx512f -mavx512bw -mavx512vl -mavx512vbmi
+  CC_HAS_AVX512 := $(shell $(CC) $(AVX512_KERNEL_CFLAGS) -x c -c /dev/null -o /dev/null 2>/dev/null && echo 1)
+  ifeq ($(CC_HAS_AVX512),1)
+    $(info funnelcake: AVX-512 kernels: WILL be compiled ($(CC) accepts $(AVX512_KERNEL_CFLAGS)); used only on CPUs with F+BW+VL+VBMI)
+  else
+    $(info funnelcake: AVX-512 kernels: will NOT be compiled ($(CC) rejects $(AVX512_KERNEL_CFLAGS) - needs gcc >= 8 or clang >= 7). Building stub fallback; AVX2 and scalar kernels are unaffected.)
+    AVX512_KERNEL_CFLAGS :=
+  endif
+endif
+
 # Library sources (always compiled)
+#
+# bindings_support.c holds the small helper surface used by the language
+# bindings (aligned alloc, stride math, ctx-sizeof guards). It is standalone
+# utility code that the scaler/HDR paths never call, so including it does not
+# change any library output or behavior - it just means a single installed
+# libfunnelcake + headers is enough to build a binding (no separate helper lib).
+# Raw C users linking the static archive get these objects dropped as unused.
 LIB_SRCS = src/funnelcake.c src/funnelcake_hdr.c src/log.c src/detect.c \
            src/kernels_scalar.c src/kernels_hdr_scalar.c src/tonemap.c \
-           src/kernels_upscale_scalar.c
+           src/kernels_upscale_scalar.c src/bindings_support.c
 
 # Platform-specific SIMD kernels (SDR + HDR + upscale)
 ifeq ($(UNAME_M),x86_64)
   LIB_SRCS += src/kernels_avx2.c src/kernels_hdr_avx2.c \
-              src/kernels_upscale_avx2.c
+              src/kernels_upscale_avx2.c src/tonemap_avx2.c \
+              src/kernels_avx512.c src/kernels_hdr_avx512.c \
+              src/kernels_upscale_avx512.c src/tonemap_avx512.c
 else ifeq ($(UNAME_M),aarch64)
   LIB_SRCS += src/kernels_neon.c src/kernels_hdr_neon.c \
-              src/kernels_upscale_neon.c
+              src/kernels_upscale_neon.c src/tonemap_neon.c
 else ifeq ($(UNAME_M),arm64)
   LIB_SRCS += src/kernels_neon.c src/kernels_hdr_neon.c \
-              src/kernels_upscale_neon.c
+              src/kernels_upscale_neon.c src/tonemap_neon.c
 else ifeq ($(UNAME_M),riscv64)
   LIB_SRCS += src/kernels_rvv.c src/kernels_hdr_rvv.c \
-              src/kernels_upscale_rvv.c
+              src/kernels_upscale_rvv.c src/tonemap_rvv.c
   # LTO link must re-process the RVV intrinsic IR with the V extension
   # available; otherwise lto1 errors out with "target specific builtin
   # not available".  Adding -march=rv64gcv to the link line satisfies it
@@ -256,12 +314,24 @@ LIB_OBJS = $(LIB_SRCS:.c=.o)
 TEST_SRCS = test/test_main.c test/test_validation.c test/test_correctness.c \
             test/test_patterns.c test/test_visual.c test/test_bench.c \
             test/test_hdr_validation.c test/test_hdr_correctness.c \
+            test/test_tonemap.c \
             test/test_hdr_bench.c test/test_swscale_bench.c \
             test/test_parity.c
 TEST_OBJS = $(TEST_SRCS:.c=.o)
 
+# Go toolchain for the bindings targets (override with `make GO=go1.23`).
+GO ?= go
+
+# Java toolchain for the bindings targets. FFM requires a JDK >= 22; tested on
+# JDK 25. Override e.g. `make JAVA=/opt/.../bin/java JAVAC=/opt/.../bin/javac`.
+JAVA  ?= java
+JAVAC ?= javac
+
+# Rust toolchain for the bindings targets (override with `make CARGO=cargo`).
+CARGO ?= cargo
+
 # Default target
-.PHONY: all lib shared test bench bench-sdr bench-hdr bench-swscale visual asm fetch-samples clean pgo pgo-clean install
+.PHONY: all lib shared test bench bench-sdr bench-hdr bench-swscale visual asm fetch-samples clean pgo pgo-clean install bindings-go test-go bindings-java test-java bindings-rust test-rust bindings-python test-python
 
 all: lib
 
@@ -300,6 +370,7 @@ install: lib shared funnelcake.pc
 	$(INSTALL) -m 755 $(SHLIB) $(DESTDIR)$(LIBDIR)/
 	ln -sf $(SHLIB) $(DESTDIR)$(LIBDIR)/$(SHLIB_LINK)
 	$(INSTALL) -m 644 include/funnelcake.h $(DESTDIR)$(INCLUDEDIR)/
+	$(INSTALL) -m 644 include/funnelcake_helpers.h $(DESTDIR)$(INCLUDEDIR)/
 	$(INSTALL) -m 644 funnelcake.pc $(DESTDIR)$(PKGCONFDIR)/
 
 funnelcake_test: $(TEST_OBJS) libfunnelcake.a
@@ -324,15 +395,134 @@ visual: funnelcake_test
 	@mkdir -p output
 	./funnelcake_test --visual
 
+# --- Language bindings (opt-in; not built by `all` or `test`) ---
+# The Go binding statically links the in-tree libfunnelcake.a (which now carries
+# the binding helpers too), so it depends on `lib`.
+GO_BINDING_DIR = bindings/go
+
+bindings-go: lib
+	@command -v $(GO) >/dev/null 2>&1 || { \
+	  echo "Error: '$(GO)' not found in PATH; install Go (>=1.23) to build the Go binding"; exit 1; }
+	cd $(GO_BINDING_DIR) && CGO_ENABLED=1 $(GO) build ./...
+
+test-go: bindings-go
+	cd $(GO_BINDING_DIR) && CGO_ENABLED=1 $(GO) vet ./... && CGO_ENABLED=1 $(GO) test ./...
+
+# --- Java binding (FFM / Panama; opt-in) ---
+# Unlike Go (static cgo), the Java binding loads the shared library at runtime
+# via the Foreign Function & Memory API. The binding helpers now live in the
+# core libfunnelcake, so only that one shared lib is needed; it is built into
+# bindings/java/ under a plain name so the JVM can find it by directory.
+JAVA_BINDING_DIR = bindings/java
+JAVA_SRC_DIR     = $(JAVA_BINDING_DIR)/src
+JAVA_CLASS_DIR   = $(JAVA_BINDING_DIR)/classes
+JAVA_SOURCES     = $(wildcard $(JAVA_SRC_DIR)/org/your/funnelcake/*.java)
+
+# Plain (unversioned) shared-library naming for the bindings that load by path
+# (Java FFM, Python ctypes). Shared between those two targets.
+ifeq ($(UNAME_S),Darwin)
+  BIND_LIBEXT        = dylib
+  BIND_SHLIB_LDFLAGS = -dynamiclib
+else
+  BIND_LIBEXT        = so
+  BIND_SHLIB_LDFLAGS = -shared
+endif
+
+JAVA_CORE_LIB = $(JAVA_BINDING_DIR)/libfunnelcake.$(BIND_LIBEXT)
+
+$(JAVA_CORE_LIB): $(LIB_OBJS)
+	$(CC) $(BIND_SHLIB_LDFLAGS) $(LINK_MARCH) -o $@ $^ $(LDFLAGS)
+
+bindings-java: $(JAVA_CORE_LIB)
+	@command -v $(JAVAC) >/dev/null 2>&1 || { \
+	  echo "Error: '$(JAVAC)' not found in PATH; install a JDK >= 22 (FFM) to build the Java binding"; exit 1; }
+	@mkdir -p $(JAVA_CLASS_DIR)
+	$(JAVAC) -d $(JAVA_CLASS_DIR) $(JAVA_SOURCES)
+
+test-java: bindings-java
+	$(JAVA) --enable-native-access=ALL-UNNAMED \
+	    -Dfunnelcake.libdir=$(CURDIR)/$(JAVA_BINDING_DIR) \
+	    -cp $(JAVA_CLASS_DIR) org.your.funnelcake.FunnelcakeTest
+
+# --- Rust binding (opt-in) ---
+# Static-links the in-tree libfunnelcake.a (so it depends on `lib`), which now
+# contains the binding helpers. No crates.io deps.
+RUST_BINDING_DIR = bindings/rust
+
+bindings-rust: lib
+	@command -v $(CARGO) >/dev/null 2>&1 || { \
+	  echo "Error: '$(CARGO)' not found in PATH; install Rust (https://rustup.rs) to build the Rust binding"; exit 1; }
+	cd $(RUST_BINDING_DIR) && $(CARGO) build
+
+test-rust: lib
+	@command -v $(CARGO) >/dev/null 2>&1 || { \
+	  echo "Error: '$(CARGO)' not found in PATH; install Rust (https://rustup.rs) to build the Rust binding"; exit 1; }
+	cd $(RUST_BINDING_DIR) && $(CARGO) test
+
+# --- Python binding (ctypes; opt-in) ---
+# Pure-Python (stdlib ctypes), so nothing to compile beyond the one shared lib
+# it loads at runtime: the core scaler (which now also carries the binding
+# helpers), built into bindings/python/ under a plain name.
+PYTHON ?= python3
+PYTHON_BINDING_DIR = bindings/python
+PY_CORE_LIB = $(PYTHON_BINDING_DIR)/libfunnelcake.$(BIND_LIBEXT)
+
+$(PY_CORE_LIB): $(LIB_OBJS)
+	$(CC) $(BIND_SHLIB_LDFLAGS) $(LINK_MARCH) -o $@ $^ $(LDFLAGS)
+
+bindings-python: $(PY_CORE_LIB)
+	@command -v $(PYTHON) >/dev/null 2>&1 || { \
+	  echo "Error: '$(PYTHON)' not found in PATH; install Python 3.8+ to use the Python binding"; exit 1; }
+
+test-python: bindings-python
+	FUNNELCAKE_LIBDIR=$(CURDIR)/$(PYTHON_BINDING_DIR) PYTHONPATH=$(CURDIR)/$(PYTHON_BINDING_DIR) \
+	    $(PYTHON) -m unittest discover -s $(PYTHON_BINDING_DIR) -p 'test_*.py' -v
+
 # --- Assembly inspection ---
-# `make asm` emits annotated assembly for the AVX2 SIMD kernels next to the
+# `make asm` emits annotated assembly for this host's SIMD kernels next to the
 # sources so optimization experiments can inspect codegen (register spills,
 # intrinsic lowering) without rediscovering the compiler invocation. Built at
-# -O3 with the same -mavx2/-mtune flags as the real objects but WITHOUT LTO:
+# -O3 with the same -march/-mtune flags as the real objects but WITHOUT LTO:
 # `-flto -S` emits pre-link IR, not the final per-function codegen we want to
 # read. Honors TUNE, e.g. `make asm TUNE=native`.
-ASM_CFLAGS = $(CFLAGS_BASE) $(LIB_OPT) $(TUNE_CFLAGS) -mavx2 -S -fverbose-asm
-ASM_SRCS   = src/kernels_avx2.c src/kernels_upscale_avx2.c
+#
+# The kernel sources and arch flag follow $(UNAME_M) exactly like LIB_SRCS
+# above, so `make asm` inspects the AVX2 kernels on x86_64, the NEON kernels on
+# arm, and the RVV kernels on riscv64. The full SIMD set for the host is
+# covered - downscale, HDR downscale, and upscale - so the HDR codegen is just
+# as inspectable as the SDR codegen. ASM_ARCH_CFLAGS mirrors the per-file flag
+# the real objects are built with (-mavx2 / none / -march=rv64gcv).
+ifeq ($(UNAME_M),x86_64)
+  ASM_ARCH_CFLAGS = -mavx2
+  ASM_SRCS        = src/kernels_avx2.c src/kernels_hdr_avx2.c \
+                    src/kernels_upscale_avx2.c src/tonemap_avx2.c
+  # AVX-512 kernels join the asm set only when the compiler can build them
+  # for real (stub assembly is just delegation jumps - nothing to inspect).
+  # The target-specific variable below swaps in the AVX-512 flag set for
+  # those three .S files while the AVX2 files keep plain -mavx2, mirroring
+  # the per-file flags the real objects are built with.
+  ifeq ($(CC_HAS_AVX512),1)
+    ASM_SRCS += src/kernels_avx512.c src/kernels_hdr_avx512.c \
+                src/kernels_upscale_avx512.c src/tonemap_avx512.c
+  endif
+  src/kernels_avx512.S src/kernels_hdr_avx512.S src/kernels_upscale_avx512.S \
+  src/tonemap_avx512.S: \
+    ASM_ARCH_CFLAGS = $(AVX512_KERNEL_CFLAGS)
+else ifeq ($(UNAME_M),aarch64)
+  ASM_ARCH_CFLAGS =
+  ASM_SRCS        = src/kernels_neon.c src/kernels_hdr_neon.c \
+                    src/kernels_upscale_neon.c src/tonemap_neon.c
+else ifeq ($(UNAME_M),arm64)
+  ASM_ARCH_CFLAGS =
+  ASM_SRCS        = src/kernels_neon.c src/kernels_hdr_neon.c \
+                    src/kernels_upscale_neon.c src/tonemap_neon.c
+else ifeq ($(UNAME_M),riscv64)
+  ASM_ARCH_CFLAGS = -march=rv64gcv
+  ASM_SRCS        = src/kernels_rvv.c src/kernels_hdr_rvv.c \
+                    src/kernels_upscale_rvv.c src/tonemap_rvv.c
+endif
+
+ASM_CFLAGS = $(CFLAGS_BASE) $(LIB_OPT) $(TUNE_CFLAGS) $(ASM_ARCH_CFLAGS) -S -fverbose-asm
 ASM_OUT    = $(ASM_SRCS:.c=.S)
 
 asm: $(ASM_OUT)
@@ -437,6 +627,12 @@ clean:
 	rm -f src/*.profraw default.profdata
 	rm -f src/*.S
 	rm -rf output/*
+	rm -f $(GO_BINDING_DIR)/*.test $(GO_BINDING_DIR)/*.o
+	rm -f $(JAVA_BINDING_DIR)/*.dylib $(JAVA_BINDING_DIR)/*.so
+	rm -rf $(JAVA_BINDING_DIR)/classes
+	rm -rf $(RUST_BINDING_DIR)/target
+	rm -f $(PYTHON_BINDING_DIR)/*.dylib $(PYTHON_BINDING_DIR)/*.so
+	rm -rf $(PYTHON_BINDING_DIR)/funnelcake/__pycache__ $(PYTHON_BINDING_DIR)/__pycache__
 
 # --- Profile-Guided Optimization ---
 # Usage: make pgo [TUNE=znver2] [LTO=1]
@@ -449,6 +645,25 @@ clean:
 # `default.profraw` would be truncated by the second run, discarding the
 # bench data which is what we actually want to optimize for).
 pgo: pgo-clean
+ifeq ($(CC_FAMILY_IS_CLANG),1)
+	@command -v $(firstword $(LLVM_PROFDATA)) >/dev/null 2>&1 || { \
+	  echo ""; \
+	  echo "ERROR: clang PGO needs 'llvm-profdata' to merge profile data, but"; \
+	  echo "       '$(firstword $(LLVM_PROFDATA))' was not found in PATH."; \
+	  echo ""; \
+	  echo "  llvm-profdata ships in a separate package from clang on most distros:"; \
+	  echo "    Debian/Ubuntu : sudo apt install llvm$(LLVM_PKG_SUFFIX)   (or: llvm)"; \
+	  echo "    Fedora/RHEL   : sudo dnf install llvm"; \
+	  echo "    Arch          : sudo pacman -S llvm"; \
+	  echo "    openSUSE      : sudo zypper install llvm"; \
+	  echo "    macOS         : xcode-select --install   (or: brew install llvm)"; \
+	  echo ""; \
+	  echo "  Already installed under a versioned name? Point make at it:"; \
+	  echo "    make pgo LLVM_PROFDATA=llvm-profdata$(LLVM_PKG_SUFFIX)"; \
+	  echo ""; \
+	  exit 1; \
+	}
+endif
 	@echo "=== PGO Step 1: Compile with instrumentation ==="
 	$(MAKE) clean
 	$(MAKE) funnelcake_test LIB_OPT="-O3 -fprofile-generate" EXTRA_LDFLAGS="-fprofile-generate"
@@ -461,6 +676,14 @@ ifeq ($(CC_FAMILY_IS_CLANG),1)
 	    pgo-bench.profraw pgo-tests.profraw
 endif
 	@echo "=== PGO Step 3: Recompile library with profile data ==="
+ifeq ($(CC_FAMILY_IS_CLANG),1)
+	@echo "    NOTE: any \"annotated as a hot function but the profile is cold\""
+	@echo "    warnings below are expected and harmless.  They mean a SIMD kernel"
+	@echo "    for an instruction set this machine does not run (e.g. AVX2 on a"
+	@echo "    non-AVX2 CPU, or the scalar kernels on a machine that always uses"
+	@echo "    SIMD) was never exercised during profiling, so it has no profile"
+	@echo "    data.  Those kernels are still built correctly."
+endif
 	rm -f $(LIB_OBJS) libfunnelcake.a funnelcake_test
 	$(MAKE) funnelcake_test LIB_OPT="-O3 $(PGO_USE_FLAGS)"
 	@echo "=== PGO complete. Run 'make bench' to see results. ==="
@@ -477,11 +700,37 @@ src/kernels_scalar.o: src/kernels_scalar.c
 src/kernels_avx2.o: src/kernels_avx2.c
 	$(CC) $(LIB_CFLAGS) -mavx2 -c -o $@ $<
 
+src/tonemap_avx2.o: src/tonemap_avx2.c
+	$(CC) $(LIB_CFLAGS) -mavx2 -c -o $@ $<
+
+# AVX-512 kernels: $(AVX512_KERNEL_CFLAGS) is the probed flag set, or empty
+# when the compiler can't build AVX-512 (the files then self-stub).  These
+# rules use $(LIB_CFLAGS), so PGO's LIB_OPT override flows through them the
+# same as every other kernel.
+src/kernels_avx512.o: src/kernels_avx512.c
+	$(CC) $(LIB_CFLAGS) $(AVX512_KERNEL_CFLAGS) -c -o $@ $<
+
+src/kernels_hdr_avx512.o: src/kernels_hdr_avx512.c
+	$(CC) $(LIB_CFLAGS) $(AVX512_KERNEL_CFLAGS) -c -o $@ $<
+
+src/kernels_upscale_avx512.o: src/kernels_upscale_avx512.c
+	$(CC) $(LIB_CFLAGS) $(AVX512_KERNEL_CFLAGS) -c -o $@ $<
+
+src/tonemap_avx512.o: src/tonemap_avx512.c
+	$(CC) $(LIB_CFLAGS) $(AVX512_KERNEL_CFLAGS) -c -o $@ $<
+
 src/kernels_neon.o: src/kernels_neon.c
+	$(CC) $(LIB_CFLAGS) -c -o $@ $<
+
+src/tonemap_neon.o: src/tonemap_neon.c
 	$(CC) $(LIB_CFLAGS) -c -o $@ $<
 
 # Library source files use LIB_CFLAGS (O3)
 src/funnelcake.o: src/funnelcake.c
+	$(CC) $(LIB_CFLAGS) -c -o $@ $<
+
+# Binding helper surface (standalone utilities; not on any scaling path).
+src/bindings_support.o: src/bindings_support.c include/funnelcake_helpers.h include/funnelcake.h
 	$(CC) $(LIB_CFLAGS) -c -o $@ $<
 
 src/log.o: src/log.c
@@ -526,6 +775,9 @@ src/kernels_hdr_rvv.o: src/kernels_hdr_rvv.c
 	$(CC) $(LIB_CFLAGS) -march=rv64gcv -c -o $@ $<
 
 src/kernels_upscale_rvv.o: src/kernels_upscale_rvv.c
+	$(CC) $(LIB_CFLAGS) -march=rv64gcv -c -o $@ $<
+
+src/tonemap_rvv.o: src/tonemap_rvv.c
 	$(CC) $(LIB_CFLAGS) -march=rv64gcv -c -o $@ $<
 
 # Test source files use TEST_CFLAGS (O2)

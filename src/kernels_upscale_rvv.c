@@ -32,27 +32,11 @@
 /* --------------------------------------------------------------------------
  * Row-level RVV primitives
  *
- * (kernels_rvv.c declares static-inline equivalents for vavg_row_u8 and
- * vblend_2_1_row_u8.  Those are translation-unit-local, so we re-define
- * the ones we need here.  The compiler inlines both copies; the source
- * duplication is a few lines and the cost of pulling them into a shared
- * header isn't worth it for two small primitives.)
+ * These small helpers are TU-local static inlines; the compiler folds them
+ * straight into the plane loops below.  A few overlap in spirit with
+ * primitives in kernels_rvv.c, but static-inline visibility is per-TU, so the
+ * handful of lines is repeated here rather than shared through a header.
  * -------------------------------------------------------------------------- */
-
-/* Vertical pair-average: dst[x] = (a[x] + b[x] + 1) >> 1 */
-static inline void vavg_row_u8_up(const uint8_t *a, const uint8_t *b,
-                                  uint8_t *dst, size_t n)
-{
-    size_t x = 0;
-    while (x < n) {
-        size_t vl = __riscv_vsetvl_e8m1(n - x);
-        vuint8m1_t va = __riscv_vle8_v_u8m1(a + x, vl);
-        vuint8m1_t vb = __riscv_vle8_v_u8m1(b + x, vl);
-        vuint8m1_t vavg = fused_vaaddu_vv_u8m1(va, vb, vl);
-        __riscv_vse8_v_u8m1(dst + x, vavg, vl);
-        x += vl;
-    }
-}
 
 /* Bilinear vertical blend with 85/171 weights:
  *   dst[x] = (a[x] * 85 + b[x] * 171 + 128) >> 8
@@ -72,8 +56,7 @@ static inline void vblend_85_171_row_u8(const uint8_t *a, const uint8_t *b,
         vuint8m1_t vb = __riscv_vle8_v_u8m1(b + x, vl);
         vuint16m2_t s = __riscv_vwmulu_vx_u16m2(va, 85, vl);
         s = __riscv_vwmaccu_vx_u16m2(s, 171, vb, vl);
-        s = __riscv_vadd_vx_u16m2(s, 128, vl);
-        vuint8m1_t r = __riscv_vnsrl_wx_u8m1(s, 8, vl);
+        vuint8m1_t r = fused_vnclipu_wx_u8m1(s, 8, vl);
         __riscv_vse8_v_u8m1(dst + x, r, vl);
         x += vl;
     }
@@ -105,6 +88,41 @@ static inline void vup_h_2x_row_u8(const uint8_t *src, int w, uint8_t *dst)
     }
 }
 
+/* Odd output row of a 2x upscale - the row that lands halfway between two
+ * source rows.  It is built straight from cur and nxt so the vertical
+ * pair-average never has to land in memory:
+ *   dst[2i]   = avg(cur[i],   nxt[i])
+ *   dst[2i+1] = avg( avg(cur[i],   nxt[i]),
+ *                    avg(cur[i+1], nxt[i+1]) )
+ * The vertical average flows directly into the horizontal 2x as three cheap
+ * vaaddu passes, so the intermediate row is gone before it ever costs a store.
+ * The right edge replicates the last averaged sample, matching the rounding of
+ * vup_h_2x_row_u8 and the scalar reference.
+ */
+static inline void vup_2x_oddrow_u8(const uint8_t *cur, const uint8_t *nxt,
+                                    int w, uint8_t *dst)
+{
+    int main_n = w - 1;
+    int i = 0;
+    while (i < main_n) {
+        size_t vl = __riscv_vsetvl_e8m1(main_n - i);
+        vuint8m1_t ca = __riscv_vle8_v_u8m1(cur + i,     vl);
+        vuint8m1_t na = __riscv_vle8_v_u8m1(nxt + i,     vl);
+        vuint8m1_t cb = __riscv_vle8_v_u8m1(cur + i + 1, vl);
+        vuint8m1_t nb = __riscv_vle8_v_u8m1(nxt + i + 1, vl);
+        vuint8m1_t v0 = fused_vaaddu_vv_u8m1(ca, na, vl);   /* vertical avg at i   */
+        vuint8m1_t v1 = fused_vaaddu_vv_u8m1(cb, nb, vl);   /* vertical avg at i+1 */
+        vuint8m1_t h  = fused_vaaddu_vv_u8m1(v0, v1, vl);   /* horizontal blend    */
+        fused_store2_u8m1(dst + 2 * i, vl, v0, h);
+        i += vl;
+    }
+    if (w > 0) {
+        uint8_t s = (uint8_t)(((uint16_t)cur[w - 1] + nxt[w - 1] + 1) >> 1);
+        dst[2 * (w - 1) + 0] = s;
+        dst[2 * (w - 1) + 1] = s;
+    }
+}
+
 /* Horizontal 1.5x (2:3): w source pixels -> w*3/2 output pixels.
  *   dst[3i+0] = src[2i]
  *   dst[3i+1] = (src[2i]   * 85  + src[2i+1] * 171 + 128) >> 8
@@ -133,14 +151,12 @@ static inline void vup_h_1_5x_row_u8(const uint8_t *src, int w, uint8_t *dst)
         /* dst[3i+1] = (a*85 + b*171 + 128) >> 8 */
         vuint16m2_t s1 = __riscv_vwmulu_vx_u16m2(a, 85, vl);
         s1 = __riscv_vwmaccu_vx_u16m2(s1, 171, b, vl);
-        s1 = __riscv_vadd_vx_u16m2(s1, 128, vl);
-        vuint8m1_t r1 = __riscv_vnsrl_wx_u8m1(s1, 8, vl);
+        vuint8m1_t r1 = fused_vnclipu_wx_u8m1(s1, 8, vl);
 
         /* dst[3i+2] = (b*171 + c*85 + 128) >> 8 */
         vuint16m2_t s2 = __riscv_vwmulu_vx_u16m2(b, 171, vl);
         s2 = __riscv_vwmaccu_vx_u16m2(s2, 85, c, vl);
-        s2 = __riscv_vadd_vx_u16m2(s2, 128, vl);
-        vuint8m1_t r2 = __riscv_vnsrl_wx_u8m1(s2, 8, vl);
+        vuint8m1_t r2 = fused_vnclipu_wx_u8m1(s2, 8, vl);
 
         fused_store3_u8m1(dst + 3 * i, vl, a, r1, r2);
         i += vl;
@@ -162,19 +178,19 @@ static inline void vup_h_1_5x_row_u8(const uint8_t *src, int w, uint8_t *dst)
  * Plane-level upscales
  * -------------------------------------------------------------------------- */
 
-/* 2x plane upscale: src (sw x sh) -> dst (2sw x 2sh). */
+/* 2x plane upscale: src (sw x sh) -> dst (2sw x 2sh).  Each source row yields
+ * two output rows: the even one is a plain horizontal 2x of the row itself, the
+ * odd one blends into the next row vertically and horizontally in a single
+ * fused pass (vup_2x_oddrow_u8), so no per-row scratch is needed. */
 static void vup_2x_plane_u8(const uint8_t *src, int sw, int sh,
-                            int sstride, uint8_t *dst, int dstride,
-                            uint8_t *scratch)
+                            int sstride, uint8_t *dst, int dstride)
 {
-    if (!scratch) return;
     for (int i = 0; i < sh; i++) {
         const uint8_t *cur = src + (size_t)i * sstride;
         const uint8_t *nxt = (i + 1 < sh) ? src + (size_t)(i + 1) * sstride
                                           : cur;
         vup_h_2x_row_u8(cur, sw, dst + (size_t)(2 * i) * dstride);
-        vavg_row_u8_up(cur, nxt, scratch, (size_t)sw);
-        vup_h_2x_row_u8(scratch, sw, dst + (size_t)(2 * i + 1) * dstride);
+        vup_2x_oddrow_u8(cur, nxt, sw, dst + (size_t)(2 * i + 1) * dstride);
     }
 }
 
@@ -227,8 +243,7 @@ static void upscale_plane_rvv(const fused_kernel_params_t *p,
                                    : p->up_out[FUSED_UP_IDX_2X].plane_v;
             dst_stride = p->up_out[FUSED_UP_IDX_2X].uv_stride;
         }
-        if (dst) vup_2x_plane_u8(src, sw, sh, sstride, dst, dst_stride,
-                                 p->upscale_scratch);
+        if (dst) vup_2x_plane_u8(src, sw, sh, sstride, dst, dst_stride);
     }
 
     /* Levels 1..N-1: up_out[k-1] -> up_out[k] */
@@ -255,7 +270,7 @@ static void upscale_plane_rvv(const fused_kernel_params_t *p,
         }
         if (src_up && dst) {
             vup_2x_plane_u8(src_up, src_up_w, src_up_h, src_up_stride,
-                            dst, dst_stride, p->upscale_scratch);
+                            dst, dst_stride);
         }
     }
 
@@ -352,27 +367,9 @@ void fused_kernel_pow2_up_rvv(const fused_kernel_params_t *p,
  * elements with vsetvl_e16m1.  The blend helper uses u32-widened
  * multiplies because 10-bit values multiplied by 171 overflow u16.
  *
- * P010/P210 chroma is NOT deinterleaved here.  The scalar HDR upscale
- * doesn't handle it either (no current test exercises P010 with upscale
- * active); matching the existing behaviour rather than silently changing
- * it.
+ * P010/P210 chroma is deinterleaved into the persistent planar temp buffers
+ * before the U/V upscale passes, matching the HDR downscale entry points.
  * -------------------------------------------------------------------------- */
-
-/* Vertical pair-average for u16 - TU-local equivalent of the one in
- * kernels_hdr_rvv.c since static-inline visibility is per-TU. */
-static inline void vavg_row_u16_up(const uint16_t *a, const uint16_t *b,
-                                   uint16_t *dst, size_t n)
-{
-    size_t x = 0;
-    while (x < n) {
-        size_t vl = __riscv_vsetvl_e16m1(n - x);
-        vuint16m1_t va = __riscv_vle16_v_u16m1(a + x, vl);
-        vuint16m1_t vb = __riscv_vle16_v_u16m1(b + x, vl);
-        vuint16m1_t vavg = fused_vaaddu_vv_u16m1(va, vb, vl);
-        __riscv_vse16_v_u16m1(dst + x, vavg, vl);
-        x += vl;
-    }
-}
 
 /* Bilinear vertical blend with 85/171 weights for u16:
  *   dst[x] = (a[x] * 85 + b[x] * 171 + 128) >> 8
@@ -387,8 +384,7 @@ static inline void vblend_85_171_row_u16(const uint16_t *a, const uint16_t *b,
         vuint16m1_t vb = __riscv_vle16_v_u16m1(b + x, vl);
         vuint32m2_t s = __riscv_vwmulu_vx_u32m2(va, 85, vl);
         s = __riscv_vwmaccu_vx_u32m2(s, 171, vb, vl);
-        s = __riscv_vadd_vx_u32m2(s, 128, vl);
-        vuint16m1_t r = __riscv_vnsrl_wx_u16m1(s, 8, vl);
+        vuint16m1_t r = fused_vnclipu_wx_u16m1(s, 8, vl);
         __riscv_vse16_v_u16m1(dst + x, r, vl);
         x += vl;
     }
@@ -416,6 +412,38 @@ static inline void vup_h_2x_row_u16(const uint16_t *src, int w, uint16_t *dst)
     }
 }
 
+/* Odd output row of a 2x upscale, u16 - twin of vup_2x_oddrow_u8.  The vertical
+ * pair-average of cur and nxt feeds straight into the horizontal 2x, so the
+ * halfway row is produced without staging it in memory:
+ *   dst[2i]   = avg(cur[i],   nxt[i])
+ *   dst[2i+1] = avg( avg(cur[i],   nxt[i]),
+ *                    avg(cur[i+1], nxt[i+1]) )
+ * 10-bit samples leave plenty of headroom in u16, so the averages stay in
+ * u16m1 the whole way. */
+static inline void vup_2x_oddrow_u16(const uint16_t *cur, const uint16_t *nxt,
+                                     int w, uint16_t *dst)
+{
+    int main_n = w - 1;
+    int i = 0;
+    while (i < main_n) {
+        size_t vl = __riscv_vsetvl_e16m1(main_n - i);
+        vuint16m1_t ca = __riscv_vle16_v_u16m1(cur + i,     vl);
+        vuint16m1_t na = __riscv_vle16_v_u16m1(nxt + i,     vl);
+        vuint16m1_t cb = __riscv_vle16_v_u16m1(cur + i + 1, vl);
+        vuint16m1_t nb = __riscv_vle16_v_u16m1(nxt + i + 1, vl);
+        vuint16m1_t v0 = fused_vaaddu_vv_u16m1(ca, na, vl);   /* vertical avg at i   */
+        vuint16m1_t v1 = fused_vaaddu_vv_u16m1(cb, nb, vl);   /* vertical avg at i+1 */
+        vuint16m1_t h  = fused_vaaddu_vv_u16m1(v0, v1, vl);   /* horizontal blend    */
+        fused_store2_u16m1(dst + 2 * i, vl, v0, h);
+        i += vl;
+    }
+    if (w > 0) {
+        uint16_t s = (uint16_t)(((uint32_t)cur[w - 1] + nxt[w - 1] + 1) >> 1);
+        dst[2 * (w - 1) + 0] = s;
+        dst[2 * (w - 1) + 1] = s;
+    }
+}
+
 /* Horizontal 1.5x (2:3) for u16:
  *   dst[3i+0] = src[2i]
  *   dst[3i+1] = (src[2i]   * 85  + src[2i+1] * 171 + 128) >> 8
@@ -437,13 +465,11 @@ static inline void vup_h_1_5x_row_u16(const uint16_t *src, int w, uint16_t *dst)
 
         vuint32m2_t s1 = __riscv_vwmulu_vx_u32m2(a, 85, vl);
         s1 = __riscv_vwmaccu_vx_u32m2(s1, 171, b, vl);
-        s1 = __riscv_vadd_vx_u32m2(s1, 128, vl);
-        vuint16m1_t r1 = __riscv_vnsrl_wx_u16m1(s1, 8, vl);
+        vuint16m1_t r1 = fused_vnclipu_wx_u16m1(s1, 8, vl);
 
         vuint32m2_t s2 = __riscv_vwmulu_vx_u32m2(b, 171, vl);
         s2 = __riscv_vwmaccu_vx_u32m2(s2, 85, c, vl);
-        s2 = __riscv_vadd_vx_u32m2(s2, 128, vl);
-        vuint16m1_t r2 = __riscv_vnsrl_wx_u16m1(s2, 8, vl);
+        vuint16m1_t r2 = fused_vnclipu_wx_u16m1(s2, 8, vl);
 
         fused_store3_u16m1(dst + 3 * i, vl, a, r1, r2);
         i += vl;
@@ -461,19 +487,18 @@ static inline void vup_h_1_5x_row_u16(const uint16_t *src, int w, uint16_t *dst)
     }
 }
 
-/* 2x plane upscale for u16. */
+/* 2x plane upscale for u16.  Even output row is a horizontal 2x of the source
+ * row; the odd row is the fused vertical+horizontal blend into the next row,
+ * so no per-row scratch is needed. */
 static void vup_2x_plane_u16(const uint16_t *src, int sw, int sh,
-                             int sstride_el, uint16_t *dst, int dstride_el,
-                             uint16_t *scratch)
+                             int sstride_el, uint16_t *dst, int dstride_el)
 {
-    if (!scratch) return;
     for (int i = 0; i < sh; i++) {
         const uint16_t *cur = src + (size_t)i * sstride_el;
         const uint16_t *nxt = (i + 1 < sh) ? src + (size_t)(i + 1) * sstride_el
                                            : cur;
         vup_h_2x_row_u16(cur, sw, dst + (size_t)(2 * i) * dstride_el);
-        vavg_row_u16_up(cur, nxt, scratch, (size_t)sw);
-        vup_h_2x_row_u16(scratch, sw, dst + (size_t)(2 * i + 1) * dstride_el);
+        vup_2x_oddrow_u16(cur, nxt, sw, dst + (size_t)(2 * i + 1) * dstride_el);
     }
 }
 
@@ -520,8 +545,7 @@ static void upscale_plane_hdr_rvv(const fused_hdr_kernel_params_t *p,
                                    : p->hdr_up_out[FUSED_UP_IDX_2X].plane_v;
             dst_el_stride = p->hdr_up_out[FUSED_UP_IDX_2X].uv_stride / (int)sizeof(uint16_t);
         }
-        if (dst) vup_2x_plane_u16(src, sw, sh, sstride_el, dst, dst_el_stride,
-                                  p->upscale_scratch_hdr);
+        if (dst) vup_2x_plane_u16(src, sw, sh, sstride_el, dst, dst_el_stride);
     }
 
     for (int k = 1; k < N; k++) {
@@ -547,7 +571,7 @@ static void upscale_plane_hdr_rvv(const fused_hdr_kernel_params_t *p,
         }
         if (src_up && dst) {
             vup_2x_plane_u16(src_up, src_up_w, src_up_h, src_up_el_stride,
-                             dst, dst_el_stride, p->upscale_scratch_hdr);
+                             dst, dst_el_stride);
         }
     }
 
@@ -598,12 +622,23 @@ void fused_kernel_upscale_hdr_rvv(const fused_hdr_kernel_params_t *p,
 {
     FUSED_RVV_SET_VXRM_RNU();
 
+    const uint16_t *up_src_u = src_u;
+    const uint16_t *up_src_v = src_v;
+    int up_src_uv_el_stride = p->src_uv_el_stride;
+
+    if (p->is_p010) {
+        if (fused_hdr_deinterleave_p010(p, src_u) != 0) return;
+        up_src_u = p->p010_tmp_u;
+        up_src_v = p->p010_tmp_v;
+        up_src_uv_el_stride = p->p010_tmp_stride / (int)sizeof(uint16_t);
+    }
+
     upscale_plane_hdr_rvv(p, src_y, p->src_width, p->src_height,
                           p->src_y_el_stride, 0);
-    upscale_plane_hdr_rvv(p, src_u, p->src_width / 2, p->src_height / 2,
-                          p->src_uv_el_stride, 1);
-    upscale_plane_hdr_rvv(p, src_v, p->src_width / 2, p->src_height / 2,
-                          p->src_uv_el_stride, 2);
+    upscale_plane_hdr_rvv(p, up_src_u, p->src_width / 2, p->src_height / 2,
+                          up_src_uv_el_stride, 1);
+    upscale_plane_hdr_rvv(p, up_src_v, p->src_width / 2, p->src_height / 2,
+                          up_src_uv_el_stride, 2);
 }
 
 void fused_kernel_thirds_up_hdr_rvv(const fused_hdr_kernel_params_t *p,

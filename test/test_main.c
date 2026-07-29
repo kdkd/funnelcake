@@ -5,10 +5,172 @@
  * See LICENSE.md in the project root for full license text.
  */
 
+/* sysctlbyname needs the BSD types that strict _POSIX_C_SOURCE hides */
+#if defined(__APPLE__)
+#define _DARWIN_C_SOURCE 1
+#endif
+
 #include "test_main.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+
+#include "detect.h"
+
+#include <sys/utsname.h>
+
+#if defined(__x86_64__)
+#include <cpuid.h>
+int fused_avx512_compiled(void);   /* internal.h pulls too much in here */
+#endif
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
+
+/* --------------------------------------------------------------------------
+ * Benchmark system info header (best effort, no exotic OS hooks)
+ * -------------------------------------------------------------------------- */
+
+static void bench_rtrim(char *s)
+{
+    size_t n = strlen(s);
+    while (n > 0 && (s[n - 1] == ' ' || s[n - 1] == '\t' || s[n - 1] == '\n'))
+        s[--n] = '\0';
+}
+
+static void bench_cpu_name(char *out, size_t out_size)
+{
+    snprintf(out, out_size, "unknown");
+
+#if defined(__x86_64__)
+    /* CPUID brand string - works on any OS */
+    unsigned int a, b, c, d;
+    if (__get_cpuid(0x80000000u, &a, &b, &c, &d) && a >= 0x80000004u) {
+        char brand[49];
+        unsigned int *p = (unsigned int *)brand;
+        for (unsigned int leaf = 0; leaf < 3; leaf++) {
+            __get_cpuid(0x80000002u + leaf, &a, &b, &c, &d);
+            *p++ = a; *p++ = b; *p++ = c; *p++ = d;
+        }
+        brand[48] = '\0';
+        const char *s = brand;
+        while (*s == ' ') s++;
+        snprintf(out, out_size, "%s", s);
+        return;
+    }
+#elif defined(__APPLE__)
+    size_t len = out_size;
+    if (sysctlbyname("machdep.cpu.brand_string", out, &len, NULL, 0) == 0)
+        return;
+    snprintf(out, out_size, "unknown");
+#elif defined(__linux__)
+    /* "model name" covers riscv and some arm; "Hardware" some others */
+    FILE *f = fopen("/proc/cpuinfo", "r");
+    if (f) {
+        char line[256];
+        while (fgets(line, sizeof(line), f)) {
+            if (strncmp(line, "model name", 10) == 0 ||
+                strncmp(line, "Hardware", 8) == 0) {
+                const char *colon = strchr(line, ':');
+                if (colon) {
+                    colon++;
+                    while (*colon == ' ' || *colon == '\t') colon++;
+                    snprintf(out, out_size, "%s", colon);
+                    out[strcspn(out, "\n")] = '\0';
+                    fclose(f);
+                    return;
+                }
+            }
+        }
+        fclose(f);
+    }
+    /* Board name beats "unknown" (e.g. Raspberry Pi, Orange Pi) */
+    f = fopen("/proc/device-tree/model", "r");
+    if (f) {
+        size_t n = fread(out, 1, out_size - 1, f);
+        out[n] = '\0';
+        fclose(f);
+        if (n > 0) return;
+        snprintf(out, out_size, "unknown");
+    }
+#endif
+}
+
+static void print_bench_system_info(void)
+{
+#if defined(__x86_64__)
+    const char *platform = "x86_64";
+#elif defined(__aarch64__)
+    const char *platform = "aarch64";
+#elif defined(__riscv) && (__riscv_xlen == 64)
+    const char *platform = "riscv64";
+#else
+    const char *platform = "unknown";
+#endif
+
+    char cpu[256];
+    bench_cpu_name(cpu, sizeof(cpu));
+    bench_rtrim(cpu);   /* CPUID brand strings carry trailing padding */
+
+    /* OS: uname is POSIX; prefer the friendlier names where one file
+     * read or sysctl gets them. */
+    char os[256] = "unknown";
+    struct utsname un;
+    if (uname(&un) == 0)
+        snprintf(os, sizeof(os), "%s %s", un.sysname, un.release);
+#if defined(__APPLE__)
+    {
+        char ver[64];
+        size_t len = sizeof(ver);
+        if (sysctlbyname("kern.osproductversion", ver, &len, NULL, 0) == 0)
+            snprintf(os, sizeof(os), "macOS %s", ver);
+    }
+#elif defined(__linux__)
+    {
+        FILE *f = fopen("/etc/os-release", "r");
+        if (f) {
+            char line[256];
+            while (fgets(line, sizeof(line), f)) {
+                if (strncmp(line, "PRETTY_NAME=\"", 13) == 0) {
+                    char *val = line + 13;
+                    val[strcspn(val, "\"")] = '\0';
+                    snprintf(os, sizeof(os), "%.180s (%.64s)", val,
+                             uname(&un) == 0 ? un.release : "?");
+                    break;
+                }
+            }
+            fclose(f);
+        }
+    }
+#endif
+
+    /* Compiler: compile-time macros, so this reports whatever built the
+     * test binary (and the library - they build together). */
+#if defined(__clang__)
+    const char *cc_name = "clang " __clang_version__;
+#elif defined(__GNUC__)
+    const char *cc_name = "gcc " __VERSION__;
+#else
+    const char *cc_name = "unknown";
+#endif
+
+    /* Mirrors the dispatchers' kernel selection (env overrides like
+     * FUNNELCAKE_FORCE_SCALAR / FUNNELCAKE_NO_AVX512 are reflected
+     * because they act on the caps themselves). */
+    const fused_cpu_caps_t *caps = fused_detect_cpu();
+    const char *kernels = "scalar";
+#if defined(__x86_64__)
+    if (caps->has_avx512 && fused_avx512_compiled()) kernels = "AVX-512";
+    else if (caps->has_avx2)                         kernels = "AVX2";
+#elif defined(__aarch64__)
+    if (caps->has_neon) kernels = "NEON";
+#elif defined(__riscv) && (__riscv_xlen == 64)
+    if (caps->has_rvv) kernels = "RVV";
+#endif
+
+    printf("Platform: %s | CPU: %s | Kernels: %s\n", platform, cpu, kernels);
+    printf("OS: %s | Compiler: %s\n", os, cc_name);
+}
 
 /* --------------------------------------------------------------------------
  * Global test results
@@ -101,6 +263,8 @@ int main(int argc, char *argv[])
                 opts.bench_filter = argv[i + 1];
                 i++;
             }
+        } else if (strcmp(argv[i], "--skip-bench-swscale") == 0) {
+            opts.skip_bench_swscale = 1;
         } else if (strcmp(argv[i], "--visual") == 0) {
             opts.run_visual = 1;
         }
@@ -126,21 +290,31 @@ int main(int argc, char *argv[])
         printf("\n=== HDR Correctness tests ===\n");
         run_hdr_correctness_tests();
 
+        printf("\n=== Tone mapping tests ===\n");
+        run_tonemap_tests();
+
         printf("\n=== Parity tests (scalar vs SIMD) ===\n");
         run_parity_tests();
+    }
+
+    if (opts.run_bench || opts.run_bench_sdr || opts.run_bench_hdr ||
+        opts.run_bench_swscale) {
+        print_bench_system_info();
     }
 
     if (opts.run_bench || opts.run_bench_sdr) {
         printf("\n=== SDR Benchmarks ===\n\n");
         run_bench_tests(opts.bench_filter);
 
-        printf("\n=== libswscale Comparison ===\n\n");
-        run_swscale_bench_tests(opts.bench_filter);
+        if (!opts.skip_bench_swscale) {
+            printf("\n=== libswscale Comparison ===\n\n");
+            run_swscale_bench_tests(opts.bench_filter);
 
-        print_bench_comparison_table();
+            print_bench_comparison_table();
+        }
     }
 
-    if (opts.run_bench_swscale) {
+    if (opts.run_bench_swscale && !opts.skip_bench_swscale) {
         printf("\n=== libswscale Comparison ===\n\n");
         run_swscale_bench_tests(opts.bench_filter);
     }

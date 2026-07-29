@@ -74,6 +74,7 @@ function New-PackageDir {
     New-Item -ItemType Directory -Path (Join-Path $dest 'include') -Force | Out-Null
     Copy-Item $LibraryPath (Join-Path $dest $LibraryName)
     Copy-Item (Join-Path $RepoRoot 'include\funnelcake.h') (Join-Path $dest 'include')
+    Copy-Item (Join-Path $RepoRoot 'include\funnelcake_helpers.h') (Join-Path $dest 'include')
     Copy-Item (Join-Path $RepoRoot 'README.md')  $dest
     Copy-Item (Join-Path $RepoRoot 'INSTALL.md') $dest
 
@@ -146,7 +147,8 @@ function Invoke-MsvcBuild {
         'src\kernels_scalar.c',
         'src\kernels_hdr_scalar.c',
         'src\tonemap.c',
-        'src\kernels_upscale_scalar.c'
+        'src\kernels_upscale_scalar.c',
+        'src\bindings_support.c'
     )
 
     if (-not (Test-Tool 'cl') -or -not (Test-Tool 'lib')) {
@@ -158,6 +160,15 @@ function Invoke-MsvcBuild {
     if ($arch -eq 'unknown') {
         Write-Host '==> Skipping MSVC: unable to determine Visual Studio target architecture'
         return
+    }
+
+    if ($arch -eq 'arm64') {
+        $commonSources += @(
+            'src\kernels_neon.c',
+            'src\kernels_hdr_neon.c',
+            'src\kernels_upscale_neon.c',
+            'src\tonemap_neon.c'
+        )
     }
 
     $package    = "funnelcake-windows-msvc-$arch"

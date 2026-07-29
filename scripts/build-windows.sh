@@ -92,6 +92,7 @@ make_package_dir() {
   mkdir -p "${DIST_DIR}/${package_dir}/include"
   cp "${library_path}" "${DIST_DIR}/${package_dir}/${library_name}"
   cp "${REPO_ROOT}/include/funnelcake.h" "${DIST_DIR}/${package_dir}/include/"
+  cp "${REPO_ROOT}/include/funnelcake_helpers.h" "${DIST_DIR}/${package_dir}/include/"
   cp "${REPO_ROOT}/README.md" "${REPO_ROOT}/INSTALL.md" "${DIST_DIR}/${package_dir}/"
 
   {
@@ -175,6 +176,7 @@ build_windows_msvc() {
     src/kernels_hdr_scalar.c
     src/tonemap.c
     src/kernels_upscale_scalar.c
+    src/bindings_support.c
   )
 
   if ! have_tool cl || ! have_tool lib; then
@@ -186,6 +188,15 @@ build_windows_msvc() {
   if [ "${arch}" = "unknown" ]; then
     echo "==> Skipping MSVC: unable to determine Visual Studio target architecture"
     return 0
+  fi
+
+  if [ "${arch}" = "arm64" ]; then
+    common_sources+=(
+      src/kernels_neon.c
+      src/kernels_hdr_neon.c
+      src/kernels_upscale_neon.c
+      src/tonemap_neon.c
+    )
   fi
 
   package_dir="funnelcake-windows-msvc-${arch}"

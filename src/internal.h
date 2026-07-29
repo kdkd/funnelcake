@@ -48,10 +48,12 @@ static inline void fused_aligned_free(void *ptr)
  * the Windows ARM64 build) needs equivalents.
  * -------------------------------------------------------------------------- */
 #if defined(__GNUC__) || defined(__clang__)
-#  define FUSED_HOT          __attribute__((hot))
-#  define FUSED_PREFETCH(p)  __builtin_prefetch(p)
+#  define FUSED_HOT           __attribute__((hot))
+#  define FUSED_ALWAYS_INLINE __attribute__((always_inline))
+#  define FUSED_PREFETCH(p)   __builtin_prefetch(p)
 #else
 #  define FUSED_HOT
+#  define FUSED_ALWAYS_INLINE
 #  if defined(_M_ARM64) || defined(_M_ARM64EC)
 #    include <intrin.h>
 #    define FUSED_PREFETCH(p) __prefetch((const void *)(p))
@@ -75,13 +77,13 @@ static inline void fused_aligned_free(void *ptr)
  * waste memory if rounded up to a 2 MB huge page. */
 #define FUSED_THP_HINT_THRESHOLD ((size_t)(2 * 1024 * 1024))
 
-/* posix_memalign + size-gated MADV_HUGEPAGE hint.  The madvise call is
- * a hint: kernels with transparent_hugepage=never silently ignore it,
- * and on non-Linux platforms the call is compiled out entirely.  The
- * underlying allocation is a normal heap pointer that free()s normally. */
+/* Portable aligned allocation + size-gated MADV_HUGEPAGE hint.  The madvise
+ * call is a hint: kernels with transparent_hugepage=never silently ignore it,
+ * and on non-Linux platforms the call is compiled out entirely.  Release the
+ * resulting pointer with fused_aligned_free(). */
 static inline int fused_alloc_aligned(void **out, size_t alignment, size_t size)
 {
-    int rc = posix_memalign(out, alignment, size);
+    int rc = fused_aligned_alloc(out, alignment, size);
     if (rc != 0) return rc;
 #if defined(__linux__) && defined(MADV_HUGEPAGE)
     if (size >= FUSED_THP_HINT_THRESHOLD) {
@@ -200,6 +202,14 @@ typedef struct {
      * sequentially.  NULL if no upscale is active. */
     uint8_t *upscale_scratch;
 
+    /* Second persistent scratch row, the same width as upscale_scratch and
+     * carved from the same allocation (points one aligned row past it).  The
+     * scalar 2x upscale expands each row in two auto-vectorizable passes -
+     * one writes horizontal midpoints here, the other interleaves them with
+     * the source row - which needs a temp distinct from upscale_scratch (the
+     * vertical-blend row).  NULL if no upscale is active. */
+    uint8_t *upscale_scratch2;
+
     /* Scratch pool for downscale kernels.  Allocated once at init and
      * sized to the max bytes the selected kernel family needs for its
      * internal vertical-cascade / horizontal-cascade buffers.  Kernels
@@ -270,6 +280,25 @@ void fused_kernel_pow2_avx2(const fused_kernel_params_t *p,
                              const uint8_t *src_y,
                              const uint8_t *src_u,
                              const uint8_t *src_v);
+
+/* AVX-512 (x86_64 only).  These symbols always exist on x86_64: when the
+ * compiler can't build real AVX-512 code the kernels_*_avx512.c files
+ * compile self-stubbed delegations to the AVX2 kernels instead.  Dispatch
+ * must gate on fused_avx512_compiled() && caps->has_avx512 so the stubs
+ * are never selected.  Entry points not yet ported to 512-bit also
+ * delegate to AVX2 internally - the swap to the avx512 table is always
+ * safe. */
+int fused_avx512_compiled(void);
+
+void fused_kernel_thirds_avx512(const fused_kernel_params_t *p,
+                                const uint8_t *src_y,
+                                const uint8_t *src_u,
+                                const uint8_t *src_v);
+
+void fused_kernel_pow2_avx512(const fused_kernel_params_t *p,
+                              const uint8_t *src_y,
+                              const uint8_t *src_u,
+                              const uint8_t *src_v);
 #endif /* __x86_64__ */
 
 #if defined(__aarch64__) || defined(_M_ARM64)
@@ -340,6 +369,21 @@ void fused_kernel_pow2_up_avx2(const fused_kernel_params_t *p,
                                const uint8_t *src_y,
                                const uint8_t *src_u,
                                const uint8_t *src_v);
+
+void fused_kernel_upscale_avx512(const fused_kernel_params_t *p,
+                                 const uint8_t *src_y,
+                                 const uint8_t *src_u,
+                                 const uint8_t *src_v);
+
+void fused_kernel_thirds_up_avx512(const fused_kernel_params_t *p,
+                                   const uint8_t *src_y,
+                                   const uint8_t *src_u,
+                                   const uint8_t *src_v);
+
+void fused_kernel_pow2_up_avx512(const fused_kernel_params_t *p,
+                                 const uint8_t *src_y,
+                                 const uint8_t *src_u,
+                                 const uint8_t *src_v);
 #endif /* __x86_64__ */
 
 #if defined(__aarch64__) || defined(_M_ARM64)
@@ -455,12 +499,44 @@ typedef struct {
      * Same semantics as the SDR upscale_scratch above. */
     uint16_t *upscale_scratch_hdr;
 
+    /* Second HDR scratch row carved from the same allocation as
+     * upscale_scratch_hdr.  See upscale_scratch2 in fused_kernel_params_t
+     * for rationale (two-pass 2x interleave). NULL if no upscale active. */
+    uint16_t *upscale_scratch_hdr2;
+
     /* Scratch pool for HDR downscale kernels.  See fused_kernel_params_t
      * for rationale.  Sized in bytes; kernels cast to uint16_t* and use
      * offset arithmetic for their sub-buffers. */
     uint8_t *scratch_pool;
     size_t   scratch_pool_size;
 } fused_hdr_kernel_params_t;
+
+/* Deinterleave the effective P010/P210 chroma region into the persistent
+ * planar temp buffers allocated by fused_hdr_init.  For P210, src_uv_el_stride
+ * has already been doubled by init so this naturally skips every other chroma
+ * row while producing a 4:2:0 planar temp. */
+static inline int fused_hdr_deinterleave_p010(const fused_hdr_kernel_params_t *p,
+                                              const uint16_t *src_uv)
+{
+    if (!p->is_p010) return 0;
+    if (!src_uv || !p->p010_tmp_u || !p->p010_tmp_v) return -1;
+
+    int chroma_w = p->src_width / 2;
+    int chroma_h = p->src_height / 2;
+    int planar_el_stride = p->p010_tmp_stride / (int)sizeof(uint16_t);
+
+    for (int y = 0; y < chroma_h; y++) {
+        const uint16_t *row = src_uv + (size_t)y * (size_t)p->src_uv_el_stride;
+        uint16_t *u_row = p->p010_tmp_u + (size_t)y * (size_t)planar_el_stride;
+        uint16_t *v_row = p->p010_tmp_v + (size_t)y * (size_t)planar_el_stride;
+        for (int x = 0; x < chroma_w; x++) {
+            u_row[x] = row[2 * x];
+            v_row[x] = row[2 * x + 1];
+        }
+    }
+
+    return 0;
+}
 
 
 /* --------------------------------------------------------------------------
@@ -489,21 +565,57 @@ typedef struct {
 
     /* Tone mapping LUTs - generated at init from transfer + curve config.
      *
-     * lut_y: 10-bit PQ/HLG input -> 8-bit BT.709 gamma output (1024 entries).
-     *   Used by the luma pass for fast per-pixel tone mapping.
+     * All color science (EOTF, tone curve, SDR OETF, range handling) is
+     * compiled into pq_to_sdr at init.  Per-pixel work is then three
+     * saturating adds and three byte lookups - no floats anywhere.
      *
-     * pq_to_linear: 10-bit PQ code -> linear luminance as float [0, 1]
-     *   where 1.0 = 10000 nits.  Used by the chroma pass to reconstruct
-     *   linear-light R, G, B from YCbCr for correct gamut mapping.
+     * lut_y: 10-bit code -> 8-bit SDR output (1024 entries).  For built-in
+     *   curves this is a copy of pq_to_sdr; for FUSED_TONEMAP_CUSTOM it is
+     *   the caller's LUT.  Used by the custom-LUT luma pass.
      *
-     * linear_to_sdr: linear luminance [0, 1] quantized to 12 bits -> 8-bit
-     *   SDR gamma output.  Incorporates tone curve + BT.709 OETF.
-     *   Indexed by (linear_value * 4095).  Used by the chroma pass to
-     *   tone-map the reconstructed R, G, B channels individually.
+     * pq_to_sdr: 10-bit PQ/HLG code -> 8-bit tone-mapped SDR gamma output.
+     *   Applied per channel: gamma-domain R', G', B' (each Y' + a chroma
+     *   delta, below) index this one shared table.  Per-channel tone
+     *   mapping through one monotonic LUT in PQ space is equivalent to
+     *   per-channel in linear space, and PQ indexing is perceptually
+     *   uniform so shadow resolution is preserved by construction.
+     *
+     * pq_*_delta: per-chroma-sample offsets in Y'-code units, from the
+     *   BT.2020 NCL inverse in the gamma domain:
+     *     R' = Y' + 1.4746*Cr            -> pq_r_delta[Cr]
+     *     B' = Y' + 1.8814*Cb            -> pq_b_delta[Cb]
+     *     G' = (Y' - Kr*R' - Kb*B')/Kg
+     *        = Y' - (Kr*1.4746*Cr + Kb*1.8814*Cb)/Kg
+     *                                    -> pq_g_delta_cr[Cr] + pq_g_delta_cb[Cb]
+     *   (using 1 - Kr - Kb = Kg).  Limited/full range scaling between the
+     *   chroma and luma code domains is folded in at init.
      */
     uint8_t  lut_y[1024];
-    float    pq_to_linear[1024];    /* PQ code -> linear [0,1] */
-    uint8_t  linear_to_sdr[4096];   /* linear 12-bit -> 8-bit SDR gamma */
+    uint8_t  pq_to_sdr[1024];       /* PQ/HLG code -> tone-mapped SDR */
+    int16_t  pq_r_delta[1024];      /* Cr code -> R' offset from Y' */
+    int16_t  pq_b_delta[1024];      /* Cb code -> B' offset from Y' */
+    int16_t  pq_g_delta_cr[1024];   /* Cr code -> G' offset contribution */
+    int16_t  pq_g_delta_cb[1024];   /* Cb code -> G' offset contribution */
+
+    /* Q10 coefficients defining the delta tables:
+     *   pq_*_delta[i] = (int16_t)(((i - 512) * coef + (1 << 9)) >> 10)
+     * SIMD kernels evaluate this exact integer form arithmetically
+     * instead of gathering from the tables, so the coefficients are the
+     * single source of truth for scalar/SIMD bit-exactness.  Q10 keeps
+     * every coefficient inside int16, so the kernels evaluate the form
+     * as one 16-bit rounding multiply-high of (x << 5):
+     *   pmulhrsw / vqrdmulh / vsmul@RNU == ((x*32)*coef + 16384) >> 15. */
+    int32_t  delta_coef_r;
+    int32_t  delta_coef_b;
+    int32_t  delta_coef_g_cr;
+    int32_t  delta_coef_g_cb;
+
+    /* SDR YCbCr re-encode constants, derived from dst_range at init.
+     * cb/cr_out_scale are 8.8 fixed point. */
+    int      cb_out_scale;
+    int      cr_out_scale;
+    int      chroma_out_min;
+    int      chroma_out_max;
 
     /* Temp 10-bit buffers for SDR-only outputs (no HDR output requested
      * at that step, but we need a 10-bit intermediate to tone map from).
@@ -513,6 +625,13 @@ typedef struct {
     /* Which outputs need tone mapping after scaling */
     uint32_t sdr_flags;
     int      tonemap_1x;
+
+    /* Achieved SDR upscale copies: bit k = pow2 level k (2^(k+1) x
+     * enlargement), bit FUSED_UP_IDX_TAIL = the 1.5x tail.  The run loop
+     * tone-maps upscale_hdr_outputs[k] into upscale_sdr_outputs[k] for
+     * each set bit. */
+    uint32_t upscale_sdr_levels;
+
     int      is_custom_lut;  /* 1 if using FUSED_TONEMAP_CUSTOM (skip RGB chroma path) */
     int      src_misaligned_warned; /* per-context one-shot flag for run() */
 } fused_hdr_internal_t;
@@ -544,6 +663,16 @@ void fused_kernel_pow2_hdr_avx2(const fused_hdr_kernel_params_t *p,
                                  const uint16_t *src_y,
                                  const uint16_t *src_u,
                                  const uint16_t *src_v);
+
+void fused_kernel_thirds_hdr_avx512(const fused_hdr_kernel_params_t *p,
+                                    const uint16_t *src_y,
+                                    const uint16_t *src_u,
+                                    const uint16_t *src_v);
+
+void fused_kernel_pow2_hdr_avx512(const fused_hdr_kernel_params_t *p,
+                                  const uint16_t *src_y,
+                                  const uint16_t *src_u,
+                                  const uint16_t *src_v);
 #endif /* __x86_64__ */
 
 #if defined(__aarch64__) || defined(_M_ARM64)
@@ -598,6 +727,15 @@ void fused_kernel_upscale_hdr_avx2(const fused_hdr_kernel_params_t *p,
                                    const uint16_t *src_u,
                                    const uint16_t *src_v);
 
+/* Planar-input implementation shared by the combined AVX2/AVX-512 entry
+ * points after their downscale stage has already deinterleaved P010. */
+void fused_kernel_upscale_hdr_planar_avx2(
+    const fused_hdr_kernel_params_t *p,
+    const uint16_t *src_y,
+    const uint16_t *src_u,
+    const uint16_t *src_v,
+    int src_uv_el_stride);
+
 void fused_kernel_thirds_up_hdr_avx2(const fused_hdr_kernel_params_t *p,
                                      const uint16_t *src_y,
                                      const uint16_t *src_u,
@@ -607,6 +745,21 @@ void fused_kernel_pow2_up_hdr_avx2(const fused_hdr_kernel_params_t *p,
                                    const uint16_t *src_y,
                                    const uint16_t *src_u,
                                    const uint16_t *src_v);
+
+void fused_kernel_upscale_hdr_avx512(const fused_hdr_kernel_params_t *p,
+                                     const uint16_t *src_y,
+                                     const uint16_t *src_u,
+                                     const uint16_t *src_v);
+
+void fused_kernel_thirds_up_hdr_avx512(const fused_hdr_kernel_params_t *p,
+                                       const uint16_t *src_y,
+                                       const uint16_t *src_u,
+                                       const uint16_t *src_v);
+
+void fused_kernel_pow2_up_hdr_avx512(const fused_hdr_kernel_params_t *p,
+                                     const uint16_t *src_y,
+                                     const uint16_t *src_u,
+                                     const uint16_t *src_v);
 #endif /* __x86_64__ */
 
 #if defined(__aarch64__) || defined(_M_ARM64)

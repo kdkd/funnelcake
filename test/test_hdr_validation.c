@@ -8,9 +8,11 @@
 #include "test_main.h"
 #include "test_patterns.h"
 #include "funnelcake.h"
+#include "detect.h"
 #include <string.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 /* --------------------------------------------------------------------------
  * Local helpers
@@ -48,7 +50,7 @@ static void test_hdr_valid_i010_thirds(void)
     suppress_log(&ctx);
 
     int rc = fused_hdr_init(&ctx);
-    TEST_ASSERT_EQ(rc, FUSED_OK, "rc should be FUSED_OK");
+    TEST_ASSERT_OK(rc, "rc should be FUSED_OK");
     TEST_ASSERT(ctx.hdr_outputs[FUSED_IDX_1_5X].plane_y != NULL, "hdr_outputs[0].plane_y != NULL");
     TEST_ASSERT_EQ(ctx.hdr_outputs[FUSED_IDX_1_5X].width,  1280, "hdr_outputs[0].width");
     TEST_ASSERT_EQ(ctx.hdr_outputs[FUSED_IDX_1_5X].height, 720,  "hdr_outputs[0].height");
@@ -80,7 +82,7 @@ static void test_hdr_valid_i010_pow2(void)
     suppress_log(&ctx);
 
     int rc = fused_hdr_init(&ctx);
-    TEST_ASSERT_EQ(rc, FUSED_OK, "rc should be FUSED_OK");
+    TEST_ASSERT_OK(rc, "rc should be FUSED_OK");
     TEST_ASSERT_EQ(ctx.hdr_outputs[FUSED_IDX_2X].width, 640, "hdr_outputs[1].width");
     TEST_ASSERT_EQ(ctx.hdr_outputs[FUSED_IDX_4X].width, 320, "hdr_outputs[3].width");
 
@@ -109,7 +111,7 @@ static void test_hdr_valid_p010(void)
     suppress_log(&ctx);
 
     int rc = fused_hdr_init(&ctx);
-    TEST_ASSERT_EQ(rc, FUSED_OK, "rc should be FUSED_OK");
+    TEST_ASSERT_OK(rc, "rc should be FUSED_OK");
     TEST_ASSERT(ctx.hdr_outputs[FUSED_IDX_1_5X].plane_y != NULL, "hdr_outputs[0].plane_y != NULL");
 
     fused_hdr_free(&ctx);
@@ -137,7 +139,7 @@ static void test_hdr_valid_i210(void)
     suppress_log(&ctx);
 
     int rc = fused_hdr_init(&ctx);
-    TEST_ASSERT_EQ(rc, FUSED_OK, "rc should be FUSED_OK");
+    TEST_ASSERT_OK(rc, "rc should be FUSED_OK");
     TEST_ASSERT(ctx.hdr_outputs[FUSED_IDX_1_5X].plane_y != NULL, "hdr_outputs[0].plane_y != NULL");
 
     fused_hdr_free(&ctx);
@@ -165,7 +167,7 @@ static void test_hdr_valid_p210(void)
     suppress_log(&ctx);
 
     int rc = fused_hdr_init(&ctx);
-    TEST_ASSERT_EQ(rc, FUSED_OK, "rc should be FUSED_OK");
+    TEST_ASSERT_OK(rc, "rc should be FUSED_OK");
     TEST_ASSERT(ctx.hdr_outputs[FUSED_IDX_1_5X].plane_y != NULL, "hdr_outputs[0].plane_y != NULL");
 
     fused_hdr_free(&ctx);
@@ -295,6 +297,71 @@ static void test_hdr_tonemap_1x(void)
     TEST_ASSERT(ctx.output_1x.plane_y != NULL, "output_1x.plane_y != NULL");
     TEST_ASSERT_EQ(ctx.output_1x.width,  1920, "output_1x.width = 1920");
     TEST_ASSERT_EQ(ctx.output_1x.height, 1080, "output_1x.height = 1080");
+
+    fused_hdr_free(&ctx);
+    TEST_PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * 9b. test_hdr_upscale_sdr_flags
+ *     upscale_sdr_flags must be a subset of upscale_flags, and the SDR
+ *     tail copy requires the HDR tail; valid requests allocate 8-bit
+ *     outputs at the upscaled dimensions.
+ * -------------------------------------------------------------------------- */
+
+static void test_hdr_upscale_sdr_flags(void)
+{
+    fused_hdr_ctx_t ctx;
+
+    /* (a) SDR level without the matching 10-bit level */
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.src_width      = 1920;
+    ctx.src_height     = 1080;
+    ctx.src_y_stride   = align_up_32(1920 * 2);
+    ctx.src_uv_stride  = align_up_32(960 * 2);
+    ctx.src_format     = FUSED_PIX_I010;
+    ctx.src_transfer   = FUSED_TRC_PQ;
+    ctx.upscale_flags     = FUSED_UPSCALE_2X;
+    ctx.upscale_sdr_flags = FUSED_UPSCALE_2X | FUSED_UPSCALE_4X;
+    suppress_log(&ctx);
+    TEST_ASSERT_EQ(fused_hdr_init(&ctx), FUSED_ERR_INVALID_FLAGS,
+                   "upscale_sdr_flags not subset -> FUSED_ERR_INVALID_FLAGS");
+
+    /* (b) SDR tail without the HDR tail */
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.src_width      = 1920;
+    ctx.src_height     = 1080;
+    ctx.src_y_stride   = align_up_32(1920 * 2);
+    ctx.src_uv_stride  = align_up_32(960 * 2);
+    ctx.src_format     = FUSED_PIX_I010;
+    ctx.src_transfer   = FUSED_TRC_PQ;
+    ctx.upscale_flags         = FUSED_UPSCALE_2X;
+    ctx.upscale_sdr_tail_1_5x = 1;
+    suppress_log(&ctx);
+    TEST_ASSERT_EQ(fused_hdr_init(&ctx), FUSED_ERR_INVALID_FLAGS,
+                   "SDR tail without HDR tail -> FUSED_ERR_INVALID_FLAGS");
+
+    /* (c) valid: SDR copy of the 2x level at upscaled dimensions */
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.src_width      = 1920;
+    ctx.src_height     = 1080;
+    ctx.src_y_stride   = align_up_32(1920 * 2);
+    ctx.src_uv_stride  = align_up_32(960 * 2);
+    ctx.src_format     = FUSED_PIX_I010;
+    ctx.src_transfer   = FUSED_TRC_PQ;
+    ctx.upscale_flags     = FUSED_UPSCALE_2X;
+    ctx.upscale_sdr_flags = FUSED_UPSCALE_2X;
+    suppress_log(&ctx);
+    int rc = fused_hdr_init(&ctx);
+    TEST_ASSERT(rc >= 0, "init should succeed");
+    TEST_ASSERT_EQ((int)ctx.achieved_upscale_sdr_flags, (int)FUSED_UPSCALE_2X,
+                   "achieved_upscale_sdr_flags = 2x");
+    TEST_ASSERT(ctx.upscale_sdr_outputs[0].plane_y != NULL,
+                "upscale_sdr_outputs[0].plane_y != NULL");
+    TEST_ASSERT_EQ(ctx.upscale_sdr_outputs[0].width,  3840,
+                   "SDR upscale width = 3840");
+    TEST_ASSERT_EQ(ctx.upscale_sdr_outputs[0].height, 2160,
+                   "SDR upscale height = 2160");
 
     fused_hdr_free(&ctx);
     TEST_PASS();
@@ -558,7 +625,7 @@ static void test_hdr_i010_hlg(void)
     suppress_log(&ctx);
 
     int rc = fused_hdr_init(&ctx);
-    TEST_ASSERT_EQ(rc, FUSED_OK, "I010+HLG thirds -> FUSED_OK");
+    TEST_ASSERT_OK(rc, "I010+HLG thirds -> FUSED_OK");
     TEST_ASSERT(ctx.hdr_outputs[FUSED_IDX_1_5X].plane_y != NULL, "hdr_outputs[0] allocated");
 
     fused_hdr_free(&ctx);
@@ -586,7 +653,7 @@ static void test_hdr_p010_hlg(void)
     suppress_log(&ctx);
 
     int rc = fused_hdr_init(&ctx);
-    TEST_ASSERT_EQ(rc, FUSED_OK, "P010+HLG thirds -> FUSED_OK");
+    TEST_ASSERT_OK(rc, "P010+HLG thirds -> FUSED_OK");
     TEST_ASSERT(ctx.hdr_outputs[FUSED_IDX_1_5X].plane_y != NULL, "hdr_outputs[0] allocated");
 
     fused_hdr_free(&ctx);
@@ -808,6 +875,72 @@ static void test_hdr_minimum_dimensions(void)
 }
 
 /* --------------------------------------------------------------------------
+ * 25. test_hdr_forced_scalar_fallback_fields
+ *     With FUNNELCAKE_FORCE_SCALAR set, every produced HDR descriptor should
+ *     report fallback=1, matching the public fallback contract.
+ * -------------------------------------------------------------------------- */
+
+static void test_hdr_forced_scalar_fallback_fields(void)
+{
+    setenv("FUNNELCAKE_FORCE_SCALAR", "1", 1);
+    fused_detect_cpu_reset();
+
+    fused_hdr_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.src_width      = 192;
+    ctx.src_height     = 108;
+    ctx.src_y_stride   = align_up_32(192 * 2);
+    ctx.src_uv_stride  = align_up_32(96 * 2);
+    ctx.src_format     = FUSED_PIX_I010;
+    ctx.src_transfer   = FUSED_TRC_PQ;
+    ctx.requested_flags = FUSED_SCALE_1_5X | FUSED_SCALE_3X;
+    ctx.hdr_flags      = FUSED_SCALE_1_5X;
+    ctx.sdr_flags      = FUSED_SCALE_3X;
+    ctx.tonemap_1x     = 1;
+    ctx.upscale_flags  = FUSED_UPSCALE_2X;
+    suppress_log(&ctx);
+
+    int rc = fused_hdr_init(&ctx);
+    int failed = 0;
+
+    if (fused_simd_available() != 0) {
+        printf("  FAIL [%s:%d] forced scalar should disable SIMD\n", __func__, __LINE__);
+        failed = 1;
+    } else if ((rc & FUSED_WARN_BIT_SCALAR) == 0 || rc < 0) {
+        printf("  FAIL [%s:%d] forced scalar init rc=%d, expected scalar warning\n",
+               __func__, __LINE__, rc);
+        failed = 1;
+    } else if (ctx.hdr_outputs[FUSED_IDX_1_5X].fallback != 1) {
+        printf("  FAIL [%s:%d] hdr output fallback=%d, expected 1\n",
+               __func__, __LINE__, ctx.hdr_outputs[FUSED_IDX_1_5X].fallback);
+        failed = 1;
+    } else if (ctx.sdr_outputs[FUSED_IDX_3X].fallback != 1) {
+        printf("  FAIL [%s:%d] sdr output fallback=%d, expected 1\n",
+               __func__, __LINE__, ctx.sdr_outputs[FUSED_IDX_3X].fallback);
+        failed = 1;
+    } else if (ctx.output_1x.fallback != 1) {
+        printf("  FAIL [%s:%d] 1x output fallback=%d, expected 1\n",
+               __func__, __LINE__, ctx.output_1x.fallback);
+        failed = 1;
+    } else if (ctx.upscale_hdr_outputs[FUSED_UP_IDX_2X].fallback != 1) {
+        printf("  FAIL [%s:%d] upscale output fallback=%d, expected 1\n",
+               __func__, __LINE__, ctx.upscale_hdr_outputs[FUSED_UP_IDX_2X].fallback);
+        failed = 1;
+    }
+
+    fused_hdr_free(&ctx);
+    unsetenv("FUNNELCAKE_FORCE_SCALAR");
+    fused_detect_cpu_reset();
+
+    if (failed) {
+        g_results.failed++;
+        return;
+    }
+
+    TEST_PASS();
+}
+
+/* --------------------------------------------------------------------------
  * run_hdr_validation_tests
  * -------------------------------------------------------------------------- */
 
@@ -822,6 +955,7 @@ void run_hdr_validation_tests(void)
     RUN_TEST(test_hdr_sdr_only);
     RUN_TEST(test_hdr_hdr_only);
     RUN_TEST(test_hdr_tonemap_1x);
+    RUN_TEST(test_hdr_upscale_sdr_flags);
     RUN_TEST(test_hdr_flags_not_subset);
     RUN_TEST(test_hdr_invalid_format);
     RUN_TEST(test_hdr_invalid_transfer);
@@ -837,4 +971,5 @@ void run_hdr_validation_tests(void)
     RUN_TEST(test_hdr_custom_lut_output);
     RUN_TEST(test_hdr_non_standard_width);
     RUN_TEST(test_hdr_minimum_dimensions);
+    RUN_TEST(test_hdr_forced_scalar_fallback_fields);
 }

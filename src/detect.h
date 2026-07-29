@@ -8,6 +8,8 @@
 #ifndef FUNNELCAKE_DETECT_H
 #define FUNNELCAKE_DETECT_H
 
+#include <stddef.h>  /* size_t */
+
 /*
  * CPU capability detection for funnelcake.
  *
@@ -22,9 +24,21 @@
 
 typedef struct {
     int has_avx2;   /* x86_64 only - 1 if AVX2 + OS XSAVE for YMM is available */
+    int has_avx512; /* x86_64 only - 1 if AVX-512 F+BW+VL+VBMI are all present
+                     * AND the OS has enabled opmask/ZMM state in XCR0.  VBMI
+                     * is required because the kernels lean on vpermb-class
+                     * shuffles; chips without it (e.g. Skylake-SP) report 0
+                     * and use the AVX2 kernels.  Setting the environment
+                     * variable FUNNELCAKE_NO_AVX512=<non-empty> forces 0,
+                     * which gives a same-build A/B against the AVX2 path.  */
     int has_neon;   /* aarch64 only - 1 if NEON is available                    */
     int has_rvv;    /* riscv64 only - 1 if RVV 1.0 (V extension) is available
                      * AND misaligned vector access is fast on the chip        */
+    size_t llc_bytes; /* x86_64 only - last-level data cache size in bytes as
+                       * CPUID reports it for one core (per-CCX on AMD, per
+                       * socket on Intel).  0 = unknown.  Kernels use this to
+                       * judge whether an output plane can stay cache-resident
+                       * or should be written with streaming stores.          */
 } fused_cpu_caps_t;
 
 /*

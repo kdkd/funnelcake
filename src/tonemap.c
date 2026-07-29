@@ -58,14 +58,34 @@ static const double HABLE_F = 0.30;
 
 
 /* --------------------------------------------------------------------------
- * BT.2020 -> BT.709 chroma scale factors (fixed-point 8.8)
+ * Chroma reconstruction constants
  *
- * Approximate YCbCr-domain gamut mapping derived from the BT.2020->BT.709
- * RGB conversion matrix.  U (Cb) compresses by ~0.945, V (Cr) by ~0.918.
+ * BT.2020 non-constant-luminance (what HDR10/HLG streams actually carry)
+ * defines, entirely in the gamma (PQ/HLG signal) domain:
+ *   Y'  = Kr*R' + Kg*G' + Kb*B'
+ *   Cb  = (B' - Y') / 1.8814
+ *   Cr  = (R' - Y') / 1.4746
+ *
+ * The exact inverse, also gamma-domain:
+ *   R'  = Y' + 1.4746 * Cr
+ *   B'  = Y' + 1.8814 * Cb
+ *   G'  = (Y' - Kr*R' - Kb*B') / Kg
+ *       = Y' - (Kr*1.4746*Cr + Kb*1.8814*Cb) / Kg     (1 - Kr - Kb = Kg)
+ *
+ * All three channels are affine in (Y', Cr, Cb), so reconstruction is three
+ * adds of precomputed per-chroma-code deltas - no linear-light detour.
  * -------------------------------------------------------------------------- */
 
-/* BT.2020->BT.709 chroma scale constants removed - chroma tone mapping now
- * uses per-channel RGB reconstruction instead of YCbCr-domain scaling. */
+#define NCL_CR_SCALE  1.4746   /* (1 - Kr) * 2 where Kr = 0.2627 */
+#define NCL_CB_SCALE  1.8814   /* (1 - Kb) * 2 where Kb = 0.0593 */
+#define BT2020_KR     0.2627
+#define BT2020_KG     0.6780
+#define BT2020_KB     0.0593
+
+/* BT.709 YCbCr encoding constants */
+#define BT709_KR      0.2126
+#define BT709_KG      0.7152
+#define BT709_KB      0.0722
 
 
 /* --------------------------------------------------------------------------
@@ -105,10 +125,30 @@ static inline double eotf_pq(double N)
 
 
 /* --------------------------------------------------------------------------
+ * Inverse EOTF: PQ (ST 2084)
+ *
+ * Input:  linear luminance in [0, 1] representing [0, 10000] nits
+ * Output: normalized PQ signal in [0, 1]
+ * -------------------------------------------------------------------------- */
+
+static inline double oetf_pq(double L)
+{
+    if (L < 0.0) L = 0.0;
+    double Lm1 = pow(L, PQ_M1);
+    return pow((PQ_C1 + PQ_C2 * Lm1) / (1.0 + PQ_C3 * Lm1), PQ_M2);
+}
+
+
+/* --------------------------------------------------------------------------
  * EOTF: HLG (ARIB STD-B67 inverse OETF + OOTF)
  *
  * Input:  normalized HLG signal E in [0, 1]
  * Output: display luminance in [0, 1] (after system gamma 1.2)
+ *
+ * Note: the BT.2100 HLG OOTF applies the system gamma to the luminance of
+ * the frame and scales R, G, B by the resulting ratio.  Applying it per
+ * channel/per signal as done here is the common fast approximation (it is
+ * exact for achromatic content and slightly oversaturates strong colors).
  * -------------------------------------------------------------------------- */
 
 static inline double eotf_hlg(double E)
@@ -136,18 +176,92 @@ static inline double hable_curve(double x)
 
 
 /* --------------------------------------------------------------------------
- * BT.709 OETF (linear -> gamma)
+ * SDR output OETF (linear -> gamma)
  *
- * Input:  linear luminance in [0, 1]
+ * Input:  display-relative linear luminance in [0, 1]
  * Output: gamma-corrected signal in [0, 1]
+ *
+ * This is the sRGB encoding curve (IEC 61966-2-1), not the BT.709 camera
+ * OETF.  For display-referred SDR output - encoding values that should
+ * reproduce a given relative luminance on a typical SDR display - the sRGB
+ * curve is the standard practical choice; the BT.709 camera OETF assumes a
+ * BT.1886 display plus rendering-intent gamma and would look washed out.
  * -------------------------------------------------------------------------- */
 
-static inline double bt709_oetf(double L)
+static inline double sdr_oetf(double L)
 {
     if (L >= 0.0031308)
         return 1.055 * pow(L, 1.0 / 2.4) - 0.055;
     else
         return 12.92 * L;
+}
+
+
+/* --------------------------------------------------------------------------
+ * Tone curves: absolute nits -> display-relative linear [0, 1]
+ *
+ * Each curve compresses [0, peak_nits] smoothly onto [0, 1] where 1.0 is
+ * SDR reference white (target_nits).  None of them clip below peak_nits,
+ * and peak_nits genuinely shapes all of them - content at peak maps to
+ * (or asymptotically approaches) 1.0, content below the curve's knee
+ * passes through at or near its true brightness.
+ *
+ * BT2390: the ITU-R BT.2390 EETF evaluated in PQ space.  Identity below
+ *   the knee at KS = 1.5*maxLum - 0.5 (normalized PQ), Hermite-spline
+ *   roll-off above.  Reference broadcast behavior: midtones are exact.
+ *
+ * HABLE: filmic curve with white point at peak.  hable(2x)/hable(2W)
+ *   where W = peak/target; the x2 exposure factor limits the filmic
+ *   midtone dimming to about -1 stop at default settings.
+ *
+ * REINHARD: extended Reinhard, x*(1 + x/W^2)/(1 + x).  Maps W exactly to
+ *   1.0 and degenerates to the identity when peak == target.
+ * -------------------------------------------------------------------------- */
+
+static double tone_curve_bt2390(double nits, double peak_f, double target_f)
+{
+    double src_max = oetf_pq(peak_f / 10000.0);     /* source range in PQ */
+    double dst_max = oetf_pq(target_f / 10000.0);   /* target range in PQ */
+    double max_lum = dst_max / src_max;
+
+    double e1 = oetf_pq(nits / 10000.0) / src_max;  /* normalized PQ [0,1] */
+    if (e1 > 1.0) e1 = 1.0;     /* content above declared peak clips at peak
+                                 * (the spline is only defined on [0,1]) */
+    double ks = 1.5 * max_lum - 0.5;                /* knee start */
+
+    double e2;
+    if (e1 <= ks || ks >= 1.0) {
+        e2 = e1;                                    /* below knee: identity */
+    } else {
+        double t  = (e1 - ks) / (1.0 - ks);
+        double t2 = t * t, t3 = t2 * t;
+        e2 = (2.0*t3 - 3.0*t2 + 1.0) * ks
+           + (t3 - 2.0*t2 + t) * (1.0 - ks)
+           + (-2.0*t3 + 3.0*t2) * max_lum;
+    }
+    if (e2 > max_lum) e2 = max_lum;
+
+    double l_out = eotf_pq(e2 * src_max) * 10000.0; /* nits, <= target */
+    return clamp_d(l_out / target_f, 0.0, 1.0);
+}
+
+static double tone_curve_disp(int curve, double nits,
+                              double peak_f, double target_f)
+{
+    double w = peak_f / target_f;   /* peak in SDR-white-relative units */
+    double x = nits / target_f;     /* input in SDR-white-relative units */
+
+    switch (curve) {
+    case FUSED_TONEMAP_REINHARD:
+        return clamp_d(x * (1.0 + x / (w * w)) / (1.0 + x), 0.0, 1.0);
+
+    case FUSED_TONEMAP_BT2390:
+        return tone_curve_bt2390(nits, peak_f, target_f);
+
+    case FUSED_TONEMAP_HABLE:
+    default:
+        return clamp_d(hable_curve(2.0 * x) / hable_curve(2.0 * w), 0.0, 1.0);
+    }
 }
 
 
@@ -163,6 +277,8 @@ void fused_tonemap_generate_luts(fused_hdr_internal_t *hdr,
     int peak_nits   = (tm->peak_nits   > 0) ? tm->peak_nits   : 1000;
     int target_nits = (tm->target_nits > 0) ? tm->target_nits : 100;
     int curve       = tm->curve;
+    int src_full    = (tm->src_range == FUSED_RANGE_FULL);
+    int dst_full    = (tm->dst_range == FUSED_RANGE_FULL);
 
     /* ------------------------------------------------------------------ */
     /* Custom LUT: bypass all computation, just copy the caller's table.  */
@@ -179,183 +295,97 @@ void fused_tonemap_generate_luts(fused_hdr_internal_t *hdr,
         }
     }
 
-    /* ------------------------------------------------------------------ */
-    /* Luma LUT generation (skipped for valid custom LUT)                  */
-    /* ------------------------------------------------------------------ */
-
     double peak_f   = (double)peak_nits;
     double target_f = (double)target_nits;
 
-    /* Precompute tone curve constants (used by both luma LUT and linear_to_sdr LUT).
-     *
-     * Each curve is normalized so that target_nits maps to 1.0 (full SDR white).
-     * Content at or below target_nits passes through at approximately full
-     * brightness; content above target_nits (true HDR highlights) gets compressed.
-     * Without this normalization, SDR-level content appears dimmed because the
-     * curve treats target_nits as mid-range. */
-    double hable_W     = peak_f / target_f;
-    double hable_exposure = 2.0;
-    double hable_denom = hable_curve(hable_W * hable_exposure);
-    /* Reference point: what the curve gives at target_nits (= SDR white) */
-    double hable_ref   = hable_curve(1.0 * hable_exposure) / hable_denom;
+    /* 10-bit input quantization: limited range is Y 64..940 (offset 64,
+     * span 876) and chroma 64..960 (center 512, span 896); full range
+     * spans the whole code space for both. */
+    double y_off   = src_full ? 0.0    : 64.0;
+    double y_span  = src_full ? 1023.0 : 876.0;
+    double c_span  = src_full ? 1023.0 : 896.0;
 
-    double bt2390_ks     = 1.5 * target_f / peak_f;
-    double bt2390_maxlum = peak_f / target_f;
-    /* BT.2390 reference: compute what the spline gives at target_nits (x_tc=1.0) */
-    double bt2390_ref;
-    {
-        double x_tc = 1.0;  /* target_nits / target_nits */
-        if (x_tc <= bt2390_ks) {
-            bt2390_ref = x_tc / bt2390_maxlum;
-        } else {
-            double t = clamp_d((x_tc - bt2390_ks) / (bt2390_maxlum - bt2390_ks), 0.0, 1.0);
-            double t2 = t * t, t3 = t2 * t;
-            double p0 = bt2390_ks / bt2390_maxlum, p1 = 1.0;
-            double m0 = 1.0 * (bt2390_maxlum - bt2390_ks) / bt2390_maxlum, m1 = 0.0;
-            bt2390_ref = (2*t3-3*t2+1)*p0 + (t3-2*t2+t)*m0 + (-2*t3+3*t2)*p1 + (t3-t2)*m1;
-        }
-    }
-
-    if (curve != FUSED_TONEMAP_CUSTOM) {
-
-        for (int i = 0; i < 1024; i++) {
-            double N = (double)i / 1023.0;
-
-            /* Step 1-2: EOTF -> linear luminance [0, 1] */
-            double L;
-            if (src_transfer == FUSED_TRC_HLG)
-                L = eotf_hlg(N);
-            else
-                L = eotf_pq(N);
-
-            /* Step 3: convert to absolute nits.
-             * PQ EOTF output is normalized to 10000 nits (the ST 2084 absolute
-             * reference), so L * 10000 gives the actual luminance in nits.
-             * HLG EOTF output is display-referred (normalized to 1.0 = display
-             * peak), so L * peak_nits gives the actual luminance. */
-            double nits;
-            if (src_transfer == FUSED_TRC_HLG)
-                nits = L * peak_f;
-            else
-                nits = L * 10000.0;
-
-            /* Step 4: apply tone curve - compress into [0, 1] */
-            double mapped;
-
-            switch (curve) {
-            case FUSED_TONEMAP_REINHARD: {
-                double x_norm = nits / peak_f;  /* [0, 1] */
-                double raw = x_norm / (1.0 + x_norm);
-                /* Normalize: target_nits -> 1.0 */
-                double ref = (target_f / peak_f) / (1.0 + target_f / peak_f);
-                mapped = (ref > 0.0) ? clamp_d(raw / ref, 0.0, 1.0) : raw;
-                break;
-            }
-
-            case FUSED_TONEMAP_BT2390: {
-                /* BT.2390 EETF: spline-based knee function */
-                double x_tc = nits / target_f;  /* [0, maxlum] */
-                double raw;
-                if (x_tc <= bt2390_ks) {
-                    raw = x_tc / bt2390_maxlum;
-                } else {
-                    double t = clamp_d((x_tc - bt2390_ks) / (bt2390_maxlum - bt2390_ks), 0.0, 1.0);
-                    double t2 = t * t, t3 = t2 * t;
-                    double p0 = bt2390_ks / bt2390_maxlum, p1 = 1.0;
-                    double m0 = 1.0 * (bt2390_maxlum - bt2390_ks) / bt2390_maxlum, m1 = 0.0;
-                    raw = (2*t3-3*t2+1)*p0 + (t3-2*t2+t)*m0 + (-2*t3+3*t2)*p1 + (t3-t2)*m1;
-                }
-                /* Normalize: target_nits -> 1.0 */
-                mapped = (bt2390_ref > 0.0) ? clamp_d(raw / bt2390_ref, 0.0, 1.0) : raw;
-                break;
-            }
-
-            case FUSED_TONEMAP_HABLE:
-            default: {
-                double raw = hable_curve(nits / target_f * hable_exposure) / hable_denom;
-                /* Normalize: target_nits -> 1.0 (full SDR white) */
-                mapped = clamp_d(raw / hable_ref, 0.0, 1.0);
-                break;
-            }
-            }
-
-            /* Step 5: BT.709 OETF (linear -> gamma) */
-            double V = bt709_oetf(mapped);
-
-            /* Step 6: quantize to 8-bit */
-            hdr->lut_y[i] = (uint8_t)clamp_i((int)(V * 255.0 + 0.5), 0, 255);
-        }
-    }
+    /* 8-bit output quantization: limited is 16 + 219*V, full is 255*V. */
+    double out_scale = dst_full ? 255.0 : 219.0;
+    int    out_off   = dst_full ? 0     : 16;
 
     /* ------------------------------------------------------------------ */
-    /* PQ-to-linear LUT: 10-bit PQ code -> linear luminance [0, 1]          */
-    /*                                                                     */
-    /* Used by the chroma tone mapping pass to reconstruct linear-light    */
-    /* R, G, B from YCbCr.  Each entry is the result of the PQ EOTF       */
-    /* (or HLG EOTF), stored as float.                                    */
+    /* pq_to_sdr: the entire per-channel pipeline compiled into one table. */
+    /*   10-bit code -> signal -> EOTF -> nits -> tone curve -> SDR OETF   */
+    /*   -> 8-bit code.                                                    */
+    /* Indexing by the PQ/HLG code keeps shadow resolution perfect by      */
+    /* construction (the input axis is already perceptually uniform).      */
     /* ------------------------------------------------------------------ */
 
     for (int i = 0; i < 1024; i++) {
-        double N = (double)i / 1023.0;
+        double N = clamp_d(((double)i - y_off) / y_span, 0.0, 1.0);
+
+        /* EOTF -> absolute nits.  PQ is absolute (1.0 = 10000 nits);
+         * HLG is display-referred (1.0 = display peak). */
+        double nits;
         if (src_transfer == FUSED_TRC_HLG)
-            hdr->pq_to_linear[i] = (float)eotf_hlg(N);
+            nits = eotf_hlg(N) * peak_f;
         else
-            hdr->pq_to_linear[i] = (float)eotf_pq(N);
+            nits = eotf_pq(N) * 10000.0;
+
+        double V = tone_curve_disp(curve, nits, peak_f, target_f);
+
+        hdr->pq_to_sdr[i] = (uint8_t)clamp_i(
+            (int)(sdr_oetf(V) * out_scale + 0.5) + out_off, 0, 255);
+    }
+
+    /* For built-in curves the luma LUT is the same table (the built-in
+     * path derives luma from reconstructed R'G'B', but lut_y is kept
+     * consistent for diagnostics and possible fast paths). */
+    if (curve != FUSED_TONEMAP_CUSTOM)
+        memcpy(hdr->lut_y, hdr->pq_to_sdr, 1024);
+
+    /* ------------------------------------------------------------------ */
+    /* Chroma delta tables: BT.2020 NCL inverse, gamma domain.             */
+    /* Deltas are expressed in Y'-code units, so y_span/c_span folds the   */
+    /* limited-range chroma-vs-luma excursion difference in at init.       */
+    /* ------------------------------------------------------------------ */
+
+    {
+        double k = y_span / c_span;
+        double g_cr = -(BT2020_KR / BT2020_KG) * NCL_CR_SCALE; /* -0.5714 */
+        double g_cb = -(BT2020_KB / BT2020_KG) * NCL_CB_SCALE; /* -0.1646 */
+
+        /* Q10 coefficients are the canonical definition; tables and SIMD
+         * kernels both evaluate ((i-512)*coef + 512) >> 10 so the two
+         * paths agree bit for bit.  Q10 keeps even the largest
+         * coefficient (1.8814, full range) inside int16, which lets the
+         * SIMD kernels evaluate the whole delta as one 16-bit rounding
+         * multiply-high (pmulhrsw / vqrdmulh / vsmul) of (x << 5) by the
+         * coefficient:
+         *   ((x*32) * coef + 16384) >> 15  ==  (x*coef + 512) >> 10
+         * exactly, for either sign. */
+        hdr->delta_coef_r    = (int32_t)floor(NCL_CR_SCALE * k * 1024.0 + 0.5);
+        hdr->delta_coef_b    = (int32_t)floor(NCL_CB_SCALE * k * 1024.0 + 0.5);
+        hdr->delta_coef_g_cr = (int32_t)floor(g_cr * k * 1024.0 + 0.5);
+        hdr->delta_coef_g_cb = (int32_t)floor(g_cb * k * 1024.0 + 0.5);
+
+        for (int i = 0; i < 1024; i++) {
+            int x = i - 512;
+            hdr->pq_r_delta[i]    = (int16_t)((x * hdr->delta_coef_r    + 512) >> 10);
+            hdr->pq_b_delta[i]    = (int16_t)((x * hdr->delta_coef_b    + 512) >> 10);
+            hdr->pq_g_delta_cr[i] = (int16_t)((x * hdr->delta_coef_g_cr + 512) >> 10);
+            hdr->pq_g_delta_cb[i] = (int16_t)((x * hdr->delta_coef_g_cb + 512) >> 10);
+        }
     }
 
     /* ------------------------------------------------------------------ */
-    /* Linear-to-SDR LUT: linear [0, 1] -> 8-bit SDR gamma output          */
-    /*                                                                     */
-    /* Incorporates: absolute nits scaling, tone curve, BT.709 OETF.       */
-    /* Indexed by (linear_value * 4095).  Used by the chroma pass to       */
-    /* tone-map individually reconstructed R, G, B channels.               */
+    /* SDR YCbCr re-encode constants (BT.709 matrix, dst_range scaling).   */
+    /* Limited-range 8-bit chroma has a 224-step excursion against luma's  */
+    /* 219, hence the 224/219 factor.                                      */
     /* ------------------------------------------------------------------ */
 
-    for (int i = 0; i < 4096; i++) {
-        double L = (double)i / 4095.0;  /* linear [0, 1] relative to peak */
-
-        /* Convert to absolute nits */
-        double nits;
-        if (src_transfer == FUSED_TRC_HLG)
-            nits = L * peak_f;
-        else
-            nits = L * 10000.0;
-
-        /* Apply tone curve with normalization (same as luma LUT).
-         * Each curve is normalized so target_nits -> 1.0. */
-        double mapped;
-        switch (curve) {
-        case FUSED_TONEMAP_REINHARD: {
-            double x_norm = nits / peak_f;
-            double raw = x_norm / (1.0 + x_norm);
-            double ref = (target_f / peak_f) / (1.0 + target_f / peak_f);
-            mapped = (ref > 0.0) ? clamp_d(raw / ref, 0.0, 1.0) : raw;
-            break;
-        }
-        case FUSED_TONEMAP_BT2390: {
-            double x_tc = nits / target_f;
-            double raw;
-            if (x_tc <= bt2390_ks) {
-                raw = x_tc / bt2390_maxlum;
-            } else {
-                double t = clamp_d((x_tc - bt2390_ks) / (bt2390_maxlum - bt2390_ks), 0.0, 1.0);
-                double t2 = t * t, t3 = t2 * t;
-                double p0 = bt2390_ks / bt2390_maxlum, p1 = 1.0;
-                double m0 = 1.0 * (bt2390_maxlum - bt2390_ks) / bt2390_maxlum, m1 = 0.0;
-                raw = (2*t3-3*t2+1)*p0 + (t3-2*t2+t)*m0 + (-2*t3+3*t2)*p1 + (t3-t2)*m1;
-            }
-            mapped = (bt2390_ref > 0.0) ? clamp_d(raw / bt2390_ref, 0.0, 1.0) : raw;
-            break;
-        }
-        default: { /* Hable */
-            double raw = hable_curve(nits / target_f * hable_exposure) / hable_denom;
-            mapped = clamp_d(raw / hable_ref, 0.0, 1.0);
-            break;
-        }
-        }
-
-        double V = bt709_oetf(mapped);
-        hdr->linear_to_sdr[i] = (uint8_t)clamp_i((int)(V * 255.0 + 0.5), 0, 255);
+    {
+        double cscale = dst_full ? 1.0 : 224.0 / 219.0;
+        hdr->cb_out_scale = (int)(256.0 * cscale * 0.5 / (1.0 - BT709_KB) + 0.5);
+        hdr->cr_out_scale = (int)(256.0 * cscale * 0.5 / (1.0 - BT709_KR) + 0.5);
+        hdr->chroma_out_min = dst_full ? 0   : 16;
+        hdr->chroma_out_max = dst_full ? 255 : 240;
     }
 
     /* One-time-per-init diagnostic: emitted at INFO level so callback-based
@@ -363,9 +393,10 @@ void fused_tonemap_generate_luts(fused_hdr_internal_t *hdr,
      * targets will see it on every init. */
     fused_log(log_warn, FUSED_LOG_INFO,
         "funnelcake: tone map LUTs generated - transfer=%s curve=%d "
-        "peak=%d target=%d\n",
+        "peak=%d target=%d range=%s/%s\n",
         (src_transfer == FUSED_TRC_HLG) ? "HLG" : "PQ",
-        curve, peak_nits, target_nits);
+        curve, peak_nits, target_nits,
+        src_full ? "full" : "limited", dst_full ? "full" : "limited");
 }
 
 
@@ -506,78 +537,14 @@ static void tonemap_luma_neon(const uint8_t *lut_y,
 #endif /* __aarch64__ */
 
 
-/* --------------------------------------------------------------------------
- * NCL chroma reconstruction helpers
- *
- * HDR10 uses non-constant-luminance (NCL) YCbCr encoding:
- *   Y' = PQ(0.2627*R + 0.6780*G + 0.0593*B)   <- PQ of linear luma
- *   Cb = (PQ(B) - Y') / 1.8814
- *   Cr = (PQ(R) - Y') / 1.4746
- *
- * To recover linear R, G, B for correct per-channel tone mapping:
- *   PQ(R) = Y' + 1.4746 * Cr
- *   PQ(B) = Y' + 1.8814 * Cb
- *   R_lin = EOTF(PQ(R)),  B_lin = EOTF(PQ(B)),  Y_lin = EOTF(Y')
- *   G_lin = (Y_lin - 0.2627*R_lin - 0.0593*B_lin) / 0.6780
- *
- * BT.2020 NCL coefficients for chroma reconstruction:
- * -------------------------------------------------------------------------- */
-
-#define NCL_CR_SCALE  1.4746   /* (1 - Kr) * 2 where Kr = 0.2627 */
-#define NCL_CB_SCALE  1.8814   /* (1 - Kb) * 2 where Kb = 0.0593 */
-#define BT2020_KR     0.2627
-#define BT2020_KG     0.6780
-#define BT2020_KB     0.0593
-
-/* BT.709 YCbCr encoding constants (full range) */
-#define BT709_KR      0.2126
-#define BT709_KG      0.7152
-#define BT709_KB      0.0722
+/* The per-block scalar pipeline (RGB reconstruction, luma dot, gamut +
+ * BT.709 chroma encode) lives in tonemap.h as fused_tm_block and
+ * friends, shared with the SIMD kernels' ragged-edge tails. */
 
 
 /* --------------------------------------------------------------------------
  * fused_tonemap_apply - planar I010 chroma
  * -------------------------------------------------------------------------- */
-
-/* --------------------------------------------------------------------------
- * Per-pixel RGB reconstruction helper
- *
- * Given a PQ-encoded Y and chroma (Cb, Cr) at a single pixel, recover
- * linear R, G, B, tone-map each channel, and return 8-bit BT.709 R, G, B.
- * -------------------------------------------------------------------------- */
-
-static inline void tonemap_pixel_rgb(
-    const float *pq_to_linear, const uint8_t *linear_to_sdr,
-    int y_pq, int cb_10, int cr_10,
-    int *r_out, int *g_out, int *b_out)
-{
-    double y_norm  = (double)y_pq / 1023.0;
-    double cb_norm = (double)(cb_10 - 512) / 1023.0;
-    double cr_norm = (double)(cr_10 - 512) / 1023.0;
-
-    int pq_r = (int)((y_norm + NCL_CR_SCALE * cr_norm) * 1023.0 + 0.5);
-    int pq_b = (int)((y_norm + NCL_CB_SCALE * cb_norm) * 1023.0 + 0.5);
-    if (pq_r < 0) pq_r = 0;
-    if (pq_r > 1023) pq_r = 1023;
-    if (pq_b < 0) pq_b = 0;
-    if (pq_b > 1023) pq_b = 1023;
-
-    float y_lin = pq_to_linear[y_pq];
-    float r_lin = pq_to_linear[pq_r];
-    float b_lin = pq_to_linear[pq_b];
-
-    float g_lin = (y_lin - (float)BT2020_KR * r_lin
-                         - (float)BT2020_KB * b_lin) / (float)BT2020_KG;
-    if (g_lin < 0.0f) g_lin = 0.0f;
-
-    int r_idx = (int)(r_lin * 4095.0f + 0.5f); if (r_idx > 4095) r_idx = 4095;
-    int g_idx = (int)(g_lin * 4095.0f + 0.5f); if (g_idx > 4095) g_idx = 4095;
-    int b_idx = (int)(b_lin * 4095.0f + 0.5f); if (b_idx > 4095) b_idx = 4095;
-
-    *r_out = linear_to_sdr[r_idx];
-    *g_out = linear_to_sdr[g_idx];
-    *b_out = linear_to_sdr[b_idx];
-}
 
 
 FUSED_HOT
@@ -592,8 +559,6 @@ void fused_tonemap_apply(
     int width, int height)
 {
     const uint8_t *lut_y          = state->lut_y;
-    const float   *pq_to_linear   = state->pq_to_linear;
-    const uint8_t *linear_to_sdr  = state->linear_to_sdr;
 
     int chroma_w = width  / 2;
     int chroma_h = height / 2;
@@ -617,6 +582,11 @@ void fused_tonemap_apply(
         if (fused_detect_cpu()->has_neon) {
             tonemap_luma_neon(lut_y, src_y, src_y_stride, dst_y, dst_y_stride,
                               width, height);
+        } else
+#elif defined(__riscv) && (__riscv_xlen == 64)
+        if (fused_detect_cpu()->has_rvv) {
+            fused_tonemap_luma_rvv(lut_y, src_y, src_y_stride,
+                                   dst_y, dst_y_stride, width, height);
         } else
 #endif
         {
@@ -642,65 +612,98 @@ void fused_tonemap_apply(
     }
 
     /* ------------------------------------------------------------------ */
-    /* Built-in curves: full per-pixel RGB reconstruction at luma          */
-    /* resolution.  For each pixel, recover linear R, G, B from the NCL   */
-    /* YCbCr encoding, tone-map each channel individually, and encode     */
-    /* as BT.709 YCbCr.  Chroma is upsampled to luma resolution           */
-    /* (nearest-neighbor: each chroma sample covers a 2×2 luma block).    */
-    /*                                                                     */
-    /* This produces consistent Y, Cb, Cr with no washout or banding,     */
-    /* at the cost of processing every luma pixel through the RGB          */
-    /* reconstruction (~6 LUT reads + float arithmetic per pixel).         */
+    /* Built-in curves: SIMD when available, scalar otherwise.             */
     /* ------------------------------------------------------------------ */
 
-    for (int y = 0; y < height; y++) {
-        const uint16_t *sy = src_y + y * src_y_pitch;
-        const uint16_t *su = src_u + (y / 2) * src_uv_pitch;
-        const uint16_t *sv = src_v + (y / 2) * src_uv_pitch;
-        uint8_t        *dy = dst_y + y * dst_y_stride;
-
-        for (int x = 0; x < width; x++) {
-            int y_pq  = sy[x] & 0x3FF;
-            int cb_10 = su[x / 2] & 0x3FF;
-            int cr_10 = sv[x / 2] & 0x3FF;
-
-            int r_sdr, g_sdr, b_sdr;
-            tonemap_pixel_rgb(pq_to_linear, linear_to_sdr,
-                              y_pq, cb_10, cr_10,
-                              &r_sdr, &g_sdr, &b_sdr);
-
-            /* BT.709 luma from tone-mapped RGB */
-            dy[x] = (uint8_t)clamp_i(
-                (int)(BT709_KR * r_sdr + BT709_KG * g_sdr
-                    + BT709_KB * b_sdr + 0.5), 0, 255);
-        }
+#if defined(__x86_64__)
+    if (fused_detect_cpu()->has_avx512 && fused_tonemap_avx512_compiled()) {
+        fused_tonemap_apply_avx512(state, src_y, src_y_stride,
+                                   src_u, src_uv_stride, src_v,
+                                   dst_y, dst_y_stride,
+                                   dst_u, dst_uv_stride, dst_v,
+                                   width, height);
+        return;
     }
+    if (fused_detect_cpu()->has_avx2) {
+        fused_tonemap_apply_avx2(state, src_y, src_y_stride,
+                                 src_u, src_uv_stride, src_v,
+                                 dst_y, dst_y_stride,
+                                 dst_u, dst_uv_stride, dst_v,
+                                 width, height);
+        return;
+    }
+#elif defined(__aarch64__) || defined(_M_ARM64)
+    if (fused_detect_cpu()->has_neon) {
+        fused_tonemap_apply_neon(state, src_y, src_y_stride,
+                                 src_u, src_uv_stride, src_v,
+                                 dst_y, dst_y_stride,
+                                 dst_u, dst_uv_stride, dst_v,
+                                 width, height);
+        return;
+    }
+#elif defined(__riscv) && (__riscv_xlen == 64)
+    if (fused_detect_cpu()->has_rvv) {
+        fused_tonemap_apply_rvv(state, src_y, src_y_stride,
+                                src_u, src_uv_stride, src_v,
+                                dst_y, dst_y_stride,
+                                dst_u, dst_uv_stride, dst_v,
+                                width, height);
+        return;
+    }
+#endif
 
-    /* Chroma at chroma resolution - compute from tone-mapped RGB */
+    fused_tonemap_apply_scalar(state, src_y, src_y_stride,
+                               src_u, src_uv_stride, src_v,
+                               dst_y, dst_y_stride,
+                               dst_u, dst_uv_stride, dst_v,
+                               width, height);
+}
+
+
+/* --------------------------------------------------------------------------
+ * fused_tonemap_apply_scalar - built-in-curve reference path
+ *
+ * RGB reconstruction and tone mapping per luma pixel, then BT.709 YCbCr
+ * re-encode.  Chroma is nearest-neighbor shared across each 2x2 luma
+ * block, and U/V are written from the block's top-left reconstructed RGB.
+ * The SIMD kernels replicate this integer pipeline bit for bit; parity
+ * tests compare against this function.
+ * -------------------------------------------------------------------------- */
+
+FUSED_HOT
+void fused_tonemap_apply_scalar(
+    const fused_hdr_internal_t *state,
+    const uint16_t *src_y,  int src_y_stride,
+    const uint16_t *src_u,  int src_uv_stride,
+    const uint16_t *src_v,
+    uint8_t *dst_y, int dst_y_stride,
+    uint8_t *dst_u, int dst_uv_stride,
+    uint8_t *dst_v,
+    int width, int height)
+{
+    int chroma_w = width  / 2;
+    int chroma_h = height / 2;
+
+    int src_y_pitch  = src_y_stride  / (int)sizeof(uint16_t);
+    int src_uv_pitch = src_uv_stride / (int)sizeof(uint16_t);
+
+    /* Process one 4:2:0 block at a time, doing chroma while the top-left
+     * reconstruction is hot. */
     for (int cy = 0; cy < chroma_h; cy++) {
         const uint16_t *su = src_u + cy * src_uv_pitch;
         const uint16_t *sv = src_v + cy * src_uv_pitch;
-        const uint16_t *sy = src_y + (cy * 2) * src_y_pitch;
+        const uint16_t *sy0 = src_y + (cy * 2) * src_y_pitch;
+        const uint16_t *sy1 = sy0 + src_y_pitch;
+        uint8_t        *dy0 = dst_y + (cy * 2) * dst_y_stride;
+        uint8_t        *dy1 = dy0 + dst_y_stride;
         uint8_t        *du = dst_u + cy * dst_uv_stride;
         uint8_t        *dv = dst_v + cy * dst_uv_stride;
 
         for (int cx = 0; cx < chroma_w; cx++) {
-            int y_pq  = sy[cx * 2] & 0x3FF;
-            int cb_10 = su[cx] & 0x3FF;
-            int cr_10 = sv[cx] & 0x3FF;
-
-            int r_sdr, g_sdr, b_sdr;
-            tonemap_pixel_rgb(pq_to_linear, linear_to_sdr,
-                              y_pq, cb_10, cr_10,
-                              &r_sdr, &g_sdr, &b_sdr);
-
-            int y_sdr = (int)(BT709_KR * r_sdr + BT709_KG * g_sdr
-                            + BT709_KB * b_sdr + 0.5);
-            int cb_sdr = (int)((b_sdr - y_sdr) / (2.0 * (1.0 - BT709_KB)) + 128.5);
-            int cr_sdr = (int)((r_sdr - y_sdr) / (2.0 * (1.0 - BT709_KR)) + 128.5);
-
-            du[cx] = (uint8_t)clamp_i(cb_sdr, 0, 255);
-            dv[cx] = (uint8_t)clamp_i(cr_sdr, 0, 255);
+            fused_tm_block(state, su[cx] & 0x3FF, sv[cx] & 0x3FF,
+                           sy0 + cx * 2, sy1 + cx * 2,
+                           dy0 + cx * 2, dy1 + cx * 2,
+                           &du[cx], &dv[cx]);
         }
     }
 }
@@ -721,8 +724,6 @@ void fused_tonemap_apply_p010(
     int width, int height)
 {
     const uint8_t *lut_y          = state->lut_y;
-    const float   *pq_to_linear   = state->pq_to_linear;
-    const uint8_t *linear_to_sdr  = state->linear_to_sdr;
 
     int chroma_w = width  / 2;
     int chroma_h = height / 2;
@@ -741,6 +742,11 @@ void fused_tonemap_apply_p010(
         if (fused_detect_cpu()->has_neon) {
             tonemap_luma_neon(lut_y, src_y, src_y_stride, dst_y, dst_y_stride,
                               width, height);
+        } else
+#elif defined(__riscv) && (__riscv_xlen == 64)
+        if (fused_detect_cpu()->has_rvv) {
+            fused_tonemap_luma_rvv(lut_y, src_y, src_y_stride,
+                                   dst_y, dst_y_stride, width, height);
         } else
 #endif
         {
@@ -763,52 +769,85 @@ void fused_tonemap_apply_p010(
         return;
     }
 
-    /* Full per-pixel RGB reconstruction at luma resolution */
-    for (int y = 0; y < height; y++) {
-        const uint16_t *sy  = src_y  + y * src_y_pitch;
-        const uint16_t *suv = src_uv + (y / 2) * src_uv_pitch;
-        uint8_t        *dy  = dst_y  + y * dst_y_stride;
-
-        for (int x = 0; x < width; x++) {
-            int y_pq  = sy[x] & 0x3FF;
-            int cb_10 = suv[(x / 2) * 2]     & 0x3FF;
-            int cr_10 = suv[(x / 2) * 2 + 1] & 0x3FF;
-
-            int r_sdr, g_sdr, b_sdr;
-            tonemap_pixel_rgb(pq_to_linear, linear_to_sdr,
-                              y_pq, cb_10, cr_10,
-                              &r_sdr, &g_sdr, &b_sdr);
-
-            dy[x] = (uint8_t)clamp_i(
-                (int)(BT709_KR * r_sdr + BT709_KG * g_sdr
-                    + BT709_KB * b_sdr + 0.5), 0, 255);
-        }
+#if defined(__x86_64__)
+    if (fused_detect_cpu()->has_avx512 && fused_tonemap_avx512_compiled()) {
+        fused_tonemap_apply_p010_avx512(state, src_y, src_y_stride,
+                                        src_uv, src_uv_stride,
+                                        dst_y, dst_y_stride,
+                                        dst_u, dst_uv_stride, dst_v,
+                                        width, height);
+        return;
     }
+    if (fused_detect_cpu()->has_avx2) {
+        fused_tonemap_apply_p010_avx2(state, src_y, src_y_stride,
+                                      src_uv, src_uv_stride,
+                                      dst_y, dst_y_stride,
+                                      dst_u, dst_uv_stride, dst_v,
+                                      width, height);
+        return;
+    }
+#elif defined(__aarch64__) || defined(_M_ARM64)
+    if (fused_detect_cpu()->has_neon) {
+        fused_tonemap_apply_p010_neon(state, src_y, src_y_stride,
+                                      src_uv, src_uv_stride,
+                                      dst_y, dst_y_stride,
+                                      dst_u, dst_uv_stride, dst_v,
+                                      width, height);
+        return;
+    }
+#elif defined(__riscv) && (__riscv_xlen == 64)
+    if (fused_detect_cpu()->has_rvv) {
+        fused_tonemap_apply_p010_rvv(state, src_y, src_y_stride,
+                                     src_uv, src_uv_stride,
+                                     dst_y, dst_y_stride,
+                                     dst_u, dst_uv_stride, dst_v,
+                                     width, height);
+        return;
+    }
+#endif
 
-    /* Chroma at chroma resolution */
+    fused_tonemap_apply_p010_scalar(state, src_y, src_y_stride,
+                                    src_uv, src_uv_stride,
+                                    dst_y, dst_y_stride,
+                                    dst_u, dst_uv_stride, dst_v,
+                                    width, height);
+}
+
+
+/* --------------------------------------------------------------------------
+ * fused_tonemap_apply_p010_scalar - built-in-curve reference path (P010)
+ * -------------------------------------------------------------------------- */
+
+FUSED_HOT
+void fused_tonemap_apply_p010_scalar(
+    const fused_hdr_internal_t *state,
+    const uint16_t *src_y,  int src_y_stride,
+    const uint16_t *src_uv, int src_uv_stride,
+    uint8_t *dst_y, int dst_y_stride,
+    uint8_t *dst_u, int dst_uv_stride,
+    uint8_t *dst_v,
+    int width, int height)
+{
+    int chroma_w = width  / 2;
+    int chroma_h = height / 2;
+
+    int src_y_pitch  = src_y_stride  / (int)sizeof(uint16_t);
+    int src_uv_pitch = src_uv_stride / (int)sizeof(uint16_t);
+
     for (int cy = 0; cy < chroma_h; cy++) {
         const uint16_t *suv = src_uv + cy * src_uv_pitch;
-        const uint16_t *sy  = src_y  + (cy * 2) * src_y_pitch;
+        const uint16_t *sy0 = src_y  + (cy * 2) * src_y_pitch;
+        const uint16_t *sy1 = sy0 + src_y_pitch;
+        uint8_t        *dy0 = dst_y  + (cy * 2) * dst_y_stride;
+        uint8_t        *dy1 = dy0 + dst_y_stride;
         uint8_t        *du  = dst_u  + cy * dst_uv_stride;
         uint8_t        *dv  = dst_v  + cy * dst_uv_stride;
 
         for (int cx = 0; cx < chroma_w; cx++) {
-            int y_pq  = sy[cx * 2] & 0x3FF;
-            int cb_10 = suv[cx * 2]     & 0x3FF;
-            int cr_10 = suv[cx * 2 + 1] & 0x3FF;
-
-            int r_sdr, g_sdr, b_sdr;
-            tonemap_pixel_rgb(pq_to_linear, linear_to_sdr,
-                              y_pq, cb_10, cr_10,
-                              &r_sdr, &g_sdr, &b_sdr);
-
-            int y_sdr = (int)(BT709_KR * r_sdr + BT709_KG * g_sdr
-                            + BT709_KB * b_sdr + 0.5);
-            int cb_sdr = (int)((b_sdr - y_sdr) / (2.0 * (1.0 - BT709_KB)) + 128.5);
-            int cr_sdr = (int)((r_sdr - y_sdr) / (2.0 * (1.0 - BT709_KR)) + 128.5);
-
-            du[cx] = (uint8_t)clamp_i(cb_sdr, 0, 255);
-            dv[cx] = (uint8_t)clamp_i(cr_sdr, 0, 255);
+            fused_tm_block(state, suv[cx * 2] & 0x3FF, suv[cx * 2 + 1] & 0x3FF,
+                           sy0 + cx * 2, sy1 + cx * 2,
+                           dy0 + cx * 2, dy1 + cx * 2,
+                           &du[cx], &dv[cx]);
         }
     }
 }

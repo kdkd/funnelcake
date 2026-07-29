@@ -10,6 +10,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include "funnelcake.h"   /* fused_simd_available(), FUSED_WARN_BIT_SCALAR */
 
 /* --------------------------------------------------------------------------
  * Test result counters
@@ -43,6 +44,30 @@ extern test_results_t g_results;
         if ((a) != (b)) { \
             printf("  FAIL [%s:%d] %s: got %d, expected %d\n", \
                    __func__, __LINE__, (msg), (int)(a), (int)(b)); \
+            g_results.failed++; \
+            return; \
+        } \
+    } while (0)
+
+/* TEST_ASSERT_OK: assert that an init call reported full success.
+ *
+ * On a CPU with no SIMD support, the library legitimately reports
+ * FUSED_WARN_BIT_SCALAR for an otherwise-perfect init (every output falls back
+ * to the scalar kernel). That bit is expected there, not a failure, so it is
+ * tolerated when - and only when - fused_simd_available() reports no SIMD.
+ * Any other warning bit (PARTIAL, CROPPED) or hard error still fails the
+ * assertion, and on a SIMD-capable CPU the check stays exact (rc == FUSED_OK).
+ *
+ * Use this in place of TEST_ASSERT_EQ(rc, FUSED_OK, ...) wherever a clean,
+ * SIMD-path init is expected. */
+#define TEST_ASSERT_OK(rc, msg) \
+    do { \
+        int rc__    = (rc); \
+        int allow__ = fused_simd_available() ? 0 : FUSED_WARN_BIT_SCALAR; \
+        if ((rc__ & ~allow__) != 0) { \
+            printf("  FAIL [%s:%d] %s: rc=%d, expected FUSED_OK%s\n", \
+                   __func__, __LINE__, (msg), rc__, \
+                   allow__ ? " (or scalar fallback)" : ""); \
             g_results.failed++; \
             return; \
         } \
@@ -84,6 +109,7 @@ void run_visual_tests(void);
 void run_bench_tests(const char *filter);
 void run_hdr_validation_tests(void);
 void run_hdr_correctness_tests(void);
+void run_tonemap_tests(void);
 void run_hdr_bench_tests(const char *filter);
 void run_swscale_bench_tests(const char *filter);
 
@@ -110,6 +136,7 @@ typedef struct {
     int         run_bench_sdr;     /* --bench-sdr: SDR benchmarks only */
     int         run_bench_hdr;     /* --bench-hdr: HDR benchmarks only */
     int         run_bench_swscale; /* --bench-swscale: libswscale comparison only */
+    int         skip_bench_swscale;/* --skip-bench-swscale: never run swscale bench */
     int         run_visual;
     const char *bench_filter;
 } test_options_t;

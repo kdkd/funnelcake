@@ -135,6 +135,17 @@ int fused_hdr_init(fused_hdr_ctx_t *ctx)
         return FUSED_ERR_INVALID_FLAGS;
     }
 
+    if ((ctx->tonemap.src_range != FUSED_RANGE_LIMITED &&
+         ctx->tonemap.src_range != FUSED_RANGE_FULL) ||
+        (ctx->tonemap.dst_range != FUSED_RANGE_LIMITED &&
+         ctx->tonemap.dst_range != FUSED_RANGE_FULL)) {
+        fused_log(&ctx->log_errors, FUSED_LOG_ERROR,
+            "funnelcake-hdr: tonemap src_range=%d/dst_range=%d invalid "
+            "(must be FUSED_RANGE_LIMITED or FUSED_RANGE_FULL)\n",
+            ctx->tonemap.src_range, ctx->tonemap.dst_range);
+        return FUSED_ERR_INVALID_FLAGS;
+    }
+
     /* hdr_flags and sdr_flags must be subsets of requested_flags */
     if (ctx->hdr_flags & ~ctx->requested_flags) {
         fused_log(&ctx->log_errors, FUSED_LOG_ERROR,
@@ -203,6 +214,21 @@ int fused_hdr_init(fused_hdr_ctx_t *ctx)
                 "prefix\n", up_req);
             return FUSED_ERR_INVALID_FLAGS;
         }
+    }
+
+    /* SDR upscale copies tone-map an achieved 10-bit upscale level, so
+     * they can only be requested where the 10-bit output is requested. */
+    if (ctx->upscale_sdr_flags & ~up_req) {
+        fused_log(&ctx->log_errors, FUSED_LOG_ERROR,
+            "funnelcake-hdr: upscale_sdr_flags 0x%02X is not a subset of "
+            "upscale_flags 0x%02X\n", ctx->upscale_sdr_flags, up_req);
+        return FUSED_ERR_INVALID_FLAGS;
+    }
+    if (ctx->upscale_sdr_tail_1_5x && !up_tail) {
+        fused_log(&ctx->log_errors, FUSED_LOG_ERROR,
+            "funnelcake-hdr: upscale_sdr_tail_1_5x requires "
+            "upscale_tail_1_5x\n");
+        return FUSED_ERR_INVALID_FLAGS;
     }
 
     int has_thirds = (req & FUSED_SCALE_THIRDS_MASK) != 0;
@@ -295,6 +321,17 @@ int fused_hdr_init(fused_hdr_ctx_t *ctx)
         simd_upscale_fn   = fused_kernel_upscale_hdr_avx2;
         simd_thirds_up_fn = fused_kernel_thirds_up_hdr_avx2;
         simd_pow2_up_fn   = fused_kernel_pow2_up_hdr_avx2;
+
+        /* Same gating as the SDR dispatch in funnelcake.c: hardware caps
+         * plus a compiler that actually built AVX-512 code.  Unported
+         * entry points delegate to AVX2 internally. */
+        if (caps->has_avx512 && fused_avx512_compiled()) {
+            simd_thirds_fn    = fused_kernel_thirds_hdr_avx512;
+            simd_pow2_fn      = fused_kernel_pow2_hdr_avx512;
+            simd_upscale_fn   = fused_kernel_upscale_hdr_avx512;
+            simd_thirds_up_fn = fused_kernel_thirds_up_hdr_avx512;
+            simd_pow2_up_fn   = fused_kernel_pow2_up_hdr_avx512;
+        }
     }
 #elif defined(__riscv) && (__riscv_xlen == 64)
     if (caps->has_rvv) {
@@ -389,7 +426,7 @@ int fused_hdr_init(fused_hdr_ctx_t *ctx)
 
         /* (d) SIMD chroma width constraint */
         int chroma_w = out_w / 2;
-        int step_fallback = 0;
+        int step_fallback = !has_simd;
 
         if (has_simd && (chroma_w & 31)) {
             if (ctx->options & FUSED_OPT_NO_FALLBACK) {
@@ -515,8 +552,10 @@ int fused_hdr_init(fused_hdr_ctx_t *ctx)
 
     uint32_t up_achieved_hdr = 0;
     int      up_achieved_tail = 0;
+    uint32_t up_achieved_sdr = 0;   /* bit FUSED_UP_IDX_TAIL = tail copy */
 
     memset(ctx->upscale_hdr_outputs, 0, sizeof(ctx->upscale_hdr_outputs));
+    memset(ctx->upscale_sdr_outputs, 0, sizeof(ctx->upscale_sdr_outputs));
 
     int up_N = 0;
     {
@@ -564,6 +603,34 @@ int fused_hdr_init(fused_hdr_ctx_t *ctx)
         ctx->upscale_hdr_outputs[k].fallback  = !has_simd;
 
         up_achieved_hdr |= (1u << k);
+
+        /* Tone-mapped SDR copy of this level */
+        if (ctx->upscale_sdr_flags & (1u << k)) {
+            int s_y_stride  = stride_for(up_w);
+            int s_uv_stride = stride_for(uv_w);
+            void *sy = NULL, *su = NULL, *sv = NULL;
+            if (fused_alloc_aligned(&sy, 32, (size_t)s_y_stride  * (size_t)up_h)    != 0 ||
+                fused_alloc_aligned(&su, 32, (size_t)s_uv_stride * (size_t)chroma_h) != 0 ||
+                fused_alloc_aligned(&sv, 32, (size_t)s_uv_stride * (size_t)chroma_h) != 0) {
+                fused_aligned_free(sy);
+                fused_aligned_free(su);
+                fused_aligned_free(sv);
+                fused_log(&ctx->log_warnings, FUSED_LOG_WARN,
+                    "funnelcake-hdr: SDR copy of upscale level %dx rejected: "
+                    "out-of-memory\n", (1 << (k + 1)));
+                warn_bits |= FUSED_WARN_BIT_PARTIAL;
+            } else {
+                ctx->upscale_sdr_outputs[k].width     = up_w;
+                ctx->upscale_sdr_outputs[k].height    = up_h;
+                ctx->upscale_sdr_outputs[k].y_stride  = s_y_stride;
+                ctx->upscale_sdr_outputs[k].uv_stride = s_uv_stride;
+                ctx->upscale_sdr_outputs[k].plane_y   = (uint8_t *)sy;
+                ctx->upscale_sdr_outputs[k].plane_u   = (uint8_t *)su;
+                ctx->upscale_sdr_outputs[k].plane_v   = (uint8_t *)sv;
+                ctx->upscale_sdr_outputs[k].fallback  = !has_simd;
+                up_achieved_sdr |= (1u << k);
+            }
+        }
     }
 
     if (up_tail) {
@@ -630,11 +697,42 @@ int fused_hdr_init(fused_hdr_ctx_t *ctx)
         ctx->upscale_hdr_outputs[FUSED_UP_IDX_TAIL].fallback  = !has_simd;
 
         up_achieved_tail = 1;
+
+        /* Tone-mapped SDR copy of the tail */
+        if (ctx->upscale_sdr_tail_1_5x) {
+            int s_y_stride  = stride_for(tail_w);
+            int s_uv_stride = stride_for(tail_uv_w);
+            void *sy = NULL, *su = NULL, *sv = NULL;
+            if (fused_alloc_aligned(&sy, 32, (size_t)s_y_stride  * (size_t)tail_h)   != 0 ||
+                fused_alloc_aligned(&su, 32, (size_t)s_uv_stride * (size_t)chroma_h) != 0 ||
+                fused_alloc_aligned(&sv, 32, (size_t)s_uv_stride * (size_t)chroma_h) != 0) {
+                fused_aligned_free(sy);
+                fused_aligned_free(su);
+                fused_aligned_free(sv);
+                fused_log(&ctx->log_warnings, FUSED_LOG_WARN,
+                    "funnelcake-hdr: SDR copy of upscale 1.5x tail rejected: "
+                    "out-of-memory\n");
+                warn_bits |= FUSED_WARN_BIT_PARTIAL;
+            } else {
+                ctx->upscale_sdr_outputs[FUSED_UP_IDX_TAIL].width     = tail_w;
+                ctx->upscale_sdr_outputs[FUSED_UP_IDX_TAIL].height    = tail_h;
+                ctx->upscale_sdr_outputs[FUSED_UP_IDX_TAIL].y_stride  = s_y_stride;
+                ctx->upscale_sdr_outputs[FUSED_UP_IDX_TAIL].uv_stride = s_uv_stride;
+                ctx->upscale_sdr_outputs[FUSED_UP_IDX_TAIL].plane_y   = (uint8_t *)sy;
+                ctx->upscale_sdr_outputs[FUSED_UP_IDX_TAIL].plane_u   = (uint8_t *)su;
+                ctx->upscale_sdr_outputs[FUSED_UP_IDX_TAIL].plane_v   = (uint8_t *)sv;
+                ctx->upscale_sdr_outputs[FUSED_UP_IDX_TAIL].fallback  = !has_simd;
+                up_achieved_sdr |= (1u << FUSED_UP_IDX_TAIL);
+            }
+        }
     }
 hdr_tail_done:
 
-    ctx->achieved_upscale_flags = up_achieved_hdr;
-    ctx->achieved_upscale_tail  = up_achieved_tail;
+    ctx->achieved_upscale_flags     = up_achieved_hdr;
+    ctx->achieved_upscale_tail      = up_achieved_tail;
+    ctx->achieved_upscale_sdr_flags = up_achieved_sdr & ~(1u << FUSED_UP_IDX_TAIL);
+    ctx->achieved_upscale_sdr_tail  = (up_achieved_sdr >> FUSED_UP_IDX_TAIL) & 1;
+    state->upscale_sdr_levels       = up_achieved_sdr;
 
     /* ------------------------------------------------------------------ */
     /* Check that at least one step was achieved (or tonemap_1x is set)     */
@@ -664,12 +762,19 @@ hdr_tail_done:
     memset(&ctx->output_1x, 0, sizeof(fused_scale_output_t));
 
     if (ctx->tonemap_1x) {
-        int y_stride  = stride_for(eff_w);
-        int uv_stride = stride_for(eff_w / 2);
-        int chroma_h  = eff_h / 2;
+        /* The 1:1 tone map reads the source frame directly and has no
+         * cascade divisor constraints, so it is NOT subject to
+         * crop-to-fit: it covers the full source frame even when the
+         * scaled outputs are cropped (src dims are already validated
+         * even, which is all the tone map needs). */
+        int w_1x = ctx->src_width;
+        int h_1x = ctx->src_height;
+        int y_stride  = stride_for(w_1x);
+        int uv_stride = stride_for(w_1x / 2);
+        int chroma_h  = h_1x / 2;
 
         void *py = NULL, *pu = NULL, *pv = NULL;
-        if (fused_aligned_alloc(&py, 32, (size_t)y_stride  * (size_t)eff_h)    != 0 ||
+        if (fused_aligned_alloc(&py, 32, (size_t)y_stride  * (size_t)h_1x)     != 0 ||
             fused_aligned_alloc(&pu, 32, (size_t)uv_stride * (size_t)chroma_h) != 0 ||
             fused_aligned_alloc(&pv, 32, (size_t)uv_stride * (size_t)chroma_h) != 0) {
             fused_aligned_free(py); fused_aligned_free(pu); fused_aligned_free(pv);
@@ -679,21 +784,21 @@ hdr_tail_done:
             return FUSED_ERR_OUT_OF_MEMORY;
         }
 
-        ctx->output_1x.width     = eff_w;
-        ctx->output_1x.height    = eff_h;
+        ctx->output_1x.width     = w_1x;
+        ctx->output_1x.height    = h_1x;
         ctx->output_1x.y_stride  = y_stride;
         ctx->output_1x.uv_stride = uv_stride;
         ctx->output_1x.plane_y   = (uint8_t *)py;
         ctx->output_1x.plane_u   = (uint8_t *)pu;
         ctx->output_1x.plane_v   = (uint8_t *)pv;
-        ctx->output_1x.fallback  = 0;
+        ctx->output_1x.fallback  = !has_simd;
     }
 
     /* ------------------------------------------------------------------ */
     /* 8. Generate tone mapping LUTs                                        */
     /* ------------------------------------------------------------------ */
 
-    if (achieved_sdr || ctx->tonemap_1x) {
+    if (achieved_sdr || ctx->tonemap_1x || up_achieved_sdr) {
         fused_tonemap_generate_luts(state, ctx->src_transfer,
                                     &ctx->tonemap, &ctx->log_warnings);
     }
@@ -831,7 +936,8 @@ hdr_tail_done:
 
     /* Upscale scratch row buffer (HDR, u16).  One-time allocation to
      * keep the per-frame hot path free of malloc/free. */
-    p->upscale_scratch_hdr = NULL;
+    p->upscale_scratch_hdr  = NULL;
+    p->upscale_scratch_hdr2 = NULL;
     if (want_up) {
         int max_scratch_w = 0;
         if (up_N >= 1) {
@@ -843,10 +949,14 @@ hdr_tail_done:
             if (tv > max_scratch_w) max_scratch_w = tv;
         }
         if (max_scratch_w > 0) {
-            size_t bytes = (size_t)((max_scratch_w + 63) & ~63) * sizeof(uint16_t);
+            /* Two aligned u16 rows from one allocation (see the SDR path /
+             * upscale_scratch2): row 0 = vertical-blend buffer, row 1 =
+             * two-pass interleave temp. */
+            size_t row = (size_t)((max_scratch_w + 63) & ~63) * sizeof(uint16_t);
             void *sp = NULL;
-            if (fused_aligned_alloc(&sp, 64, bytes) == 0) {
-                p->upscale_scratch_hdr = (uint16_t *)sp;
+            if (fused_aligned_alloc(&sp, 64, row * 2) == 0) {
+                p->upscale_scratch_hdr  = (uint16_t *)sp;
+                p->upscale_scratch_hdr2 = (uint16_t *)((uint8_t *)sp + row);
             } else {
                 fused_log(&ctx->log_warnings, FUSED_LOG_WARN,
                     "funnelcake-hdr: failed to allocate upscale scratch buffer\n");
@@ -1012,6 +1122,29 @@ void fused_hdr_run(fused_hdr_ctx_t *ctx,
     }
 
     /* ------------------------------------------------------------------ */
+    /* 3b. Apply tone mapping to each SDR upscale copy                      */
+    /*     (the upscale kernel has already filled upscale_hdr_outputs)      */
+    /* ------------------------------------------------------------------ */
+
+    if (state->upscale_sdr_levels) {
+        for (int k = 0; k < FUSED_MAX_UPSCALE_STEPS; k++) {
+            if (!(state->upscale_sdr_levels & (1u << k))) continue;
+
+            const fused_hdr_output_t *up = &ctx->upscale_hdr_outputs[k];
+            fused_scale_output_t     *out = &ctx->upscale_sdr_outputs[k];
+
+            fused_tonemap_apply(state,
+                up->plane_y, up->y_stride,
+                up->plane_u, up->uv_stride,
+                up->plane_v,
+                out->plane_y, out->y_stride,
+                out->plane_u, out->uv_stride,
+                out->plane_v,
+                up->width, up->height);
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
     /* 4. 1:1 tone map (source resolution, no scaling)                      */
     /* ------------------------------------------------------------------ */
 
@@ -1023,7 +1156,7 @@ void fused_hdr_run(fused_hdr_ctx_t *ctx,
                 ctx->output_1x.plane_y, ctx->output_1x.y_stride,
                 ctx->output_1x.plane_u, ctx->output_1x.uv_stride,
                 ctx->output_1x.plane_v,
-                ctx->effective_width, ctx->effective_height);
+                ctx->src_width, ctx->src_height);
         } else {
             fused_tonemap_apply(state,
                 src_y, ctx->src_y_stride,
@@ -1032,7 +1165,7 @@ void fused_hdr_run(fused_hdr_ctx_t *ctx,
                 ctx->output_1x.plane_y, ctx->output_1x.y_stride,
                 ctx->output_1x.plane_u, ctx->output_1x.uv_stride,
                 ctx->output_1x.plane_v,
-                ctx->effective_width, ctx->effective_height);
+                ctx->src_width, ctx->src_height);
         }
     }
 }
@@ -1072,6 +1205,9 @@ void fused_hdr_free(fused_hdr_ctx_t *ctx)
         fused_aligned_free(state->params.p010_tmp_u);
         fused_aligned_free(state->params.p010_tmp_v);
         fused_aligned_free(state->params.upscale_scratch_hdr);
+        /* upscale_scratch_hdr2 aliases into the same allocation - do not
+         * free it separately. */
+        state->params.upscale_scratch_hdr2 = NULL;
         fused_aligned_free(state->params.scratch_pool);
         free(state);
     }
@@ -1082,12 +1218,16 @@ void fused_hdr_free(fused_hdr_ctx_t *ctx)
     fused_aligned_free(ctx->output_1x.plane_v);
     memset(&ctx->output_1x, 0, sizeof(fused_scale_output_t));
 
-    /* Free upscale HDR output planes */
+    /* Free upscale HDR and SDR output planes */
     for (int i = 0; i < FUSED_MAX_UPSCALE_STEPS; i++) {
         fused_aligned_free(ctx->upscale_hdr_outputs[i].plane_y);
         fused_aligned_free(ctx->upscale_hdr_outputs[i].plane_u);
         fused_aligned_free(ctx->upscale_hdr_outputs[i].plane_v);
         memset(&ctx->upscale_hdr_outputs[i], 0, sizeof(fused_hdr_output_t));
+        fused_aligned_free(ctx->upscale_sdr_outputs[i].plane_y);
+        fused_aligned_free(ctx->upscale_sdr_outputs[i].plane_u);
+        fused_aligned_free(ctx->upscale_sdr_outputs[i].plane_v);
+        memset(&ctx->upscale_sdr_outputs[i], 0, sizeof(fused_scale_output_t));
     }
 
     ctx->_internal              = NULL;

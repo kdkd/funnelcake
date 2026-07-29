@@ -60,6 +60,7 @@ rm -rf "${DIST_DIR}/${package_dir}"
 mkdir -p "${DIST_DIR}/${package_dir}/include"
 cp "${REPO_ROOT}/libfunnelcake.a" "${DIST_DIR}/${package_dir}/"
 cp "${REPO_ROOT}/include/funnelcake.h" "${DIST_DIR}/${package_dir}/include/"
+cp "${REPO_ROOT}/include/funnelcake_helpers.h" "${DIST_DIR}/${package_dir}/include/"
 cp "${REPO_ROOT}/README.md" "${REPO_ROOT}/INSTALL.md" "${DIST_DIR}/${package_dir}/"
 
 {

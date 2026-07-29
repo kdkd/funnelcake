@@ -44,13 +44,42 @@
  * - Row 2i+1 = horizontally-doubled copy of vert_avg(src[i], src[i+1])
  *              (src[h-1] replicated as "row h" at the bottom edge)
  */
-static void up_2x_plane_u8(const uint8_t *src, int src_w, int src_h,
-                           int src_stride, uint8_t *dst, int dst_stride,
-                           uint8_t *scratch)
+/* Two-pass horizontal 2x expand of one row.  Pass 1 writes the bilinear
+ * midpoints (avg of adjacent samples) contiguously into `tmp`; pass 2
+ * interleaves the source row with `tmp` into `dst`:
+ *      dst[2i] = src[i],  dst[2i+1] = avg(src[i], src[i+1])
+ *
+ * The obvious single fused loop (compute-and-interleave in one go) makes
+ * the compiler fall back to an 8-wide widening sequence (punpcklbw->pavgw
+ * ->pack) for the interleaved store.  Splitting into two contiguous passes
+ * instead lets it emit a 16-wide pavgb pass and a punpck-based interleave
+ * pass - roughly 2-4x the per-row throughput on x86-64 SSE2, which is what
+ * closes the gap to libswscale's bilinear on AVX2-less CPUs.  `tmp` must be
+ * distinct from both `src` and `dst`. */
+static inline void up_h_2x_row_2pass_u8(const uint8_t *restrict src, int w,
+                                        uint8_t *restrict dst,
+                                        uint8_t *restrict tmp)
 {
-    /* `scratch` is a persistent row buffer sized at init to the widest
-     * row any upscale helper will process.  Avoids per-frame malloc. */
-    if (!scratch) return;
+    int i;
+    for (i = 0; i + 1 < w; i++)
+        tmp[i] = up_avg_u8(src[i], src[i + 1]);
+    if (w > 0)
+        tmp[w - 1] = src[w - 1];          /* edge: avg(a,a) == a */
+    for (i = 0; i < w; i++) {
+        dst[2 * i + 0] = src[i];
+        dst[2 * i + 1] = tmp[i];
+    }
+}
+
+static void up_2x_plane_u8(const uint8_t *restrict src, int src_w, int src_h,
+                           int src_stride, uint8_t *restrict dst, int dst_stride,
+                           uint8_t *restrict vbuf, uint8_t *restrict hbuf)
+{
+    /* `vbuf`/`hbuf` are two persistent row buffers sized at init to the
+     * widest row any upscale helper will process: vbuf holds the vertical
+     * midpoint row, hbuf the horizontal two-pass temp.  Avoids per-frame
+     * malloc. */
+    if (!vbuf || !hbuf) return;
 
     for (int i = 0; i < src_h; i++) {
         const uint8_t *row_cur = src + (size_t)i * src_stride;
@@ -59,15 +88,17 @@ static void up_2x_plane_u8(const uint8_t *src, int src_w, int src_h,
                                     : row_cur;
 
         /* Output row 2i+0 = horizontally-doubled row_cur */
-        up_h_2x_row_u8(row_cur, src_w, dst + (size_t)(2 * i) * dst_stride);
+        up_h_2x_row_2pass_u8(row_cur, src_w,
+                             dst + (size_t)(2 * i) * dst_stride, hbuf);
 
         /* Vertical midpoint of row_cur and row_nxt */
         for (int x = 0; x < src_w; x++) {
-            scratch[x] = up_avg_u8(row_cur[x], row_nxt[x]);
+            vbuf[x] = up_avg_u8(row_cur[x], row_nxt[x]);
         }
 
         /* Output row 2i+1 = horizontally-doubled midrow */
-        up_h_2x_row_u8(scratch, src_w, dst + (size_t)(2 * i + 1) * dst_stride);
+        up_h_2x_row_2pass_u8(vbuf, src_w,
+                             dst + (size_t)(2 * i + 1) * dst_stride, hbuf);
     }
 }
 
@@ -83,9 +114,9 @@ static void up_2x_plane_u8(const uint8_t *src, int src_w, int src_h,
  *   output row 3j+2 = horizontally-1.5x of blend(src[2j+1], src[2j+2]) (2/3, 1/3)
  *                     with src[h] replicated to src[h-1] at bottom edge
  */
-static void up_1_5x_plane_u8(const uint8_t *src, int src_w, int src_h,
-                             int src_stride, uint8_t *dst, int dst_stride,
-                             uint8_t *scratch)
+static void up_1_5x_plane_u8(const uint8_t *restrict src, int src_w, int src_h,
+                             int src_stride, uint8_t *restrict dst, int dst_stride,
+                             uint8_t *restrict scratch)
 {
     if (!scratch) return;
 
@@ -148,7 +179,7 @@ static void upscale_plane_scalar(const fused_kernel_params_t *p,
             dst_stride = p->up_out[FUSED_UP_IDX_2X].uv_stride;
         }
         if (dst) up_2x_plane_u8(src, src_w, src_h, src_stride, dst, dst_stride,
-                                p->upscale_scratch);
+                                p->upscale_scratch, p->upscale_scratch2);
     }
 
     /* Levels 1..N-1 cascade from up_out[k-1] -> up_out[k] */
@@ -175,7 +206,7 @@ static void upscale_plane_scalar(const fused_kernel_params_t *p,
         }
         if (src_up && dst) {
             up_2x_plane_u8(src_up, src_up_w, src_up_h, src_up_stride,
-                           dst, dst_stride, p->upscale_scratch);
+                           dst, dst_stride, p->upscale_scratch, p->upscale_scratch2);
         }
     }
 
@@ -275,11 +306,28 @@ void fused_kernel_pow2_up_scalar(const fused_kernel_params_t *p,
  * HDR - same structure with uint16_t planes and 10-bit-aware helpers.
  * ======================================================================= */
 
-static void up_2x_plane_u16(const uint16_t *src, int src_w, int src_h,
-                            int src_el_stride, uint16_t *dst, int dst_el_stride,
-                            uint16_t *scratch)
+/* Two-pass horizontal 2x expand for 10-bit rows.  See up_h_2x_row_2pass_u8
+ * for the rationale; here the vectorized passes use pavgw / 16-bit punpck. */
+static inline void up_h_2x_row_2pass_u16(const uint16_t *restrict src, int w,
+                                         uint16_t *restrict dst,
+                                         uint16_t *restrict tmp)
 {
-    if (!scratch) return;
+    int i;
+    for (i = 0; i + 1 < w; i++)
+        tmp[i] = up_avg_u16(src[i], src[i + 1]);
+    if (w > 0)
+        tmp[w - 1] = src[w - 1];
+    for (i = 0; i < w; i++) {
+        dst[2 * i + 0] = src[i];
+        dst[2 * i + 1] = tmp[i];
+    }
+}
+
+static void up_2x_plane_u16(const uint16_t *restrict src, int src_w, int src_h,
+                            int src_el_stride, uint16_t *restrict dst, int dst_el_stride,
+                            uint16_t *restrict vbuf, uint16_t *restrict hbuf)
+{
+    if (!vbuf || !hbuf) return;
 
     for (int i = 0; i < src_h; i++) {
         const uint16_t *row_cur = src + (size_t)i * src_el_stride;
@@ -287,21 +335,21 @@ static void up_2x_plane_u16(const uint16_t *src, int src_w, int src_h,
                                     ? src + (size_t)(i + 1) * src_el_stride
                                     : row_cur;
 
-        up_h_2x_row_u16(row_cur, src_w,
-                        dst + (size_t)(2 * i) * dst_el_stride);
+        up_h_2x_row_2pass_u16(row_cur, src_w,
+                              dst + (size_t)(2 * i) * dst_el_stride, hbuf);
 
         for (int x = 0; x < src_w; x++) {
-            scratch[x] = up_avg_u16(row_cur[x], row_nxt[x]);
+            vbuf[x] = up_avg_u16(row_cur[x], row_nxt[x]);
         }
 
-        up_h_2x_row_u16(scratch, src_w,
-                        dst + (size_t)(2 * i + 1) * dst_el_stride);
+        up_h_2x_row_2pass_u16(vbuf, src_w,
+                              dst + (size_t)(2 * i + 1) * dst_el_stride, hbuf);
     }
 }
 
-static void up_1_5x_plane_u16(const uint16_t *src, int src_w, int src_h,
-                              int src_el_stride, uint16_t *dst, int dst_el_stride,
-                              uint16_t *scratch)
+static void up_1_5x_plane_u16(const uint16_t *restrict src, int src_w, int src_h,
+                              int src_el_stride, uint16_t *restrict dst, int dst_el_stride,
+                              uint16_t *restrict scratch)
 {
     if (!scratch) return;
 
@@ -351,7 +399,7 @@ static void upscale_plane_hdr_scalar(const fused_hdr_kernel_params_t *p,
             dst_el_stride = p->hdr_up_out[FUSED_UP_IDX_2X].uv_stride / (int)sizeof(uint16_t);
         }
         if (dst) up_2x_plane_u16(src, src_w, src_h, src_el_stride, dst, dst_el_stride,
-                                 p->upscale_scratch_hdr);
+                                 p->upscale_scratch_hdr, p->upscale_scratch_hdr2);
     }
 
     /* Levels 1..N-1 */
@@ -378,7 +426,7 @@ static void upscale_plane_hdr_scalar(const fused_hdr_kernel_params_t *p,
         }
         if (src_up && dst) {
             up_2x_plane_u16(src_up, src_up_w, src_up_h, src_up_el_stride,
-                            dst, dst_el_stride, p->upscale_scratch_hdr);
+                            dst, dst_el_stride, p->upscale_scratch_hdr, p->upscale_scratch_hdr2);
         }
     }
 
@@ -428,12 +476,23 @@ void fused_kernel_upscale_hdr_scalar(const fused_hdr_kernel_params_t *p,
                                      const uint16_t *src_u,
                                      const uint16_t *src_v)
 {
+    const uint16_t *up_src_u = src_u;
+    const uint16_t *up_src_v = src_v;
+    int up_src_uv_el_stride = p->src_uv_el_stride;
+
+    if (p->is_p010) {
+        if (fused_hdr_deinterleave_p010(p, src_u) != 0) return;
+        up_src_u = p->p010_tmp_u;
+        up_src_v = p->p010_tmp_v;
+        up_src_uv_el_stride = p->p010_tmp_stride / (int)sizeof(uint16_t);
+    }
+
     upscale_plane_hdr_scalar(p, src_y, p->src_width, p->src_height,
                              p->src_y_el_stride, 0);
-    upscale_plane_hdr_scalar(p, src_u, p->src_width / 2, p->src_height / 2,
-                             p->src_uv_el_stride, 1);
-    upscale_plane_hdr_scalar(p, src_v, p->src_width / 2, p->src_height / 2,
-                             p->src_uv_el_stride, 2);
+    upscale_plane_hdr_scalar(p, up_src_u, p->src_width / 2, p->src_height / 2,
+                             up_src_uv_el_stride, 1);
+    upscale_plane_hdr_scalar(p, up_src_v, p->src_width / 2, p->src_height / 2,
+                             up_src_uv_el_stride, 2);
 }
 
 void fused_kernel_thirds_up_hdr_scalar(const fused_hdr_kernel_params_t *p,

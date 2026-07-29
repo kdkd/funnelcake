@@ -25,6 +25,59 @@ static void suppress_log(fused_hdr_ctx_t *ctx)
     ctx->log_errors.target   = FUSED_LOG_SUPPRESS;
 }
 
+static int hdr_output_equal_exact(const fused_hdr_output_t *a,
+                                  const fused_hdr_output_t *b,
+                                  const char *group,
+                                  int output_idx)
+{
+    if (a->width != b->width || a->height != b->height) {
+        printf("\n  FAIL [%s:%d] P010 %s[%d] dimensions differ\n",
+               __func__, __LINE__, group, output_idx);
+        return 0;
+    }
+
+    const uint16_t *a_planes[3] = { a->plane_y, a->plane_u, a->plane_v };
+    const uint16_t *b_planes[3] = { b->plane_y, b->plane_u, b->plane_v };
+    int a_strides[3] = {
+        a->y_stride / (int)sizeof(uint16_t),
+        a->uv_stride / (int)sizeof(uint16_t),
+        a->uv_stride / (int)sizeof(uint16_t)
+    };
+    int b_strides[3] = {
+        b->y_stride / (int)sizeof(uint16_t),
+        b->uv_stride / (int)sizeof(uint16_t),
+        b->uv_stride / (int)sizeof(uint16_t)
+    };
+    static const char *plane_names[3] = { "Y", "U", "V" };
+
+    for (int plane = 0; plane < 3; plane++) {
+        if (!a_planes[plane] || !b_planes[plane]) {
+            printf("\n  FAIL [%s:%d] P010 %s[%d] %s plane missing\n",
+                   __func__, __LINE__, group, output_idx, plane_names[plane]);
+            return 0;
+        }
+
+        int width = plane == 0 ? a->width : a->width / 2;
+        int height = plane == 0 ? a->height : a->height / 2;
+        for (int y = 0; y < height; y++) {
+            const uint16_t *a_row = a_planes[plane] + y * a_strides[plane];
+            const uint16_t *b_row = b_planes[plane] + y * b_strides[plane];
+            for (int x = 0; x < width; x++) {
+                if (a_row[x] != b_row[x]) {
+                    printf("\n  FAIL [%s:%d] P010 %s[%d] %s pixel(%d,%d) "
+                           "I010=%u P010=%u\n",
+                           __func__, __LINE__, group, output_idx,
+                           plane_names[plane], x, y,
+                           (unsigned)a_row[x], (unsigned)b_row[x]);
+                    return 0;
+                }
+            }
+        }
+    }
+
+    return 1;
+}
+
 /*
  * Probe whether fused_hdr_run actually writes HDR output for a given config.
  * Run with a solid-512 source and check if any HDR output pixel is non-zero.
@@ -510,6 +563,96 @@ static void test_hdr_p010_equivalence(void)
 }
 
 /* --------------------------------------------------------------------------
+ * 6b. test_hdr_p010_combined_equivalence
+ *     Combined downscale and upscale must reuse planar P010 temporaries
+ *     without changing any Y, U, or V sample.
+ * -------------------------------------------------------------------------- */
+
+static void test_hdr_p010_combined_equivalence(void)
+{
+    const int width = 640;
+    const int height = 360;
+    const uint32_t down_flags = FUSED_SCALE_1_5X | FUSED_SCALE_3X;
+    const uint32_t up_flags = FUSED_UPSCALE_2X;
+    const uint32_t seed = 0x51a7c0de;
+    test_hdr_frame_t i010_frame;
+    test_p010_frame_t p010_frame;
+    fused_hdr_ctx_t ctx_i010;
+    fused_hdr_ctx_t ctx_p010;
+
+    int r = test_hdr_frame_create(&i010_frame, width, height,
+                                  PATTERN_RANDOM, seed);
+    TEST_ASSERT(r == 0, "test_hdr_frame_create failed for I010");
+    r = test_p010_frame_create(&p010_frame, width, height,
+                               PATTERN_RANDOM, seed);
+    if (r != 0) {
+        test_hdr_frame_free(&i010_frame);
+        TEST_ASSERT(0, "test_p010_frame_create failed");
+    }
+
+    memset(&ctx_i010, 0, sizeof(ctx_i010));
+    ctx_i010.src_width       = width;
+    ctx_i010.src_height      = height;
+    ctx_i010.src_y_stride    = i010_frame.y_stride;
+    ctx_i010.src_uv_stride   = i010_frame.uv_stride;
+    ctx_i010.src_format      = FUSED_PIX_I010;
+    ctx_i010.src_transfer    = FUSED_TRC_PQ;
+    ctx_i010.requested_flags = down_flags;
+    ctx_i010.hdr_flags       = down_flags;
+    ctx_i010.upscale_flags   = up_flags;
+    suppress_log(&ctx_i010);
+
+    memset(&ctx_p010, 0, sizeof(ctx_p010));
+    ctx_p010.src_width       = width;
+    ctx_p010.src_height      = height;
+    ctx_p010.src_y_stride    = p010_frame.y_stride;
+    ctx_p010.src_uv_stride   = p010_frame.uv_stride;
+    ctx_p010.src_format      = FUSED_PIX_P010;
+    ctx_p010.src_transfer    = FUSED_TRC_PQ;
+    ctx_p010.requested_flags = down_flags;
+    ctx_p010.hdr_flags       = down_flags;
+    ctx_p010.upscale_flags   = up_flags;
+    suppress_log(&ctx_p010);
+
+    int rc_i010 = fused_hdr_init(&ctx_i010);
+    int rc_p010 = fused_hdr_init(&ctx_p010);
+    if (rc_i010 < 0 || rc_p010 < 0) {
+        fused_hdr_free(&ctx_i010);
+        fused_hdr_free(&ctx_p010);
+        test_hdr_frame_free(&i010_frame);
+        test_p010_frame_free(&p010_frame);
+        TEST_ASSERT(0, "combined P010 or I010 init failed");
+    }
+
+    fused_hdr_run(&ctx_i010, i010_frame.plane_y,
+                  i010_frame.plane_u, i010_frame.plane_v);
+    fused_hdr_run(&ctx_p010, p010_frame.plane_y,
+                  p010_frame.plane_uv, NULL);
+
+    int equal = 1;
+    for (int i = 0; i < 8 && equal; i++) {
+        const fused_hdr_output_t *a = &ctx_i010.hdr_outputs[i];
+        const fused_hdr_output_t *b = &ctx_p010.hdr_outputs[i];
+        if (!a->plane_y && !b->plane_y) continue;
+        equal = hdr_output_equal_exact(a, b, "down", i);
+    }
+    for (int i = 0; i < FUSED_MAX_UPSCALE_STEPS && equal; i++) {
+        const fused_hdr_output_t *a = &ctx_i010.upscale_hdr_outputs[i];
+        const fused_hdr_output_t *b = &ctx_p010.upscale_hdr_outputs[i];
+        if (!a->plane_y && !b->plane_y) continue;
+        equal = hdr_output_equal_exact(a, b, "up", i);
+    }
+
+    fused_hdr_free(&ctx_i010);
+    fused_hdr_free(&ctx_p010);
+    test_hdr_frame_free(&i010_frame);
+    test_p010_frame_free(&p010_frame);
+
+    TEST_ASSERT(equal, "combined P010 output differs from I010");
+    TEST_PASS();
+}
+
+/* --------------------------------------------------------------------------
  * 7. test_hdr_curve_variation
  *    Each preset (Hable/Reinhard/BT2390) produces different output on same input
  * -------------------------------------------------------------------------- */
@@ -946,6 +1089,168 @@ static void test_hdr_p010_tonemap_1x(void)
     TEST_PASS();
 }
 
+/* --------------------------------------------------------------------------
+ * 13b. test_hdr_tonemap_1x_not_cropped
+ *      tonemap_1x combined with a ladder that triggers crop-to-fit
+ *      (1920x1080 with a pow2 8x ladder crops the effective area to
+ *      1920x1072).  The 1:1 tone map reads the source directly, so its
+ *      output must cover the full source frame - including the rows the
+ *      scaled outputs crop away.
+ * -------------------------------------------------------------------------- */
+
+static void test_hdr_tonemap_1x_not_cropped(void)
+{
+    test_hdr_frame_t frame;
+    int r = test_hdr_frame_create(&frame, 1920, 1080, PATTERN_RANDOM, 0xC0FFEEu);
+    TEST_ASSERT(r == 0, "test_hdr_frame_create failed");
+
+    fused_hdr_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.src_width      = frame.width;
+    ctx.src_height     = frame.height;
+    ctx.src_y_stride   = frame.y_stride;
+    ctx.src_uv_stride  = frame.uv_stride;
+    ctx.src_format     = FUSED_PIX_I010;
+    ctx.src_transfer   = FUSED_TRC_PQ;
+    ctx.requested_flags = FUSED_SCALE_2X | FUSED_SCALE_4X | FUSED_SCALE_8X;
+    ctx.hdr_flags      = FUSED_SCALE_2X | FUSED_SCALE_4X | FUSED_SCALE_8X;
+    ctx.tonemap_1x     = 1;
+    suppress_log(&ctx);
+
+    int rc = fused_hdr_init(&ctx);
+    TEST_ASSERT(rc >= 0, "init should succeed");
+    /* The ladder is cropped... */
+    TEST_ASSERT_EQ(ctx.hdr_outputs[1].height, 536, "2x output height = 1072/2");
+    /* ...but the 1:1 tone map is not. */
+    TEST_ASSERT_EQ(ctx.output_1x.width,  1920, "output_1x.width = 1920");
+    TEST_ASSERT_EQ(ctx.output_1x.height, 1080, "output_1x.height = 1080");
+
+    fused_hdr_run(&ctx, frame.plane_y, frame.plane_u, frame.plane_v);
+
+    /* The bottom row (one of the rows crop-to-fit discards from the
+     * ladder) must have been written by the tone map. */
+    const uint8_t *last_row = ctx.output_1x.plane_y
+        + (size_t)(ctx.output_1x.height - 1) * (size_t)ctx.output_1x.y_stride;
+    int found_nonzero = 0;
+    for (int x = 0; x < ctx.output_1x.width && !found_nonzero; x++) {
+        if (last_row[x] != 0)
+            found_nonzero = 1;
+    }
+    TEST_ASSERT(found_nonzero, "last source row should be tone-mapped");
+
+    fused_hdr_free(&ctx);
+    test_hdr_frame_free(&frame);
+    TEST_PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * 13c. test_hdr_upscale_sdr
+ *      Tone-mapped SDR copies of upscale outputs.  With a solid-color
+ *      source, every scaling step is exact (all blends of equal values),
+ *      so the SDR upscale copy must be uniform and bit-identical to the
+ *      tonemap_1x output of the same frame - both are the same tone map
+ *      of the same color, just at different resolutions.
+ * -------------------------------------------------------------------------- */
+
+static void test_hdr_upscale_sdr(void)
+{
+    test_hdr_frame_t frame;
+    int r = test_hdr_frame_create(&frame, 64, 64, PATTERN_SOLID, 0);
+    TEST_ASSERT(r == 0, "test_hdr_frame_create failed");
+
+    fused_hdr_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.src_width      = frame.width;
+    ctx.src_height     = frame.height;
+    ctx.src_y_stride   = frame.y_stride;
+    ctx.src_uv_stride  = frame.uv_stride;
+    ctx.src_format     = FUSED_PIX_I010;
+    ctx.src_transfer   = FUSED_TRC_PQ;
+    ctx.upscale_flags     = FUSED_UPSCALE_2X;
+    ctx.upscale_sdr_flags = FUSED_UPSCALE_2X;
+    ctx.tonemap_1x     = 1;
+    suppress_log(&ctx);
+
+    int rc = fused_hdr_init(&ctx);
+    TEST_ASSERT(rc >= 0, "init should succeed");
+    TEST_ASSERT_EQ(ctx.upscale_sdr_outputs[0].width,  128, "SDR up width = 128");
+    TEST_ASSERT_EQ(ctx.upscale_sdr_outputs[0].height, 128, "SDR up height = 128");
+
+    fused_hdr_run(&ctx, frame.plane_y, frame.plane_u, frame.plane_v);
+
+    const fused_scale_output_t *up = &ctx.upscale_sdr_outputs[0];
+    uint8_t want_y = ctx.output_1x.plane_y[0];
+    uint8_t want_u = ctx.output_1x.plane_u[0];
+    uint8_t want_v = ctx.output_1x.plane_v[0];
+
+    int bad = 0;
+    for (int y = 0; y < up->height && !bad; y++) {
+        const uint8_t *row = up->plane_y + (size_t)y * (size_t)up->y_stride;
+        for (int x = 0; x < up->width; x++) {
+            if (row[x] != want_y) { bad = 1; break; }
+        }
+    }
+    TEST_ASSERT(!bad, "SDR upscale luma uniform and equal to tonemap_1x");
+
+    for (int y = 0; y < up->height / 2 && !bad; y++) {
+        const uint8_t *ru = up->plane_u + (size_t)y * (size_t)up->uv_stride;
+        const uint8_t *rv = up->plane_v + (size_t)y * (size_t)up->uv_stride;
+        for (int x = 0; x < up->width / 2; x++) {
+            if (ru[x] != want_u || rv[x] != want_v) { bad = 1; break; }
+        }
+    }
+    TEST_ASSERT(!bad, "SDR upscale chroma uniform and equal to tonemap_1x");
+
+    fused_hdr_free(&ctx);
+    test_hdr_frame_free(&frame);
+    TEST_PASS();
+}
+
+/* --------------------------------------------------------------------------
+ * 14. test_hdr_p010_upscale
+ *     P010 callers pass interleaved UV as src_u and NULL src_v. HDR upscale
+ *     must deinterleave chroma before scaling rather than reading src_v.
+ * -------------------------------------------------------------------------- */
+
+static void test_hdr_p010_upscale(void)
+{
+    test_p010_frame_t frame;
+    int r = test_p010_frame_create(&frame, 64, 64, PATTERN_SOLID, 0);
+    TEST_ASSERT(r == 0, "test_p010_frame_create failed");
+
+    fused_hdr_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.src_width      = frame.width;
+    ctx.src_height     = frame.height;
+    ctx.src_y_stride   = frame.y_stride;
+    ctx.src_uv_stride  = frame.uv_stride;
+    ctx.src_format     = FUSED_PIX_P010;
+    ctx.src_transfer   = FUSED_TRC_PQ;
+    ctx.requested_flags = 0;
+    ctx.hdr_flags      = 0;
+    ctx.sdr_flags      = 0;
+    ctx.upscale_flags  = FUSED_UPSCALE_2X;
+    suppress_log(&ctx);
+
+    int rc = fused_hdr_init(&ctx);
+    TEST_ASSERT_OK(rc, "P010 upscale init should succeed");
+    TEST_ASSERT(ctx.upscale_hdr_outputs[FUSED_UP_IDX_2X].plane_y != NULL,
+                "P010 2x output allocated");
+
+    fused_hdr_run(&ctx, frame.plane_y, frame.plane_uv, NULL);
+
+    const fused_hdr_output_t *out = &ctx.upscale_hdr_outputs[FUSED_UP_IDX_2X];
+    TEST_ASSERT_EQ(out->width, 128, "P010 2x output width");
+    TEST_ASSERT_EQ(out->height, 128, "P010 2x output height");
+    TEST_ASSERT(out->plane_y[0] != 0, "P010 upscale wrote Y");
+    TEST_ASSERT(out->plane_u[0] != 0, "P010 upscale wrote U");
+    TEST_ASSERT(out->plane_v[0] != 0, "P010 upscale wrote V");
+
+    fused_hdr_free(&ctx);
+    test_p010_frame_free(&frame);
+    TEST_PASS();
+}
+
 /* ==========================================================================
  * HDR upscale tests
  * ========================================================================== */
@@ -1138,6 +1443,7 @@ void run_hdr_correctness_tests(void)
     RUN_TEST(test_hdr_tonemap_monotonicity);
     RUN_TEST(test_hdr_tonemap_range);
     RUN_TEST(test_hdr_p010_equivalence);
+    RUN_TEST(test_hdr_p010_combined_equivalence);
     RUN_TEST(test_hdr_curve_variation);
     RUN_TEST(test_hdr_output_dimensions);
     RUN_TEST(test_hdr_hlg_vs_pq_differ);
@@ -1145,6 +1451,9 @@ void run_hdr_correctness_tests(void)
     RUN_TEST(test_hdr_double_free_safety);
     RUN_TEST(test_hdr_non_standard_correctness);
     RUN_TEST(test_hdr_p010_tonemap_1x);
+    RUN_TEST(test_hdr_tonemap_1x_not_cropped);
+    RUN_TEST(test_hdr_upscale_sdr);
+    RUN_TEST(test_hdr_p010_upscale);
 
     /* HDR upscale tests */
     RUN_TEST(test_hdr_upscale_dimensions);

@@ -51,28 +51,22 @@ static inline void vavg_row_u16(const uint16_t *a, const uint16_t *b,
 }
 
 /* --------------------------------------------------------------------------
- * Primitive: 2:1 bilinear blend for u16 (the thirds 1.5x vertical row blend).
+ * Primitive: 2:1 bilinear blend of two u16 vectors.
  *
- *   for x in 0..n: dst[x] = (a[x] * 171 + b[x] * 85 + 128) >> 8
+ *   blend(a, b) = (171*a + 85*b + 128) >> 8   ~= a * 2/3 + b * 1/3
  *
- * Inputs are 10-bit (max 1023), so a*171 = max 174,933 overflows u16.
- * Widen to u32 for the multiply-accumulate, then narrow back to u16.
+ * The whole 1.5x thirds path - both the vertical row blend and the horizontal
+ * 1.5x filter - is built from this one op.  10-bit inputs make a*171 overflow
+ * u16 (max 174,933), so the multiply-accumulate widens to u32 before narrowing
+ * back to u16.  vnclipu does that narrowing with the rounding folded in: under
+ * vxrm = RNU it applies the 128 bias and the >>8 in one instruction, with no
+ * separate add and no vtype change.
  * -------------------------------------------------------------------------- */
-static inline void vblend_2_1_row_u16(const uint16_t *a, const uint16_t *b,
-                                      uint16_t *dst, size_t n)
+static inline vuint16m1_t vblend_2_1_u16m1(vuint16m1_t a, vuint16m1_t b, size_t vl)
 {
-    size_t x = 0;
-    while (x < n) {
-        size_t vl = __riscv_vsetvl_e16m1(n - x);
-        vuint16m1_t va = __riscv_vle16_v_u16m1(a + x, vl);
-        vuint16m1_t vb = __riscv_vle16_v_u16m1(b + x, vl);
-        vuint32m2_t s = __riscv_vwmulu_vx_u32m2(va, 171, vl);
-        s = __riscv_vwmaccu_vx_u32m2(s, 85, vb, vl);
-        s = __riscv_vadd_vx_u32m2(s, 128, vl);
-        vuint16m1_t r = __riscv_vnsrl_wx_u16m1(s, 8, vl);
-        __riscv_vse16_v_u16m1(dst + x, r, vl);
-        x += vl;
-    }
+    vuint32m2_t s = __riscv_vwmulu_vx_u32m2(a, 171, vl);
+    s = __riscv_vwmaccu_vx_u32m2(s, 85, b, vl);
+    return fused_vnclipu_wx_u16m1(s, 8, vl);
 }
 
 /* --------------------------------------------------------------------------
@@ -104,11 +98,11 @@ static inline void vh_filter_3x_row_u16(const uint16_t *src,
  * Primitive: horizontal 3:2 bilinear for u16.
  *
  *   for i in 0..pairs:
- *     dst[2i + 0] = blend_2_1(src[3i],   src[3i + 1])
- *     dst[2i + 1] = blend_2_1(src[3i+2], src[3i + 1])
+ *     dst[2i + 0] = vblend_2_1(src[3i],   src[3i + 1])
+ *     dst[2i + 1] = vblend_2_1(src[3i+2], src[3i + 1])
  *
- * Same blend-with-widening as vblend_2_1_row_u16, run twice per chunk
- * with stride-2 stores at offsets 0 and 1.
+ * Two vblend_2_1_u16m1 calls per chunk, written out with stride-2 stores at
+ * offsets 0 and 1.
  * -------------------------------------------------------------------------- */
 static inline void vh_filter_1_5x_row_u16(const uint16_t *src,
                                           uint16_t *dst, size_t pairs)
@@ -118,19 +112,41 @@ static inline void vh_filter_1_5x_row_u16(const uint16_t *src,
         size_t vl = __riscv_vsetvl_e16m1(pairs - i);
         vuint16m1_t a, b, c;
         fused_load3_u16m1(src + 3 * i, vl, &a, &b, &c);
+        vuint16m1_t r0 = vblend_2_1_u16m1(a, b, vl);   /* dst[2i]   */
+        vuint16m1_t r1 = vblend_2_1_u16m1(c, b, vl);   /* dst[2i+1] */
+        fused_store2_u16m1(dst + 2 * i, vl, r0, r1);
+        i += vl;
+    }
+}
 
-        /* dst[2i]   = (171*a + 85*b + 128) >> 8 */
-        vuint32m2_t s0 = __riscv_vwmulu_vx_u32m2(a, 171, vl);
-        s0 = __riscv_vwmaccu_vx_u32m2(s0, 85, b, vl);
-        s0 = __riscv_vadd_vx_u32m2(s0, 128, vl);
-        vuint16m1_t r0 = __riscv_vnsrl_wx_u16m1(s0, 8, vl);
+/* --------------------------------------------------------------------------
+ * Primitive: vertical 2:1 blend folded into the horizontal 1.5x filter (u16).
+ *
+ * Twin of the SDR vh_filter_1_5x_blend_row_u8.  The two interior 1.5x rows are
+ * a vertical 2:1 blend of two reduced rows (ra, rb) followed by the 1.5x
+ * horizontal filter; both are the same vblend_2_1, so they fuse into one pass
+ * that keeps the blended row in registers instead of writing it out and
+ * reading it back.
+ * -------------------------------------------------------------------------- */
+static inline void vh_filter_1_5x_blend_row_u16(const uint16_t *ra,
+                                                const uint16_t *rb,
+                                                uint16_t *dst, size_t pairs)
+{
+    size_t i = 0;
+    while (i < pairs) {
+        size_t vl = __riscv_vsetvl_e16m1(pairs - i);
+        vuint16m1_t a0, a1, a2, b0, b1, b2;
+        fused_load3_u16m1(ra + 3 * i, vl, &a0, &a1, &a2);
+        fused_load3_u16m1(rb + 3 * i, vl, &b0, &b1, &b2);
 
-        /* dst[2i+1] = (171*c + 85*b + 128) >> 8 */
-        vuint32m2_t s1 = __riscv_vwmulu_vx_u32m2(c, 171, vl);
-        s1 = __riscv_vwmaccu_vx_u32m2(s1, 85, b, vl);
-        s1 = __riscv_vadd_vx_u32m2(s1, 128, vl);
-        vuint16m1_t r1 = __riscv_vnsrl_wx_u16m1(s1, 8, vl);
+        /* Vertical blend of the two rows at each tap... */
+        vuint16m1_t t0 = vblend_2_1_u16m1(a0, b0, vl);
+        vuint16m1_t t1 = vblend_2_1_u16m1(a1, b1, vl);
+        vuint16m1_t t2 = vblend_2_1_u16m1(a2, b2, vl);
 
+        /* ...then the horizontal 1.5x of those blended taps. */
+        vuint16m1_t r0 = vblend_2_1_u16m1(t0, t1, vl);   /* dst[2i]   */
+        vuint16m1_t r1 = vblend_2_1_u16m1(t2, t1, vl);   /* dst[2i+1] */
         fused_store2_u16m1(dst + 2 * i, vl, r0, r1);
         i += vl;
     }
@@ -153,6 +169,37 @@ static inline void vhalve_row_u16(const uint16_t *src, uint16_t *dst, size_t dst
         fused_load2_u16m1(src + 2 * x, vl, &even, &odd);
         vuint16m1_t avg = fused_vaaddu_vv_u16m1(even, odd, vl);
         __riscv_vse16_v_u16m1(dst + x, avg, vl);
+        x += vl;
+    }
+}
+
+/* --------------------------------------------------------------------------
+ * Fused 2x2-box downscale row (the pure-2x case), u16 twin of the SDR helper.
+ *
+ *   for x in 0..dst_n:
+ *     dst[x] = avg( avg(rowA[2x],   rowB[2x]),
+ *                   avg(rowA[2x+1], rowB[2x+1]) )
+ *
+ * Both source rows arrive as even/odd pairs from one stride-2 load each, the
+ * vertical averages stay in registers, and a final vaaddu folds them into the
+ * halved output - so the full-width intermediate row is never written or read.
+ * Bit-exact with the separate vertical-then-horizontal path.
+ * -------------------------------------------------------------------------- */
+static inline void vdown_2x2_row_u16(const uint16_t *rowA,
+                                     const uint16_t *rowB,
+                                     uint16_t *dst,
+                                     size_t dst_n)
+{
+    size_t x = 0;
+    while (x < dst_n) {
+        size_t vl = __riscv_vsetvl_e16m1(dst_n - x);
+        vuint16m1_t ae, ao, be, bo;
+        fused_load2_u16m1(rowA + 2 * x, vl, &ae, &ao);
+        fused_load2_u16m1(rowB + 2 * x, vl, &be, &bo);
+        vuint16m1_t ve = fused_vaaddu_vv_u16m1(ae, be, vl);  /* even columns, vertical */
+        vuint16m1_t vo = fused_vaaddu_vv_u16m1(ao, bo, vl);  /* odd columns, vertical  */
+        vuint16m1_t h  = fused_vaaddu_vv_u16m1(ve, vo, vl);  /* fold pair -> halved out */
+        __riscv_vse16_v_u16m1(dst + x, h, vl);
         x += vl;
     }
 }
@@ -219,15 +266,35 @@ static void scale_plane_pow2_hdr_rvv(
     int group_rows = (2 << deepest);
     int num_groups = src_h / group_rows;
 
+    /* Pure 2x downscale: each group is two source rows collapsing to one output
+     * row, so fuse the vertical average and horizontal halve and skip scratch
+     * entirely.  Deeper cascades take the general path, where vert_buf[0] feeds
+     * the next level and must be materialized. */
+    if (deepest == 0) {
+        for (int g = 0; g < num_groups; g++) {
+            const uint16_t *ra = src + (size_t)(2 * g)     * (size_t)src_el_stride;
+            const uint16_t *rb = src + (size_t)(2 * g + 1) * (size_t)src_el_stride;
+            int dst_el_stride = dst_strides_bytes[0] / (int)sizeof(uint16_t);
+            uint16_t *out = dst_planes[0] + (size_t)g * (size_t)dst_el_stride;
+            vdown_2x2_row_u16(ra, rb, out, (size_t)dst_widths[0]);
+        }
+        return;
+    }
+
     fused_scratch_t scratch;
     fused_scratch_init(&scratch, scratch_pool_base, scratch_pool_size);
 
     uint16_t *vert_buf[4] = { NULL, NULL, NULL, NULL };
     int       vert_rows[4];
 
-    for (int k = 0; k <= deepest; k++) {
+    for (int k = 0; k <= deepest; k++)
         vert_rows[k] = group_rows >> (k + 1);
-        vert_buf[k]  = (uint16_t *)fused_scratch_alloc(
+
+    /* Materialize a vertical buffer for every level EXCEPT the deepest, whose
+     * vertical average is fused into its own first horizontal halve below
+     * (vdown_2x2_row_u16) - no deeper level reads it, so it need not exist. */
+    for (int k = 0; k < deepest; k++) {
+        vert_buf[k] = (uint16_t *)fused_scratch_alloc(
             &scratch,
             (size_t)vert_rows[k] * (size_t)src_w * sizeof(uint16_t));
         if (!vert_buf[k]) return;
@@ -243,14 +310,15 @@ static void scale_plane_pow2_hdr_rvv(
         const uint16_t *grp_base = src
             + (size_t)g * (size_t)group_rows * (size_t)src_el_stride;
 
-        /* Vertical cascade. */
+        /* Vertical cascade, stopping one short of the deepest level (that one
+         * is produced on the fly in the horizontal pass). */
         for (int r = 0; r < vert_rows[0]; r++) {
             const uint16_t *ra = grp_base + (size_t)(2 * r)     * (size_t)src_el_stride;
             const uint16_t *rb = grp_base + (size_t)(2 * r + 1) * (size_t)src_el_stride;
             uint16_t *dst_row  = vert_buf[0] + (size_t)r * (size_t)src_w;
             vavg_row_u16(ra, rb, dst_row, (size_t)src_w);
         }
-        for (int k = 1; k <= deepest; k++) {
+        for (int k = 1; k < deepest; k++) {
             for (int r = 0; r < vert_rows[k]; r++) {
                 const uint16_t *ra = vert_buf[k - 1]
                     + (size_t)(2 * r)     * (size_t)src_w;
@@ -266,29 +334,45 @@ static void scale_plane_pow2_hdr_rvv(
             if (!(active_outputs & (1u << bit_pos[k]))) continue;
             int dst_el_stride = dst_strides_bytes[k] / (int)sizeof(uint16_t);
 
+            int steps = k + 1;
             for (int r = 0; r < vert_rows[k]; r++) {
-                const uint16_t *vert_row = vert_buf[k]
-                    + (size_t)r * (size_t)src_w;
-
-                int cur_w = src_w;
-                const uint16_t *cur_src = vert_row;
-                uint16_t *cur_dst = h_buf;
-                for (int hstep = 0; hstep < (k + 1); hstep++) {
-                    int next_w = cur_w >> 1;
-                    vhalve_row_u16(cur_src, cur_dst, (size_t)next_w);
-                    cur_w = next_w;
-                    cur_src = h_buf;
-                }
-
                 uint16_t *out = dst_planes[k]
                     + (size_t)out_row[k] * (size_t)dst_el_stride;
-                size_t n = (size_t)dst_widths[k];
-                size_t i = 0;
-                while (i < n) {
-                    size_t vl = __riscv_vsetvl_e16m1(n - i);
-                    vuint16m1_t v = __riscv_vle16_v_u16m1(h_buf + i, vl);
-                    __riscv_vse16_v_u16m1(out + i, v, vl);
-                    i += vl;
+
+                /* Same in-place halving cascade as the SDR kernel: intermediate
+                 * halvings narrow through h_buf and the final one stores
+                 * straight into the destination plane, clamped to dst_widths[k].
+                 * The deepest level has no materialized vert_buf - vdown_2x2_row
+                 * fuses its vertical average into the first halve (landing in
+                 * h_buf) and the cascade resumes from the second step.  deepest
+                 * >= 1 here, so a halve always remains to reach the output. */
+                int cur_w;
+                const uint16_t *cur_src;
+                int hstep;
+                if (k == deepest) {
+                    const uint16_t *ra = vert_buf[deepest - 1]
+                        + (size_t)(2 * r)     * (size_t)src_w;
+                    const uint16_t *rb = vert_buf[deepest - 1]
+                        + (size_t)(2 * r + 1) * (size_t)src_w;
+                    int half_w = src_w >> 1;
+                    vdown_2x2_row_u16(ra, rb, h_buf, (size_t)half_w);
+                    cur_src = h_buf;
+                    cur_w   = half_w;
+                    hstep   = 1;
+                } else {
+                    cur_src = vert_buf[k] + (size_t)r * (size_t)src_w;
+                    cur_w   = src_w;
+                    hstep   = 0;
+                }
+                for (; hstep < steps; hstep++) {
+                    int next_w = cur_w >> 1;
+                    if (hstep == steps - 1) {
+                        vhalve_row_u16(cur_src, out, (size_t)dst_widths[k]);
+                    } else {
+                        vhalve_row_u16(cur_src, h_buf, (size_t)next_w);
+                        cur_src = h_buf;
+                    }
+                    cur_w = next_w;
                 }
                 out_row[k]++;
             }
@@ -427,12 +511,9 @@ static void scale_plane_thirds_hdr_rvv(
 
     uint16_t *v6x_prev = need_12x
         ? (uint16_t *)fused_scratch_alloc(&scratch, row_bytes) : NULL;
-    uint16_t *blend_tmp = need_1_5x
-        ? (uint16_t *)fused_scratch_alloc(&scratch, row_bytes) : NULL;
-
     if (!v01 || !v23 || !v45 || !v3x_0 || !v3x_1 || !v6x ||
         !h_3x_buf || !h_6x_buf ||
-        (need_12x && !v6x_prev) || (need_1_5x && !blend_tmp)) {
+        (need_12x && !v6x_prev)) {
         return;
     }
 
@@ -470,14 +551,12 @@ static void scale_plane_thirds_hdr_rvv(
             vh_filter_1_5x_row_u16(v01, out, pairs);
             out_row[0]++;
 
-            vblend_2_1_row_u16(v01, v23, blend_tmp, (size_t)src_w);
             out = dst_planes[0] + (size_t)out_row[0] * (size_t)ds_el;
-            vh_filter_1_5x_row_u16(blend_tmp, out, pairs);
+            vh_filter_1_5x_blend_row_u16(v01, v23, out, pairs);
             out_row[0]++;
 
-            vblend_2_1_row_u16(v23, v45, blend_tmp, (size_t)src_w);
             out = dst_planes[0] + (size_t)out_row[0] * (size_t)ds_el;
-            vh_filter_1_5x_row_u16(blend_tmp, out, pairs);
+            vh_filter_1_5x_blend_row_u16(v23, v45, out, pairs);
             out_row[0]++;
 
             out = dst_planes[0] + (size_t)out_row[0] * (size_t)ds_el;

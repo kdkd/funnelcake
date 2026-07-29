@@ -28,9 +28,9 @@
  * single hardware instruction that loads 48 consecutive bytes and
  * automatically separates them into three 16-byte vectors (one per
  * component of the ABC triplet).  There is no equivalent in SSE/AVX2,
- * which requires the table-based shuffle approach.  The deinterleave_chunk
- * helper exploits this by storing three vertically-blended NEON registers
- * to a small stack buffer and reloading with vld3q_u8.
+ * which requires the table-based shuffle approach.  Each source row is
+ * deinterleaved as it is loaded; because the vertical filters are lane-wise,
+ * all later vertical intermediates remain deinterleaved without extra work.
  *
  * The pow2 kernel (2x/4x/8x/16x) uses a vertical cascade into temporary
  * buffers followed by a horizontal halving cascade, for the same reasons
@@ -119,19 +119,20 @@ static void h_filter_1_5x(const uint8_t *restrict src, int src_w,
         uint8x16_t B = loaded.val[1];  /* second of each triple */
         uint8x16_t C = loaded.val[2];  /* third of each triple */
 
+        /* Both outputs contain B*85.  Keep that product live and accumulate
+         * the independently weighted A/C terms into copies. */
+        uint16x8_t base_lo = vmull_u8(vget_low_u8(B), w85);
+        uint16x8_t base_hi = vmull_u8(vget_high_u8(B), w85);
+
         /* Output 0: pixel at 1/3 position, weighted toward A */
-        uint16x8_t t0_lo = vmull_u8(vget_low_u8(A), w171);
-        t0_lo = vmlal_u8(t0_lo, vget_low_u8(B), w85);
-        uint16x8_t t0_hi = vmull_u8(vget_high_u8(A), w171);
-        t0_hi = vmlal_u8(t0_hi, vget_high_u8(B), w85);
+        uint16x8_t t0_lo = vmlal_u8(base_lo, vget_low_u8(A), w171);
+        uint16x8_t t0_hi = vmlal_u8(base_hi, vget_high_u8(A), w171);
         uint8x16_t out0 = vcombine_u8(vrshrn_n_u16(t0_lo, 8),
                                        vrshrn_n_u16(t0_hi, 8));
 
         /* Output 1: pixel at 2/3 position, weighted toward C */
-        uint16x8_t t1_lo = vmull_u8(vget_low_u8(C), w171);
-        t1_lo = vmlal_u8(t1_lo, vget_low_u8(B), w85);
-        uint16x8_t t1_hi = vmull_u8(vget_high_u8(C), w171);
-        t1_hi = vmlal_u8(t1_hi, vget_high_u8(B), w85);
+        uint16x8_t t1_lo = vmlal_u8(base_lo, vget_low_u8(C), w171);
+        uint16x8_t t1_hi = vmlal_u8(base_hi, vget_high_u8(C), w171);
         uint8x16_t out1 = vcombine_u8(vrshrn_n_u16(t1_lo, 8),
                                        vrshrn_n_u16(t1_hi, 8));
 
@@ -237,7 +238,7 @@ static void h_filter_halve(const uint8_t *restrict src,
  * Horizontal: NEON vpaddlq_u8 + vrshrn_n_u16 cascade
  * ----------------------------------------------------------------------- */
 
-static void FUSED_HOT scale_plane_pow2_neon(
+static void FUSED_HOT scale_plane_pow2_neon_buffered(
     const uint8_t *restrict src,
     int src_w, int src_h, int src_stride,
     uint32_t active_outputs,
@@ -379,6 +380,231 @@ static void FUSED_HOT scale_plane_pow2_neon(
     /* Scratch buffers are carved from the persistent pool - nothing to free. */
 }
 
+/* Register-tiled power-of-two reductions.  The common aligned-width path
+ * keeps the complete vertical tree for one 16-column tile in registers and
+ * immediately applies the required number of horizontal halvings. */
+static inline uint8x16_t pow2_hhalve_reg(uint8x16_t v)
+{
+    uint16x8_t sum = vpaddlq_u8(v);
+    uint8x8_t out = vrshrn_n_u16(sum, 1);
+    return vcombine_u8(out, vdup_n_u8(0));
+}
+
+static inline void pow2_store_h1(uint8x16_t v, uint8_t *dst)
+{
+    v = pow2_hhalve_reg(v);
+    vst1_u8(dst, vget_low_u8(v));
+}
+
+static inline void pow2_store_h2(uint8x16_t v, uint8_t *dst)
+{
+    v = pow2_hhalve_reg(pow2_hhalve_reg(v));
+    vst1_lane_u32((uint32_t *)dst,
+                  vreinterpret_u32_u8(vget_low_u8(v)), 0);
+}
+
+static inline void pow2_store_h3(uint8x16_t v, uint8_t *dst)
+{
+    v = pow2_hhalve_reg(pow2_hhalve_reg(pow2_hhalve_reg(v)));
+    vst1_lane_u16((uint16_t *)dst,
+                  vreinterpret_u16_u8(vget_low_u8(v)), 0);
+}
+
+static inline void pow2_store_h4(uint8x16_t v, uint8_t *dst)
+{
+    v = pow2_hhalve_reg(
+        pow2_hhalve_reg(pow2_hhalve_reg(pow2_hhalve_reg(v))));
+    vst1_lane_u8(dst, vget_low_u8(v), 0);
+}
+
+static void pow2_tiled_depth0(
+    const uint8_t *restrict src, int src_w, int src_h, int src_stride,
+    uint32_t active_outputs, uint8_t *restrict dst[4], int strides[4])
+{
+    int groups = src_h / 2;
+    int emit0 = (active_outputs & (1u << 1)) != 0;
+    for (int g = 0; g < groups; g++) {
+        const uint8_t *r0 = src + (size_t)(2 * g) * src_stride;
+        const uint8_t *r1 = r0 + src_stride;
+        for (int x = 0; x < src_w; x += 16) {
+            uint8x16_t v0 = vrhaddq_u8(vld1q_u8(r0 + x),
+                                        vld1q_u8(r1 + x));
+            if (emit0)
+                pow2_store_h1(v0, dst[0] + (size_t)g * strides[0] + x / 2);
+        }
+    }
+}
+
+static void pow2_tiled_depth1(
+    const uint8_t *restrict src, int src_w, int src_h, int src_stride,
+    uint32_t active_outputs, uint8_t *restrict dst[4], int strides[4])
+{
+    int groups = src_h / 4;
+    int emit0 = (active_outputs & (1u << 1)) != 0;
+    int emit1 = (active_outputs & (1u << 3)) != 0;
+    for (int g = 0; g < groups; g++) {
+        const uint8_t *base = src + (size_t)(4 * g) * src_stride;
+        for (int x = 0; x < src_w; x += 16) {
+            uint8x16_t v0 = vrhaddq_u8(vld1q_u8(base + x),
+                                        vld1q_u8(base + src_stride + x));
+            uint8x16_t v1 = vrhaddq_u8(vld1q_u8(base + 2 * (size_t)src_stride + x),
+                                        vld1q_u8(base + 3 * (size_t)src_stride + x));
+            if (emit0) {
+                pow2_store_h1(v0, dst[0] + (size_t)(2 * g) * strides[0] + x / 2);
+                pow2_store_h1(v1, dst[0] + (size_t)(2 * g + 1) * strides[0] + x / 2);
+            }
+            uint8x16_t v2 = vrhaddq_u8(v0, v1);
+            if (emit1)
+                pow2_store_h2(v2, dst[1] + (size_t)g * strides[1] + x / 4);
+        }
+    }
+}
+
+static void pow2_tiled_depth2(
+    const uint8_t *restrict src, int src_w, int src_h, int src_stride,
+    uint32_t active_outputs, uint8_t *restrict dst[4], int strides[4])
+{
+    int groups = src_h / 8;
+    int emit0 = (active_outputs & (1u << 1)) != 0;
+    int emit1 = (active_outputs & (1u << 3)) != 0;
+    int emit2 = (active_outputs & (1u << 5)) != 0;
+    for (int g = 0; g < groups; g++) {
+        const uint8_t *base = src + (size_t)(8 * g) * src_stride;
+        for (int x = 0; x < src_w; x += 16) {
+            uint8x16_t v0 = vrhaddq_u8(vld1q_u8(base + x),
+                                        vld1q_u8(base + src_stride + x));
+            uint8x16_t v1 = vrhaddq_u8(vld1q_u8(base + 2 * (size_t)src_stride + x),
+                                        vld1q_u8(base + 3 * (size_t)src_stride + x));
+            uint8x16_t v2 = vrhaddq_u8(vld1q_u8(base + 4 * (size_t)src_stride + x),
+                                        vld1q_u8(base + 5 * (size_t)src_stride + x));
+            uint8x16_t v3 = vrhaddq_u8(vld1q_u8(base + 6 * (size_t)src_stride + x),
+                                        vld1q_u8(base + 7 * (size_t)src_stride + x));
+            if (emit0) {
+                uint8_t *out = dst[0] + (size_t)(4 * g) * strides[0] + x / 2;
+                pow2_store_h1(v0, out);
+                pow2_store_h1(v1, out + strides[0]);
+                pow2_store_h1(v2, out + 2 * (size_t)strides[0]);
+                pow2_store_h1(v3, out + 3 * (size_t)strides[0]);
+            }
+            uint8x16_t v4 = vrhaddq_u8(v0, v1);
+            uint8x16_t v5 = vrhaddq_u8(v2, v3);
+            if (emit1) {
+                uint8_t *out = dst[1] + (size_t)(2 * g) * strides[1] + x / 4;
+                pow2_store_h2(v4, out);
+                pow2_store_h2(v5, out + strides[1]);
+            }
+            uint8x16_t v6 = vrhaddq_u8(v4, v5);
+            if (emit2)
+                pow2_store_h3(v6, dst[2] + (size_t)g * strides[2] + x / 8);
+        }
+    }
+}
+
+static void pow2_tiled_depth3(
+    const uint8_t *restrict src, int src_w, int src_h, int src_stride,
+    uint32_t active_outputs, uint8_t *restrict dst[4], int strides[4])
+{
+    int groups = src_h / 16;
+    int emit0 = (active_outputs & (1u << 1)) != 0;
+    int emit1 = (active_outputs & (1u << 3)) != 0;
+    int emit2 = (active_outputs & (1u << 5)) != 0;
+    int emit3 = (active_outputs & (1u << 7)) != 0;
+    for (int g = 0; g < groups; g++) {
+        const uint8_t *base = src + (size_t)(16 * g) * src_stride;
+        for (int x = 0; x < src_w; x += 16) {
+            uint8x16_t v[8];
+#if defined(__clang__)
+            #pragma clang loop unroll(full)
+#elif defined(__GNUC__)
+            #pragma GCC unroll 8
+#endif
+            for (int r = 0; r < 8; r++) {
+                const uint8_t *ra = base + (size_t)(2 * r) * src_stride + x;
+                v[r] = vrhaddq_u8(vld1q_u8(ra), vld1q_u8(ra + src_stride));
+            }
+            if (emit0) {
+                uint8_t *out = dst[0] + (size_t)(8 * g) * strides[0] + x / 2;
+#if defined(__clang__)
+                #pragma clang loop unroll(full)
+#elif defined(__GNUC__)
+                #pragma GCC unroll 8
+#endif
+                for (int r = 0; r < 8; r++)
+                    pow2_store_h1(v[r], out + (size_t)r * strides[0]);
+            }
+            uint8x16_t w0 = vrhaddq_u8(v[0], v[1]);
+            uint8x16_t w1 = vrhaddq_u8(v[2], v[3]);
+            uint8x16_t w2 = vrhaddq_u8(v[4], v[5]);
+            uint8x16_t w3 = vrhaddq_u8(v[6], v[7]);
+            if (emit1) {
+                uint8_t *out = dst[1] + (size_t)(4 * g) * strides[1] + x / 4;
+                pow2_store_h2(w0, out);
+                pow2_store_h2(w1, out + strides[1]);
+                pow2_store_h2(w2, out + 2 * (size_t)strides[1]);
+                pow2_store_h2(w3, out + 3 * (size_t)strides[1]);
+            }
+            uint8x16_t z0 = vrhaddq_u8(w0, w1);
+            uint8x16_t z1 = vrhaddq_u8(w2, w3);
+            if (emit2) {
+                uint8_t *out = dst[2] + (size_t)(2 * g) * strides[2] + x / 8;
+                pow2_store_h3(z0, out);
+                pow2_store_h3(z1, out + strides[2]);
+            }
+            uint8x16_t q0 = vrhaddq_u8(z0, z1);
+            if (emit3)
+                pow2_store_h4(q0, dst[3] + (size_t)g * strides[3] + x / 16);
+        }
+    }
+}
+
+static void FUSED_HOT scale_plane_pow2_neon(
+    const uint8_t *restrict src,
+    int src_w, int src_h, int src_stride,
+    uint32_t active_outputs,
+    uint8_t *restrict dst_planes[4],
+    int dst_widths[4],
+    int dst_strides[4],
+    int dst_heights[4],
+    uint8_t *scratch_pool_base,
+    size_t scratch_pool_size)
+{
+    if ((src_w & 15) != 0) {
+        scale_plane_pow2_neon_buffered(src, src_w, src_h, src_stride,
+            active_outputs, dst_planes, dst_widths, dst_strides, dst_heights,
+            scratch_pool_base, scratch_pool_size);
+        return;
+    }
+
+    int deepest = -1;
+    static const int bit_pos[4] = { 1, 3, 5, 7 };
+    for (int k = 3; k >= 0; k--) {
+        if (active_outputs & (1u << bit_pos[k])) {
+            deepest = k;
+            break;
+        }
+    }
+    switch (deepest) {
+    case 0:
+        pow2_tiled_depth0(src, src_w, src_h, src_stride,
+                          active_outputs, dst_planes, dst_strides);
+        break;
+    case 1:
+        pow2_tiled_depth1(src, src_w, src_h, src_stride,
+                          active_outputs, dst_planes, dst_strides);
+        break;
+    case 2:
+        pow2_tiled_depth2(src, src_w, src_h, src_stride,
+                          active_outputs, dst_planes, dst_strides);
+        break;
+    case 3:
+        pow2_tiled_depth3(src, src_w, src_h, src_stride,
+                          active_outputs, dst_planes, dst_strides);
+        break;
+    default:
+        break;
+    }
+}
+
 
 /* -----------------------------------------------------------------------
  * Thirds kernel: scale a single plane (NEON fused vertical+horizontal)
@@ -391,7 +617,7 @@ static void FUSED_HOT scale_plane_pow2_neon(
  *
  * Vertical: NEON vrhaddq_u8 for pairwise avgs, vmull_u8/vmlal_u8 for
  *           bilinear blends (1.5x)
- * Horizontal: vld3q_u8 deinterleave + blend/box-of-3/halve helpers
+ * Horizontal: source-time vld3q_u8 + blend/box-of-3/halve helpers
  *
  * A 6-source-row group produces 4 output rows at 1.5x, 2 at 3x, and 1
  * at 6x.  12x requires pairing two consecutive 6x rows via a ping-pong
@@ -402,21 +628,22 @@ static void FUSED_HOT scale_plane_pow2_neon(
  * Fused vertical+horizontal chunk helpers
  *
  * These inline functions perform horizontal filtering on a 48-byte chunk
- * (3 x uint8x16_t) that has already been vertically reduced in registers.
- * The store+reload through a 48-byte stack buffer enables vld3q_u8
- * hardware deinterleave (essentially free on Apple Silicon L1).
+ * (3 x uint8x16_t) that was deinterleaved at the source load and then
+ * vertically reduced in registers.
  * ----------------------------------------------------------------------- */
 
-/* NEON divide-by-3 for a uint16x8 of sums (each max 765).
- * Returns uint8x8_t: (sum * 0x5556) >> 16, narrowed to u8. */
+/* NEON divide-by-3 for a uint16x8 of sums (each max 765), narrowed to u8.
+ * Mirrors the HDR kernel's neon_div3_u16x8_hdr: SQDMULH doubles, so it
+ * computes floor(sum * 21846 / 65536) = floor(sum * 10923 / 32768).  10923 is
+ * ceil(32768 / 3), and its positive error stays below 0.032 over [0, 765], so
+ * the product never crosses the next integer for any residue modulo three.
+ * Verified exhaustively against floor(sum / 3) over the whole range.  The
+ * result is in [0, 255], so the saturating narrow is exact.  This avoids
+ * widening each half to u32 solely to take the high product. */
 static inline uint8x8_t neon_div3_u16x8(uint16x8_t sum)
 {
-    uint16x8_t magic = vdupq_n_u16(0x5556);
-    uint32x4_t p0 = vmull_u16(vget_low_u16(sum),  vget_low_u16(magic));
-    uint32x4_t p1 = vmull_u16(vget_high_u16(sum), vget_high_u16(magic));
-    uint16x4_t d0 = vshrn_n_u32(p0, 16);
-    uint16x4_t d1 = vshrn_n_u32(p1, 16);
-    return vmovn_u16(vcombine_u16(d0, d1));
+    int16x8_t q = vqdmulhq_n_s16(vreinterpretq_s16_u16(sum), 10923);
+    return vqmovun_s16(q);
 }
 
 /* Horizontal 1.5x on one deinterleaved chunk (A, B, C each 16 bytes).
@@ -425,19 +652,20 @@ static inline void h_chunk_1_5x(uint8x16_t A, uint8x16_t B, uint8x16_t C,
                                  uint8_t *restrict dst,
                                  uint8x8_t w171, uint8x8_t w85)
 {
+    /* Both outputs contain B*85.  Keep that product live and accumulate the
+     * independently weighted A/C terms into copies. */
+    uint16x8_t base_lo = vmull_u8(vget_low_u8(B), w85);
+    uint16x8_t base_hi = vmull_u8(vget_high_u8(B), w85);
+
     /* out0 = (A*171 + B*85 + 128) >> 8 */
-    uint16x8_t t0_lo = vmull_u8(vget_low_u8(A), w171);
-    t0_lo = vmlal_u8(t0_lo, vget_low_u8(B), w85);
-    uint16x8_t t0_hi = vmull_u8(vget_high_u8(A), w171);
-    t0_hi = vmlal_u8(t0_hi, vget_high_u8(B), w85);
+    uint16x8_t t0_lo = vmlal_u8(base_lo, vget_low_u8(A), w171);
+    uint16x8_t t0_hi = vmlal_u8(base_hi, vget_high_u8(A), w171);
     uint8x16_t out0 = vcombine_u8(vrshrn_n_u16(t0_lo, 8),
                                    vrshrn_n_u16(t0_hi, 8));
 
     /* out1 = (C*171 + B*85 + 128) >> 8 */
-    uint16x8_t t1_lo = vmull_u8(vget_low_u8(C), w171);
-    t1_lo = vmlal_u8(t1_lo, vget_low_u8(B), w85);
-    uint16x8_t t1_hi = vmull_u8(vget_high_u8(C), w171);
-    t1_hi = vmlal_u8(t1_hi, vget_high_u8(B), w85);
+    uint16x8_t t1_lo = vmlal_u8(base_lo, vget_low_u8(C), w171);
+    uint16x8_t t1_hi = vmlal_u8(base_hi, vget_high_u8(C), w171);
     uint8x16_t out1 = vcombine_u8(vrshrn_n_u16(t1_lo, 8),
                                    vrshrn_n_u16(t1_hi, 8));
 
@@ -464,6 +692,21 @@ static inline uint8x16_t h_chunk_3x(uint8x16_t A, uint8x16_t B, uint8x16_t C,
     return result;
 }
 
+/* Horizontal 3x computation without a store.  The 6x path consumes the
+ * register immediately, so materializing the 3x intermediate in memory only
+ * creates a store-forwarding dependency. */
+static inline uint8x16_t h_chunk_3x_reg(uint8x16_t A, uint8x16_t B,
+                                        uint8x16_t C)
+{
+    uint16x8_t sum_lo = vaddl_u8(vget_low_u8(A), vget_low_u8(B));
+    sum_lo = vaddw_u8(sum_lo, vget_low_u8(C));
+    uint16x8_t sum_hi = vaddl_u8(vget_high_u8(A), vget_high_u8(B));
+    sum_hi = vaddw_u8(sum_hi, vget_high_u8(C));
+
+    return vcombine_u8(neon_div3_u16x8(sum_lo),
+                       neon_div3_u16x8(sum_hi));
+}
+
 /* Horizontal 6x cascaded from a 3x result (16 bytes -> 8 bytes).
  * Stores 8 output bytes at dst. Returns the 8-byte result. */
 static inline uint8x8_t h_chunk_6x(uint8x16_t result_3x, uint8_t *restrict dst)
@@ -472,28 +715,6 @@ static inline uint8x8_t h_chunk_6x(uint8x16_t result_3x, uint8_t *restrict dst)
     uint8x8_t result = vrshrn_n_u16(pair_sum, 1);
     vst1_u8(dst, result);
     return result;
-}
-
-/* Deinterleave a 48-byte chunk (3 x uint8x16_t) using vld3q_u8.
- *
- * vld3q_u8 is a single ARM instruction that loads 48 consecutive bytes
- * and deinterleaves them into three 16-byte NEON vectors in one operation.
- * There is no equivalent in SSE/AVX2, which requires the table-based
- * shuffle approach in the AVX2 kernel.
- *
- * Since vld3q_u8 takes a memory address rather than registers, we store
- * the three vertically-blended NEON registers to a 48-byte stack buffer
- * and reload with vld3q_u8.  On cores with fast L1 (e.g. Apple Silicon),
- * the store-reload is effectively free because the loads hit L1 at zero
- * latency. */
-static inline uint8x16x3_t deinterleave_chunk(
-    uint8x16_t a, uint8x16_t b, uint8x16_t c,
-    uint8_t chunk_buf[48])
-{
-    vst1q_u8(chunk_buf,      a);
-    vst1q_u8(chunk_buf + 16, b);
-    vst1q_u8(chunk_buf + 32, c);
-    return vld3q_u8(chunk_buf);
 }
 
 /* Bilinear blend of two 16-byte registers: (a*171 + b*85 + 128) >> 8.
@@ -548,7 +769,10 @@ static void FUSED_HOT scale_plane_thirds_neon(
 
     /* For 12x: two buffers to hold 6x vertical intermediates across
      * consecutive 6-row groups. On even groups we write to v6x_cur,
-     * then swap pointers so the odd group can read the previous. */
+     * then swap pointers so the odd group can read the previous.
+     * On odd groups the chunk loop consumes v6x_prev directly in
+     * registers - no store of the odd group's 6x intermediate and no
+     * separate averaging/horizontal passes over scratch rows. */
     uint8_t *v6x_buf_a = NULL, *v6x_buf_b = NULL;
     uint8_t *v6x_cur = NULL, *v6x_prev = NULL;
     if (need_12x) {
@@ -559,16 +783,9 @@ static void FUSED_HOT scale_plane_thirds_neon(
         v6x_prev = v6x_buf_b;
     }
 
-    /* Horizontal scratch for 12x (3x -> halve -> halve) */
+    /* 12x tail widths (3x -> halve -> halve) for the columns outside the
+     * 48-wide NEON chunks. */
     int w_3x = src_w / 3;
-    int w_6x = w_3x / 2;
-    uint8_t *h_3x_buf = NULL, *h_6x_buf = NULL;
-    if (need_12x && (active_outputs & (1u << 6))) {
-        h_3x_buf = (uint8_t *)fused_scratch_alloc(&scratch, (size_t)w_3x);
-        h_6x_buf = (uint8_t *)fused_scratch_alloc(
-            &scratch, (size_t)(w_6x > 0 ? w_6x : 1));
-        if (!h_3x_buf || !h_6x_buf) return;
-    }
 
     /* NEON weight constants */
     uint8x8_t w171 = vdup_n_u8(171);
@@ -578,9 +795,6 @@ static void FUSED_HOT scale_plane_thirds_neon(
     int full_chunks = src_w / 48;
     int tail_start  = full_chunks * 48;
     int tail_cols   = src_w - tail_start;
-
-    /* Deinterleave buffer (stack-allocated, 48 bytes aligned) */
-    _Alignas(16) uint8_t chunk_buf[48];
 
     /* Output row cursors */
     int out_row[4] = { 0, 0, 0, 0 };
@@ -618,6 +832,13 @@ static void FUSED_HOT scale_plane_thirds_neon(
             dst_6x_r0 = dst_planes[2] + (size_t)out_row[2] * (size_t)dst_strides[2];
         }
 
+        /* 12x output row, needed on odd groups where the chunk loop emits
+         * the fused 12x output directly from registers. */
+        uint8_t *dst_12x_r0 = NULL;
+        if (need_12x && (g6 & 1)) {
+            dst_12x_r0 = dst_planes[3] + (size_t)out_row[3] * (size_t)dst_strides[3];
+        }
+
         /* ============================================================
          * MAIN CHUNK LOOP: process 48 source columns at a time.
          * Vertical intermediates stay in NEON registers; horizontal
@@ -625,54 +846,37 @@ static void FUSED_HOT scale_plane_thirds_neon(
          * row buffers are needed.  A 6-source-row group produces 4 output
          * rows at 1.5x, 2 rows at 3x, and 1 row at 6x.
          * ============================================================ */
-#if defined(__clang__)
-        #pragma clang loop unroll_count(2)
-#elif defined(__GNUC__)
-        #pragma GCC unroll 2
-#endif
         for (int ci = 0; ci < full_chunks; ci++) {
             int cx = ci * 48;
             int out_off_1_5x = ci * 32;  /* 48 -> 32 output bytes */
             int out_off_3x   = ci * 16;  /* 48 -> 16 output bytes */
             int out_off_6x   = ci * 8;   /* 48 ->  8 output bytes */
 
-            /* --- LOAD 6 rows x 3 registers = 18 loads ---
-             * Loading all 6 rows before any computation lets the CPU's
-             * out-of-order engine overlap the loads with subsequent
-             * arithmetic. */
-            uint8x16_t r0a = vld1q_u8(row0 + cx);
-            uint8x16_t r0b = vld1q_u8(row0 + cx + 16);
-            uint8x16_t r0c = vld1q_u8(row0 + cx + 32);
-            uint8x16_t r1a = vld1q_u8(row1 + cx);
-            uint8x16_t r1b = vld1q_u8(row1 + cx + 16);
-            uint8x16_t r1c = vld1q_u8(row1 + cx + 32);
-            uint8x16_t r2a = vld1q_u8(row2 + cx);
-            uint8x16_t r2b = vld1q_u8(row2 + cx + 16);
-            uint8x16_t r2c = vld1q_u8(row2 + cx + 32);
-            uint8x16_t r3a = vld1q_u8(row3 + cx);
-            uint8x16_t r3b = vld1q_u8(row3 + cx + 16);
-            uint8x16_t r3c = vld1q_u8(row3 + cx + 32);
-            uint8x16_t r4a = vld1q_u8(row4 + cx);
-            uint8x16_t r4b = vld1q_u8(row4 + cx + 16);
-            uint8x16_t r4c = vld1q_u8(row4 + cx + 32);
-            uint8x16_t r5a = vld1q_u8(row5 + cx);
-            uint8x16_t r5b = vld1q_u8(row5 + cx + 16);
-            uint8x16_t r5c = vld1q_u8(row5 + cx + 32);
+            /* Deinterleave at the source load.  Every vertical operation is
+             * lane-wise, so the permutation commutes exactly with the
+             * vertical cascade and avoids register -> stack -> ld3 round
+             * trips for each output row. */
+            uint8x16x3_t r0 = vld3q_u8(row0 + cx);
+            uint8x16x3_t r1 = vld3q_u8(row1 + cx);
+            uint8x16x3_t r2 = vld3q_u8(row2 + cx);
+            uint8x16x3_t r3 = vld3q_u8(row3 + cx);
+            uint8x16x3_t r4 = vld3q_u8(row4 + cx);
+            uint8x16x3_t r5 = vld3q_u8(row5 + cx);
 
             /* --- VERTICAL PAIRWISE AVERAGES (in registers) ---
              * Average adjacent row pairs: rows 0+1 -> v01, rows 2+3 -> v23,
              * rows 4+5 -> v45.  These three intermediates represent the
              * vertical center of each pair and are reused across all output
              * levels without writing to memory. */
-            uint8x16_t v01a = vrhaddq_u8(r0a, r1a);
-            uint8x16_t v01b = vrhaddq_u8(r0b, r1b);
-            uint8x16_t v01c = vrhaddq_u8(r0c, r1c);
-            uint8x16_t v23a = vrhaddq_u8(r2a, r3a);
-            uint8x16_t v23b = vrhaddq_u8(r2b, r3b);
-            uint8x16_t v23c = vrhaddq_u8(r2c, r3c);
-            uint8x16_t v45a = vrhaddq_u8(r4a, r5a);
-            uint8x16_t v45b = vrhaddq_u8(r4b, r5b);
-            uint8x16_t v45c = vrhaddq_u8(r4c, r5c);
+            uint8x16_t v01a = vrhaddq_u8(r0.val[0], r1.val[0]);
+            uint8x16_t v01b = vrhaddq_u8(r0.val[1], r1.val[1]);
+            uint8x16_t v01c = vrhaddq_u8(r0.val[2], r1.val[2]);
+            uint8x16_t v23a = vrhaddq_u8(r2.val[0], r3.val[0]);
+            uint8x16_t v23b = vrhaddq_u8(r2.val[1], r3.val[1]);
+            uint8x16_t v23c = vrhaddq_u8(r2.val[2], r3.val[2]);
+            uint8x16_t v45a = vrhaddq_u8(r4.val[0], r5.val[0]);
+            uint8x16_t v45b = vrhaddq_u8(r4.val[1], r5.val[1]);
+            uint8x16_t v45c = vrhaddq_u8(r4.val[2], r5.val[2]);
 
             /* --- 1.5x OUTPUT (4 rows) ---
              * A 6-source-row group produces 4 output rows at 1.5x.  Rows 0
@@ -682,11 +886,8 @@ static void FUSED_HOT scale_plane_thirds_neon(
              * representing the vertical positions 1/3 and 2/3 of the way
              * through the group. */
             if (need_1_5x) {
-                uint8x16x3_t d;
-
                 /* Row 0: v01 */
-                d = deinterleave_chunk(v01a, v01b, v01c, chunk_buf);
-                h_chunk_1_5x(d.val[0], d.val[1], d.val[2],
+                h_chunk_1_5x(v01a, v01b, v01c,
                              dst_1_5x_r0 + out_off_1_5x, w171, w85);
 
                 /* Row 1: blend(v01, v23) */
@@ -694,8 +895,7 @@ static void FUSED_HOT scale_plane_thirds_neon(
                     uint8x16_t ba = neon_blend_reg(v01a, v23a, w171, w85);
                     uint8x16_t bb = neon_blend_reg(v01b, v23b, w171, w85);
                     uint8x16_t bc = neon_blend_reg(v01c, v23c, w171, w85);
-                    d = deinterleave_chunk(ba, bb, bc, chunk_buf);
-                    h_chunk_1_5x(d.val[0], d.val[1], d.val[2],
+                    h_chunk_1_5x(ba, bb, bc,
                                  dst_1_5x_r1 + out_off_1_5x, w171, w85);
                 }
 
@@ -704,14 +904,12 @@ static void FUSED_HOT scale_plane_thirds_neon(
                     uint8x16_t ba = neon_blend_reg(v23a, v45a, w171, w85);
                     uint8x16_t bb = neon_blend_reg(v23b, v45b, w171, w85);
                     uint8x16_t bc = neon_blend_reg(v23c, v45c, w171, w85);
-                    d = deinterleave_chunk(ba, bb, bc, chunk_buf);
-                    h_chunk_1_5x(d.val[0], d.val[1], d.val[2],
+                    h_chunk_1_5x(ba, bb, bc,
                                  dst_1_5x_r2 + out_off_1_5x, w171, w85);
                 }
 
                 /* Row 3: v45 */
-                d = deinterleave_chunk(v45a, v45b, v45c, chunk_buf);
-                h_chunk_1_5x(d.val[0], d.val[1], d.val[2],
+                h_chunk_1_5x(v45a, v45b, v45c,
                              dst_1_5x_r3 + out_off_1_5x, w171, w85);
             }
 
@@ -731,14 +929,10 @@ static void FUSED_HOT scale_plane_thirds_neon(
                 v3x1c = vrhaddq_u8(v23c, v45c);
 
                 if (active_outputs & (1u << 2)) {
-                    uint8x16x3_t d;
-
-                    d = deinterleave_chunk(v3x0a, v3x0b, v3x0c, chunk_buf);
-                    h_chunk_3x(d.val[0], d.val[1], d.val[2],
+                    h_chunk_3x(v3x0a, v3x0b, v3x0c,
                                dst_3x_r0 + out_off_3x);
 
-                    d = deinterleave_chunk(v3x1a, v3x1b, v3x1c, chunk_buf);
-                    h_chunk_3x(d.val[0], d.val[1], d.val[2],
+                    h_chunk_3x(v3x1a, v3x1b, v3x1c,
                                dst_3x_r1 + out_off_3x);
                 }
             }
@@ -752,17 +946,32 @@ static void FUSED_HOT scale_plane_thirds_neon(
                 uint8x16_t v6xb = vrhaddq_u8(v3x0b, v3x1b);
                 uint8x16_t v6xc = vrhaddq_u8(v3x0c, v3x1c);
 
-                /* Save 6x vertical intermediate for 12x pairing */
+                /* 12x pairing.  On even groups: save the 6x vertical
+                 * intermediate; it becomes v6x_prev for the next group.
+                 * On odd groups: average with v6x_prev in registers and
+                 * emit the 12x output immediately (3x box filter followed
+                 * by two in-register rounded halvings), avoiding both the
+                 * odd group's intermediate store and the separate
+                 * averaging + horizontal scratch passes. */
                 if (need_12x) {
-                    vst1q_u8(v6x_cur + cx,      v6xa);
-                    vst1q_u8(v6x_cur + cx + 16, v6xb);
-                    vst1q_u8(v6x_cur + cx + 32, v6xc);
+                    if ((g6 & 1) == 0) {
+                        vst1q_u8(v6x_cur + cx,      v6xa);
+                        vst1q_u8(v6x_cur + cx + 16, v6xb);
+                        vst1q_u8(v6x_cur + cx + 32, v6xc);
+                    } else {
+                        uint8x16_t p6a = vld1q_u8(v6x_prev + cx);
+                        uint8x16_t p6b = vld1q_u8(v6x_prev + cx + 16);
+                        uint8x16_t p6c = vld1q_u8(v6x_prev + cx + 32);
+                        uint8x16_t r3x = h_chunk_3x_reg(
+                            vrhaddq_u8(p6a, v6xa),
+                            vrhaddq_u8(p6b, v6xb),
+                            vrhaddq_u8(p6c, v6xc));
+                        pow2_store_h2(r3x, dst_12x_r0 + ci * 4);
+                    }
                 }
 
                 if (active_outputs & (1u << 4)) {
-                    uint8x16x3_t d = deinterleave_chunk(v6xa, v6xb, v6xc, chunk_buf);
-                    uint8x16_t r3x = h_chunk_3x(d.val[0], d.val[1], d.val[2],
-                                                 chunk_buf);
+                    uint8x16_t r3x = h_chunk_3x_reg(v6xa, v6xb, v6xc);
                     h_chunk_6x(r3x, dst_6x_r0 + out_off_6x);
                 }
             }
@@ -854,13 +1063,9 @@ static void FUSED_HOT scale_plane_thirds_neon(
          * 12x handling: pair two consecutive 6-row groups.
          * v6x_cur holds this group's 6x vertical intermediate (src_w bytes).
          * On even groups: swap pointers so current becomes previous.
-         * On odd groups: average prev with current, apply horizontal, output.
-         *
-         * 12x requires averaging two consecutive 6x rows, each derived from
-         * a different 6-row source group.  Since the two 6x rows come from
-         * different iterations of the outer loop, we save each 6x
-         * intermediate in v6x_cur and pair them every two iterations.
-         * The ping-pong swap avoids copying.
+         * On odd groups: the chunk loop already averaged each full chunk
+         * with v6x_prev in registers and emitted the 12x output inline;
+         * only the scalar tail columns remain to be paired and filtered.
          * ============================================================ */
         if (need_12x) {
             if ((g6 & 1) == 0) {
@@ -869,30 +1074,23 @@ static void FUSED_HOT scale_plane_thirds_neon(
                 v6x_prev = v6x_cur;
                 v6x_cur  = tmp;
             } else {
-                /* Average v6x_prev (even group) with v6x_cur (odd group) */
-                /* Compute 12x vertical into v6x_prev (reuse as scratch) */
-                int neon16 = src_w / 16;
-                int x = 0;
-                for (int c = 0; c < neon16; c++, x += 16) {
-                    uint8x16_t a = vld1q_u8(v6x_prev + x);
-                    uint8x16_t b = vld1q_u8(v6x_cur + x);
-                    vst1q_u8(v6x_prev + x, vrhaddq_u8(a, b));
-                }
-                for (; x < src_w; x++) {
-                    v6x_prev[x] = avg_u8(v6x_prev[x], v6x_cur[x]);
-                }
+                if (tail_cols > 0) {
+                    /* Average the two groups' 6x intermediates over the
+                     * tail columns only (full chunks were fused in the
+                     * chunk loop), then 3x -> halve -> halve. */
+                    for (int x = tail_start; x < src_w; x++)
+                        v6x_prev[x] = avg_u8(v6x_prev[x], v6x_cur[x]);
 
-                if (active_outputs & (1u << 6)) {
-                    int dw = dst_widths[3];
-                    int ds = dst_strides[3];
-
-                    /* Horizontal: 3x box avg -> halve -> halve = 12:1 */
-                    h_filter_3x(v6x_prev, src_w, h_3x_buf, w_3x);
-                    h_filter_halve(h_3x_buf, h_6x_buf, w_6x);
-                    h_filter_halve(h_6x_buf,
-                                   dst_planes[3] + (size_t)out_row[3] * (size_t)ds, dw);
-                    out_row[3]++;
+                    int tail_w3 = w_3x - full_chunks * 16;
+                    uint8_t h3_tail[16];
+                    uint8_t h6_tail[8];
+                    h_filter_3x(v6x_prev + tail_start, tail_cols,
+                                h3_tail, tail_w3);
+                    h_filter_halve(h3_tail, h6_tail, tail_w3 / 2);
+                    h_filter_halve(h6_tail, dst_12x_r0 + full_chunks * 4,
+                                   dst_widths[3] - full_chunks * 4);
                 }
+                out_row[3]++;
             }
         }
     } /* end g6 loop */

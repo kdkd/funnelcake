@@ -297,6 +297,32 @@ void fused_scaler_run(fused_scaler_ctx_t *ctx,
 void fused_scaler_free(fused_scaler_ctx_t *ctx);
 
 
+/* --------------------------------------------------------------------------
+ * Capability query (applies to both the SDR and HDR scalers)
+ * -------------------------------------------------------------------------- */
+
+/*
+ * fused_simd_available - report whether the scalers will use SIMD kernels.
+ *
+ * Returns 1 if fused_scaler_init / fused_hdr_init will run the vectorized
+ * (AVX2 / NEON / RVV) kernels on this machine, or 0 if they will use the
+ * portable scalar kernels instead. Scalar fallback happens when:
+ *   - the build target has no SIMD kernels (a CPU family other than x86_64,
+ *     aarch64, or riscv64),
+ *   - the running CPU lacks the required extension (e.g. a pre-AVX2 x86_64
+ *     part), or
+ *   - FUNNELCAKE_FORCE_SCALAR is set to a non-empty value in the environment.
+ *
+ * When this returns 0, an otherwise-perfect init reports FUSED_WARN_BIT_SCALAR
+ * (not FUSED_OK) and every produced output's `fallback` field is 1; callers
+ * that treat that warning bit as success should consult this function first.
+ *
+ * Uses the same one-time CPU probe as the scalers; the result is cached, and
+ * the call is thread-safe after the first invocation.
+ */
+int fused_simd_available(void);
+
+
 /* ==========================================================================
  * HDR10 API - 10-bit scaling with optional tone mapping to SDR
  *
@@ -333,11 +359,40 @@ void fused_scaler_free(fused_scaler_ctx_t *ctx);
 
 
 /* --------------------------------------------------------------------------
+ * Quantization range (fused_tonemap_config_t.src_range / dst_range)
+ *
+ * Limited (video/MPEG) range is the default because essentially all real
+ * HDR10/HLG video streams are limited range: 10-bit Y 64..940, chroma
+ * 64..960.  Full (PC/JPEG) range uses the entire code space (0..1023 in,
+ * 0..255 out).  Only the tone mapping stage interprets pixel values, so
+ * these flags have no effect on pure scaling outputs.
+ * -------------------------------------------------------------------------- */
+
+#define FUSED_RANGE_LIMITED 0   /* video range: 10-bit 64..940/960, 8-bit 16..235/240 */
+#define FUSED_RANGE_FULL    1   /* full range: 10-bit 0..1023, 8-bit 0..255            */
+
+
+/* --------------------------------------------------------------------------
  * Tone mapping curve presets (fused_tonemap_config_t.curve)
  *
  * Applied to SDR outputs and the 1:1 tone map output. The LUT is
  * precomputed at init time from the selected curve, peak_nits, and
  * target_nits.
+ *
+ * All built-in curves map [0, peak_nits] smoothly onto the SDR range -
+ * highlights compress progressively rather than clipping, and peak_nits
+ * controls how much headroom the curve reserves.  They differ in look:
+ *
+ *   HABLE    - filmic shoulder/toe.  Preserves the most highlight detail;
+ *              renders midtones noticeably darker than the source
+ *              (about -1 stop at default settings), as filmic curves do.
+ *   REINHARD - extended Reinhard with white point at peak_nits.  Soft,
+ *              lower contrast; midtones at about half the source level.
+ *   BT2390   - ITU-R BT.2390 EETF in PQ space.  Reference broadcast
+ *              behavior: content below the knee (a few tens of nits at
+ *              default settings) passes through at the correct brightness,
+ *              only the top of the range is compressed.  Use this when
+ *              output should track the source as closely as possible.
  * -------------------------------------------------------------------------- */
 
 #define FUSED_TONEMAP_HABLE    0   /* Hable/Uncharted 2 filmic - good default    */
@@ -368,13 +423,20 @@ typedef struct {
 
 /*
  * Tone mapping configuration for SDR outputs.
- * Zero-initialised struct means: Hable curve, 1000-nit peak, 100-nit target.
+ * Zero-initialised struct means: Hable curve, 1000-nit peak, 100-nit target,
+ * limited (video) range in and out.
+ *
+ * Range flags apply to the built-in curves only.  FUSED_TONEMAP_CUSTOM
+ * passes 10-bit codes straight through the caller's LUT, so range handling
+ * is the caller's responsibility there.
  */
 typedef struct {
     int            curve;          /* FUSED_TONEMAP_* preset                    */
     int            peak_nits;      /* source peak brightness (0 = default 1000) */
     int            target_nits;    /* SDR target (0 = default 100)              */
     const uint8_t *custom_lut;     /* 1024-entry Y LUT for FUSED_TONEMAP_CUSTOM */
+    int            src_range;      /* FUSED_RANGE_* of 10-bit input (default limited) */
+    int            dst_range;      /* FUSED_RANGE_* of 8-bit SDR output (default limited) */
 } fused_tonemap_config_t;
 
 /*
@@ -424,14 +486,26 @@ typedef struct {
     fused_scale_output_t sdr_outputs[8];  /* 8-bit;  NULL planes if not in sdr_flags */
     fused_scale_output_t output_1x;       /* 8-bit tone-mapped at source res         */
 
-    /* Upscale configuration and results - HDR-only for this iteration.
-     * No tone-mapping is applied to upscale outputs; they are 10-bit HDR
-     * copies scaled from the 10-bit HDR source. */
+    /* Upscale configuration and results.  Upscale outputs are 10-bit HDR
+     * copies scaled from the 10-bit source.  Each achieved level (and the
+     * 1.5x tail) can additionally produce an 8-bit tone-mapped SDR copy:
+     * set the level's bit in upscale_sdr_flags (must be a subset of
+     * upscale_flags - the 10-bit output exists either way) and/or
+     * upscale_sdr_tail_1_5x (requires upscale_tail_1_5x).  SDR upscale
+     * copies are tone-mapped from the level's 10-bit planes at the
+     * upscaled resolution - the same scale-in-10-bit-then-tone-map order
+     * as the downscale SDR outputs. */
     uint32_t upscale_flags;             /* FUSED_UPSCALE_* contiguous prefix mask  */
     int      upscale_tail_1_5x;         /* 0 or 1: append 1.5x tail output         */
+    uint32_t upscale_sdr_flags;         /* subset of upscale_flags: also produce
+                                         * tone-mapped SDR copies of these levels  */
+    int      upscale_sdr_tail_1_5x;     /* 0 or 1: SDR copy of the 1.5x tail       */
     uint32_t achieved_upscale_flags;    /* written by init                         */
     int      achieved_upscale_tail;     /* written by init                         */
-    fused_hdr_output_t upscale_hdr_outputs[FUSED_MAX_UPSCALE_STEPS];
+    uint32_t achieved_upscale_sdr_flags;/* written by init                         */
+    int      achieved_upscale_sdr_tail; /* written by init                         */
+    fused_hdr_output_t   upscale_hdr_outputs[FUSED_MAX_UPSCALE_STEPS];
+    fused_scale_output_t upscale_sdr_outputs[FUSED_MAX_UPSCALE_STEPS];
 
     /* Internal - opaque, managed by init/free; do not read or write */
     void *_internal;

@@ -249,6 +249,19 @@ int fused_scaler_init(fused_scaler_ctx_t *ctx)
         simd_upscale_fn   = fused_kernel_upscale_avx2;
         simd_thirds_up_fn = fused_kernel_thirds_up_avx2;
         simd_pow2_up_fn   = fused_kernel_pow2_up_avx2;
+
+        /* AVX-512 needs both the hardware (has_avx512: F+BW+VL+VBMI with
+         * OS ZMM state) and a build whose compiler accepted the AVX-512
+         * flags (fused_avx512_compiled).  Entry points not yet ported to
+         * 512-bit delegate to their AVX2 counterparts internally, so the
+         * whole table swaps at once. */
+        if (caps->has_avx512 && fused_avx512_compiled()) {
+            simd_thirds_fn    = fused_kernel_thirds_avx512;
+            simd_pow2_fn      = fused_kernel_pow2_avx512;
+            simd_upscale_fn   = fused_kernel_upscale_avx512;
+            simd_thirds_up_fn = fused_kernel_thirds_up_avx512;
+            simd_pow2_up_fn   = fused_kernel_pow2_up_avx512;
+        }
     }
 #elif defined(__riscv) && (__riscv_xlen == 64)
     if (caps->has_rvv) {
@@ -611,7 +624,8 @@ tail_done:
      * source row any upscale helper will process.  Allocated once here
      * so the per-frame hot path does not malloc/free, which was causing
      * first-touch page faults and high max latency. */
-    p->upscale_scratch = NULL;
+    p->upscale_scratch  = NULL;
+    p->upscale_scratch2 = NULL;
     if (want_up) {
         int max_scratch_w = 0;
         if (up_N >= 1) {
@@ -626,10 +640,14 @@ tail_done:
             if (tv > max_scratch_w) max_scratch_w = tv;
         }
         if (max_scratch_w > 0) {
-            size_t bytes = (size_t)((max_scratch_w + 63) & ~63);
+            /* Two aligned rows from one allocation: row 0 is the
+             * vertical-blend buffer, row 1 the two-pass interleave temp.
+             * Each row is 64-byte aligned so both stay SIMD-friendly. */
+            size_t row = (size_t)((max_scratch_w + 63) & ~63);
             void *sp = NULL;
-            if (fused_aligned_alloc(&sp, 64, bytes) == 0) {
-                p->upscale_scratch = (uint8_t *)sp;
+            if (fused_aligned_alloc(&sp, 64, row * 2) == 0) {
+                p->upscale_scratch  = (uint8_t *)sp;
+                p->upscale_scratch2 = (uint8_t *)sp + row;
             } else {
                 fused_log(&ctx->log_warnings, FUSED_LOG_WARN,
                     "funnelcake: failed to allocate upscale scratch buffer\n");
@@ -784,6 +802,9 @@ void fused_scaler_free(fused_scaler_ctx_t *ctx)
         fused_internal_t *state = (fused_internal_t *)ctx->_internal;
         fused_aligned_free(state->params.upscale_scratch);
         state->params.upscale_scratch = NULL;
+        /* upscale_scratch2 aliases into the upscale_scratch allocation;
+         * it must not be freed separately, only cleared. */
+        state->params.upscale_scratch2 = NULL;
         fused_aligned_free(state->params.scratch_pool);
         state->params.scratch_pool = NULL;
         state->params.scratch_pool_size = 0;

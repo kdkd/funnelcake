@@ -81,6 +81,7 @@ function New-PackageDir {
     New-Item -ItemType Directory -Path (Join-Path $dest 'include') -Force | Out-Null
     Copy-Item $LibraryPath (Join-Path $dest $LibraryName)
     Copy-Item (Join-Path $RepoRoot 'include\funnelcake.h') (Join-Path $dest 'include')
+    Copy-Item (Join-Path $RepoRoot 'include\funnelcake_helpers.h') (Join-Path $dest 'include')
     Copy-Item (Join-Path $RepoRoot 'README.md')  $dest
     Copy-Item (Join-Path $RepoRoot 'INSTALL.md') $dest
 
@@ -152,9 +153,11 @@ function Invoke-MsvcArm64Build {
         'src\kernels_hdr_scalar.c',
         'src\tonemap.c',
         'src\kernels_upscale_scalar.c',
+        'src\bindings_support.c',
         'src\kernels_neon.c',
         'src\kernels_hdr_neon.c',
-        'src\kernels_upscale_neon.c'
+        'src\kernels_upscale_neon.c',
+        'src\tonemap_neon.c'
     )
 
     if (-not (Test-Tool 'cl') -or -not (Test-Tool 'lib')) {

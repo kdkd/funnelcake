@@ -142,6 +142,45 @@ error (no-op in both cases). After this call the context may be
 re-initialised with new parameters.
 
 
+### `fused_simd_available`
+
+```c
+int fused_simd_available(void);
+```
+
+Returns `1` if the scalers will run the vectorized (AVX2 / NEON / RVV)
+kernels on this machine, or `0` if they will use the portable scalar
+kernels instead. Applies to both the SDR (`fused_scaler_init`) and HDR
+(`fused_hdr_init`) paths.
+
+Scalar fallback - and therefore a `0` return - happens when:
+
+- the build target has no SIMD kernels (a CPU family other than x86_64,
+  aarch64, or riscv64),
+- the running CPU lacks the required extension (e.g. a pre-AVX2 x86_64
+  part), or
+- `FUNNELCAKE_FORCE_SCALAR` is set to a non-empty value in the
+  environment.
+
+When this returns `0`, an otherwise-perfect init reports
+`FUSED_WARN_BIT_SCALAR` (not `FUSED_OK`) and every produced output's
+`fallback` field is `1`. This is the canonical way to tell *expected*
+scalar fallback (an old CPU) apart from a per-step fallback caused by
+alignment - callers and test harnesses that want to treat the whole-CPU
+case as success should consult this function first:
+
+```c
+int allow = fused_simd_available() ? 0 : FUSED_WARN_BIT_SCALAR;
+int rc = fused_scaler_init(&scaler);
+if ((rc & ~allow) != 0) {
+    /* a real warning or error, not just expected scalar fallback */
+}
+```
+
+Uses the same one-time CPU probe as the scalers; the result is cached,
+and the call is thread-safe after the first invocation.
+
+
 ## Data Types
 
 ### `fused_scaler_ctx_t`
@@ -558,6 +597,106 @@ must be a multiple of 64). Steps that fail this constraint are handled
 by the scalar fallback unless `FUSED_OPT_NO_FALLBACK` is set.
 
 
+## NUMA and Thread Affinity
+
+Funnelcake does not create worker threads or change CPU affinity. Both
+`fused_scaler_run` and `fused_hdr_run` execute on the caller's thread,
+so applications that care about NUMA placement should manage affinity at
+the caller level.
+
+This can matter on multi-socket systems, or on systems configured with
+multiple NUMA domains per socket. Large HDR frames, deep upscale cascades,
+and workloads that produce several outputs touch enough source, output,
+and scratch memory that remote-node placement can become visible.
+
+For best locality, prefer one scaler context per long-lived worker or per
+NUMA domain. The exact affinity calls are platform-specific. For example:
+
+```c
+/* Linux: libnuma, link with -lnuma. */
+#if defined(__linux__)
+#include <numa.h>
+
+static int pin_current_thread_to_numa_node(unsigned node)
+{
+    if (numa_available() < 0)
+        return -1;
+    return numa_run_on_node((int)node);
+}
+
+/* FreeBSD: build a CPU set for the target socket / NUMA domain using
+ * your application's topology knowledge, then bind this thread to it. */
+#elif defined(__FreeBSD__)
+#include <sys/param.h>
+#include <sys/cpuset.h>
+
+static int pin_current_thread_to_cpuset(const cpuset_t *cpus)
+{
+    return cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1,
+                              sizeof(*cpus), cpus);
+}
+
+/* Windows: node id to processor-group affinity. */
+#elif defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
+static int pin_current_thread_to_numa_node(unsigned node)
+{
+    GROUP_AFFINITY affinity = {0};
+    if (!GetNumaNodeProcessorMaskEx((USHORT)node, &affinity) ||
+        affinity.Mask == 0)
+        return -1;
+    return SetThreadGroupAffinity(GetCurrentThread(), &affinity, NULL) ? 0 : -1;
+}
+#endif
+
+/* Pin the owning worker before creating and warming the context. */
+#if defined(__linux__) || defined(_WIN32)
+if (pin_current_thread_to_numa_node(node) != 0) {
+    /* handle affinity failure or continue without pinning */
+}
+#elif defined(__FreeBSD__)
+cpuset_t cpus;
+CPU_ZERO(&cpus);
+/* Fill cpus with the logical CPUs in the target socket / NUMA domain. */
+CPU_SET(0, &cpus);
+CPU_SET(1, &cpus);
+if (pin_current_thread_to_cpuset(&cpus) != 0) {
+    /* handle affinity failure or continue without pinning */
+}
+#endif
+
+fused_scaler_ctx_t scaler = {0};
+/* fill scaler fields */
+int rc = fused_scaler_init(&scaler);
+if (rc < 0) {
+    /* handle error */
+}
+
+/* Optional: run one warm-up frame on the owning worker so output and
+ * scratch pages are first-touched on the intended NUMA node. */
+fused_scaler_run(&scaler, src_y, src_u, src_v);
+
+/* Reuse this context on the same worker for subsequent frames. */
+```
+
+The same pattern applies to `fused_hdr_ctx_t` and `fused_hdr_run`.
+
+Avoid bouncing a single initialized context between sockets. Output
+planes, scratch pools, and P010 deinterleave buffers are allocated during
+init and are commonly placed by first touch during the first run. Moving
+the context to a different NUMA node afterward can turn those persistent
+buffers into remote memory. Source frame buffers are owned by the caller,
+so they should also be produced, copied, or pinned in a way that matches
+the worker that will call funnelcake.
+
+Useful platform references:
+[Linux libnuma](https://man7.org/linux/man-pages/man3/numa.3.html),
+[FreeBSD cpuset(2)](https://man.freebsd.org/cgi/man.cgi?query=cpuset&sektion=2),
+and [Windows SetThreadGroupAffinity](https://learn.microsoft.com/en-us/windows/win32/api/processtopologyapi/nf-processtopologyapi-setthreadgroupaffinity).
+
+
 ## libavcodec Integration
 
 AVFrame planes map directly to the scaler's source parameters:
@@ -941,15 +1080,24 @@ struct member. Zero-initialise before use.
 | `hdr_outputs[8]` | `fused_hdr_output_t` | 10-bit downscale outputs. Slots not in `achieved_hdr_flags` have NULL planes. |
 | `sdr_outputs[8]` | `fused_scale_output_t` | 8-bit tone-mapped downscale outputs. Slots not in `achieved_sdr_flags` have NULL planes. |
 | `output_1x` | `fused_scale_output_t` | 8-bit tone-mapped output at source resolution. Only valid if `tonemap_1x` was set. |
-| `upscale_hdr_outputs[6]` | `fused_hdr_output_t` | 10-bit upscale outputs, indexed by `FUSED_UP_IDX_*`. HDR only - no SDR or tone-mapping path is applied to upscale outputs. |
+| `upscale_hdr_outputs[6]` | `fused_hdr_output_t` | 10-bit upscale outputs, indexed by `FUSED_UP_IDX_*`. |
+| `upscale_sdr_flags` | `uint32_t` | Subset of `upscale_flags`: levels that should also produce an 8-bit tone-mapped SDR copy. |
+| `upscale_sdr_tail_1_5x` | `int` | 1 to also produce an SDR copy of the 1.5x tail (requires `upscale_tail_1_5x`). |
+| `achieved_upscale_sdr_flags` | `uint32_t` | SDR upscale copies that will be produced. |
+| `achieved_upscale_sdr_tail` | `int` | 1 if the SDR tail copy will be produced. |
+| `upscale_sdr_outputs[6]` | `fused_scale_output_t` | 8-bit tone-mapped upscale copies, indexed by `FUSED_UP_IDX_*`. Slots not achieved have NULL planes. |
 
 The `_internal` field is opaque; do not read or write it.
 
-**HDR upscale** produces 10-bit outputs only. Unlike the downscale path,
-there is no parallel SDR or tone-mapping stage on upscale: `hdr_flags`
-and `sdr_flags` do not affect upscale outputs. If you need an SDR
-tone-mapped upscale copy, apply it in a separate pass on the resulting
-`upscale_hdr_outputs` plane.
+**HDR upscale** always produces 10-bit outputs; `hdr_flags` and
+`sdr_flags` do not affect upscale outputs. To additionally get an SDR
+tone-mapped copy of an upscale level, set the level's bit in
+`upscale_sdr_flags` (and/or `upscale_sdr_tail_1_5x` for the tail). SDR
+copies are tone-mapped from the level's 10-bit planes at the upscaled
+resolution - the same scale-in-10-bit-then-tone-map order as the
+downscale SDR outputs - and use the shared `tonemap` configuration.
+Because the copy is made from the 10-bit output, each requested SDR
+level must also be present in `upscale_flags`.
 
 
 ## Input Pixel Formats

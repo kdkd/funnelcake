@@ -62,13 +62,27 @@ static inline uint8_t up_blend_21_u8(uint8_t a, uint8_t b)
  *   dst[2i+1] = avg(src[i], src[i+1])      (src[w-1] replicated at edge)
  * dst must have room for 2*w pixels.
  */
-static inline void up_h_2x_row_u8(const uint8_t *src, int w, uint8_t *dst)
+static inline void up_h_2x_row_u8(const uint8_t *restrict src, int w, uint8_t *restrict dst)
 {
-    for (int i = 0; i < w; i++) {
+    /* Main body: src[i+1] is always in range, so the loop carries no
+     * per-pixel edge branch, which keeps it auto-vectorizable.  This helper
+     * is used by the SIMD kernels for their scalar remainder/edge handling;
+     * the scalar plane path instead uses the two-pass variant in
+     * kernels_upscale_scalar.c, which the compiler vectorizes far better for
+     * the interleaved store on AVX2-less x86-64 (baseline SSE2). */
+    int i;
+    for (i = 0; i + 1 < w; i++) {
         uint8_t a = src[i];
-        uint8_t b = (i + 1 < w) ? src[i + 1] : a;
+        uint8_t b = src[i + 1];
         dst[2 * i + 0] = a;
         dst[2 * i + 1] = up_avg_u8(a, b);
+    }
+    /* Right edge: src[w-1] replicated as its own "next" pixel, so the
+     * midpoint equals the pixel itself (avg(a,a) == a). */
+    if (w > 0) {
+        uint8_t a = src[w - 1];
+        dst[2 * (w - 1) + 0] = a;
+        dst[2 * (w - 1) + 1] = a;
     }
 }
 
@@ -79,10 +93,25 @@ static inline void up_h_2x_row_u8(const uint8_t *src, int w, uint8_t *dst)
  * The source width must be even; out_w = in_w * 3 / 2.
  * dst must have room for in_w * 3 / 2 pixels.
  */
-static inline void up_h_1_5x_row_u8(const uint8_t *src, int w, uint8_t *dst)
+static inline void up_h_1_5x_row_u8(const uint8_t *restrict src, int w, uint8_t *restrict dst)
 {
     int pairs = w / 2;
-    for (int i = 0; i < pairs; i++) {
+    /* All pairs except the last read src[2i+2], which is in range; peeling
+     * the final pair out of the loop removes the per-iteration edge branch
+     * so the body (stride-2 deinterleave loads, two 85/171 blends, stride-3
+     * store) can auto-vectorize. */
+    int main_pairs = pairs > 0 ? pairs - 1 : 0;
+    int i;
+    for (i = 0; i < main_pairs; i++) {
+        uint8_t a = src[2 * i + 0];
+        uint8_t b = src[2 * i + 1];
+        uint8_t c = src[2 * i + 2];
+        dst[3 * i + 0] = a;
+        dst[3 * i + 1] = up_blend_21_u8(a, b);
+        dst[3 * i + 2] = up_blend_21_u8(c, b);
+    }
+    if (pairs > 0) {
+        i = pairs - 1;
         uint8_t a = src[2 * i + 0];
         uint8_t b = src[2 * i + 1];
         uint8_t c = (2 * i + 2 < w) ? src[2 * i + 2] : b;
@@ -107,20 +136,37 @@ static inline uint16_t up_blend_21_u16(uint16_t a, uint16_t b)
     return (uint16_t)(((uint32_t)a * 85 + (uint32_t)b * 171 + 128) >> 8);
 }
 
-static inline void up_h_2x_row_u16(const uint16_t *src, int w, uint16_t *dst)
+static inline void up_h_2x_row_u16(const uint16_t *restrict src, int w, uint16_t *restrict dst)
 {
-    for (int i = 0; i < w; i++) {
+    int i;
+    for (i = 0; i + 1 < w; i++) {
         uint16_t a = src[i];
-        uint16_t b = (i + 1 < w) ? src[i + 1] : a;
+        uint16_t b = src[i + 1];
         dst[2 * i + 0] = a;
         dst[2 * i + 1] = up_avg_u16(a, b);
     }
+    if (w > 0) {
+        uint16_t a = src[w - 1];
+        dst[2 * (w - 1) + 0] = a;
+        dst[2 * (w - 1) + 1] = a;
+    }
 }
 
-static inline void up_h_1_5x_row_u16(const uint16_t *src, int w, uint16_t *dst)
+static inline void up_h_1_5x_row_u16(const uint16_t *restrict src, int w, uint16_t *restrict dst)
 {
     int pairs = w / 2;
-    for (int i = 0; i < pairs; i++) {
+    int main_pairs = pairs > 0 ? pairs - 1 : 0;
+    int i;
+    for (i = 0; i < main_pairs; i++) {
+        uint16_t a = src[2 * i + 0];
+        uint16_t b = src[2 * i + 1];
+        uint16_t c = src[2 * i + 2];
+        dst[3 * i + 0] = a;
+        dst[3 * i + 1] = up_blend_21_u16(a, b);
+        dst[3 * i + 2] = up_blend_21_u16(c, b);
+    }
+    if (pairs > 0) {
+        i = pairs - 1;
         uint16_t a = src[2 * i + 0];
         uint16_t b = src[2 * i + 1];
         uint16_t c = (2 * i + 2 < w) ? src[2 * i + 2] : b;

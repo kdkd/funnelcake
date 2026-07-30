@@ -282,7 +282,9 @@ static void h_filter_halve(const uint8_t *restrict src,
     int out_x = 0;
 
     int c = 0;
+#if defined(__GNUC__) && !defined(__clang__)
     #pragma GCC unroll 4
+#endif
     for (; c + 1 < h_chunks; c += 2) {
         __m256i v0 = _mm256_loadu_si256((const __m256i *)(src + c * 32));
         __m256i v1 = _mm256_loadu_si256((const __m256i *)(src + c * 32 + 32));

@@ -3,6 +3,7 @@
 *.a
 *.d
 *.S
+*.dylib
 build/
 dist/
 funnelcake_test
@@ -25,3 +26,7 @@ test/samples/
 #temporary and dev viles
 attic/
 docs/superpowers/
+.claude/settings.local.json
+*.profdata
+*.profraw
+.codex

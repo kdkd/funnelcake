@@ -32,10 +32,10 @@
  *   - Chunk sizes: 48 bytes = 24 uint16_t = 8 triplets (thirds family),
  *     16 bytes = 8 uint16_t elements (pow2 family).
  *
- * Guarded by __aarch64__ so this file is a no-op on other platforms.
+ * Guarded by __aarch64__/_M_ARM64 so this file is a no-op on other platforms.
  */
 
-#if defined(__aarch64__)
+#if defined(__aarch64__) || defined(_M_ARM64)
 
 #include "internal.h"
 #include <arm_neon.h>
@@ -223,7 +223,7 @@ static void h_filter_halve_hdr(const uint16_t *restrict src,
  * uint16_t elements with 8 elements per Q register instead of 16.
  * ----------------------------------------------------------------------- */
 
-static void __attribute__((hot)) scale_plane_pow2_hdr_neon_buffered(
+static void FUSED_HOT scale_plane_pow2_hdr_neon_buffered(
     const uint16_t *restrict src,
     int src_w, int src_h, int src_stride,
     uint32_t active_outputs,
@@ -286,8 +286,8 @@ static void __attribute__((hot)) scale_plane_pow2_hdr_neon_buffered(
          * per-row stream tracker has to re-lock; the prefetches bridge that. */
         if (g + 1 < num_groups) {
             const uint16_t *nxt = grp_base + (size_t)group_rows * (size_t)src_el_stride;
-            __builtin_prefetch(nxt);
-            __builtin_prefetch(nxt + src_el_stride);
+            FUSED_PREFETCH(nxt);
+            FUSED_PREFETCH(nxt + src_el_stride);
         }
 
         /* -- Vertical cascade (NEON) --------------------------------- */
@@ -510,7 +510,7 @@ typedef struct {
     uint16x8_t hi;
 } hdr_pow2_tile16_t;
 
-static inline __attribute__((always_inline)) hdr_pow2_tile16_t
+static inline FUSED_ALWAYS_INLINE hdr_pow2_tile16_t
 hdr_pow2_load_pair16(const uint16_t *base, int row, int src_el_stride, int x)
 {
     const uint16_t *a = base + (size_t)row * src_el_stride + x;
@@ -521,7 +521,7 @@ hdr_pow2_load_pair16(const uint16_t *base, int row, int src_el_stride, int x)
     return out;
 }
 
-static inline __attribute__((always_inline)) hdr_pow2_tile16_t
+static inline FUSED_ALWAYS_INLINE hdr_pow2_tile16_t
 hdr_pow2_avg_tile16(hdr_pow2_tile16_t a, hdr_pow2_tile16_t b)
 {
     hdr_pow2_tile16_t out = {
@@ -531,28 +531,28 @@ hdr_pow2_avg_tile16(hdr_pow2_tile16_t a, hdr_pow2_tile16_t b)
     return out;
 }
 
-static inline __attribute__((always_inline)) void
+static inline FUSED_ALWAYS_INLINE void
 hdr_pow2_store_h1_tile16(hdr_pow2_tile16_t v, uint16_t *dst)
 {
     hdr_pow2_store_h1(v.lo, dst);
     hdr_pow2_store_h1(v.hi, dst + 4);
 }
 
-static inline __attribute__((always_inline)) void
+static inline FUSED_ALWAYS_INLINE void
 hdr_pow2_store_h2_tile16(hdr_pow2_tile16_t v, uint16_t *dst)
 {
     hdr_pow2_store_h2(v.lo, dst);
     hdr_pow2_store_h2(v.hi, dst + 2);
 }
 
-static inline __attribute__((always_inline)) void
+static inline FUSED_ALWAYS_INLINE void
 hdr_pow2_store_h3_tile16(hdr_pow2_tile16_t v, uint16_t *dst)
 {
     hdr_pow2_store_h3(v.lo, dst);
     hdr_pow2_store_h3(v.hi, dst + 1);
 }
 
-static inline __attribute__((always_inline)) void
+static inline FUSED_ALWAYS_INLINE void
 hdr_pow2_store_h4_tile16(hdr_pow2_tile16_t v, uint16_t *dst)
 {
     v.lo = hdr_pow2_hhalve_reg(
@@ -641,7 +641,7 @@ static void hdr_pow2_tiled_depth3(
     }
 }
 
-static void __attribute__((hot)) scale_plane_pow2_hdr_neon(
+static void FUSED_HOT scale_plane_pow2_hdr_neon(
     const uint16_t *restrict src,
     int src_w, int src_h, int src_stride,
     uint32_t active_outputs,
@@ -787,7 +787,7 @@ static inline void h_chunk_12x_hdr(uint16x8_t result_3x, uint16_t *restrict dst)
     vst1_lane_u16(dst + 1, v12, 1);
 }
 
-static void __attribute__((hot)) scale_plane_thirds_hdr_neon(
+static void FUSED_HOT scale_plane_thirds_hdr_neon(
     const uint16_t *restrict src,
     int src_w, int src_h, int src_stride,
     uint32_t active_outputs,
@@ -869,12 +869,12 @@ static void __attribute__((hot)) scale_plane_thirds_hdr_neon(
          * row; this bridges the per-row stream restart at the group boundary. */
         if (g6 + 1 < base6_groups) {
             const uint16_t *nxt = grp + (size_t)6 * (size_t)src_el_stride;
-            __builtin_prefetch(nxt);
-            __builtin_prefetch(nxt + src_el_stride);
-            __builtin_prefetch(nxt + 2 * src_el_stride);
-            __builtin_prefetch(nxt + 3 * src_el_stride);
-            __builtin_prefetch(nxt + 4 * src_el_stride);
-            __builtin_prefetch(nxt + 5 * src_el_stride);
+            FUSED_PREFETCH(nxt);
+            FUSED_PREFETCH(nxt + src_el_stride);
+            FUSED_PREFETCH(nxt + 2 * src_el_stride);
+            FUSED_PREFETCH(nxt + 3 * src_el_stride);
+            FUSED_PREFETCH(nxt + 4 * src_el_stride);
+            FUSED_PREFETCH(nxt + 5 * src_el_stride);
         }
 
         /* Compute output row base pointers (element pointers, not byte) */
@@ -1175,7 +1175,7 @@ static void __attribute__((hot)) scale_plane_thirds_hdr_neon(
  * into two 8-element vectors), then process U and V identically to I010.
  * ----------------------------------------------------------------------- */
 
-void __attribute__((hot)) fused_kernel_pow2_hdr_neon(
+void FUSED_HOT fused_kernel_pow2_hdr_neon(
     const fused_hdr_kernel_params_t *p,
     const uint16_t *src_y,
     const uint16_t *src_u,
@@ -1275,7 +1275,7 @@ void __attribute__((hot)) fused_kernel_pow2_hdr_neon(
 }
 
 
-void __attribute__((hot)) fused_kernel_thirds_hdr_neon(
+void FUSED_HOT fused_kernel_thirds_hdr_neon(
     const fused_hdr_kernel_params_t *p,
     const uint16_t *src_y,
     const uint16_t *src_u,

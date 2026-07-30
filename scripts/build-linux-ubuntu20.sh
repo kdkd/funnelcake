@@ -73,7 +73,7 @@ RUN make lib CC=clang LTO=0
 RUN pkg="/out/funnelcake-linux-ubuntu20-${TARGETARCH}" \
     && mkdir -p "${pkg}/include" \
     && cp libfunnelcake.a "${pkg}/" \
-    && cp include/funnelcake.h "${pkg}/include/" \
+    && cp include/funnelcake.h include/funnelcake_helpers.h "${pkg}/include/" \
     && cp README.md INSTALL.md "${pkg}/" \
     && printf '%s\n' \
        "name=funnelcake" \
@@ -89,6 +89,9 @@ WORKDIR /out
 RUN pkg="funnelcake-linux-ubuntu20-${TARGETARCH}" \
     && tar -czf "${pkg}.tar.gz" "${pkg}" \
     && sha256sum "${pkg}.tar.gz" > "${pkg}.tar.gz.sha256"
+
+FROM scratch
+COPY --from=0 /out/ /out/
 EOF
 
   output_root="${export_dir}/out"

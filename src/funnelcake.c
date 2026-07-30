@@ -232,7 +232,7 @@ int fused_scaler_init(fused_scaler_ctx_t *ctx)
     fused_kernel_fn simd_thirds_up_fn = NULL;
     fused_kernel_fn simd_pow2_up_fn   = NULL;
 
-#if defined(__aarch64__)
+#if defined(__aarch64__) || defined(_M_ARM64)
     if (caps->has_neon) {
         has_simd = 1;
         simd_thirds_fn    = fused_kernel_thirds_neon;
@@ -277,16 +277,18 @@ int fused_scaler_init(fused_scaler_ctx_t *ctx)
 #endif
 
     if (!has_simd) {
-        /* One-time stderr notice.  Suppressed when scalar was explicitly
-         * requested via FUNNELCAKE_FORCE_SCALAR (the parity test toggles
-         * this on and off; printing the warning on every flip would flood
-         * the test output and confuse readers into thinking SIMD is broken). */
+        /* One-time notice routed through the configured warning logger so
+         * callers using FUSED_LOG_SUPPRESS / FUSED_LOG_CALLBACK can control
+         * it. Suppressed when scalar was explicitly requested via
+         * FUNNELCAKE_FORCE_SCALAR (the parity test toggles this on and off;
+         * printing the warning on every flip would flood the test output and
+         * confuse readers into thinking SIMD is broken). */
         static int g_no_simd_warned = 0;
         const char *force_scalar_env = getenv("FUNNELCAKE_FORCE_SCALAR");
         int forced_scalar = (force_scalar_env != NULL && force_scalar_env[0] != '\0');
         if (!g_no_simd_warned && !forced_scalar) {
             g_no_simd_warned = 1;
-            fprintf(stderr,
+            fused_log(&ctx->log_warnings, FUSED_LOG_WARN,
                 "funnelcake: no SIMD support detected; using scalar kernel\n");
         }
         warn_bits |= FUSED_WARN_BIT_SCALAR;
@@ -369,11 +371,11 @@ int fused_scaler_init(fused_scaler_ctx_t *ctx)
         int chroma_h  = out_h / 2;
 
         void *py = NULL, *pu = NULL, *pv = NULL;
-        if (fused_alloc_aligned(&py, 32, (size_t)y_stride  * (size_t)out_h)  != 0 ||
-            fused_alloc_aligned(&pu, 32, (size_t)uv_stride * (size_t)chroma_h) != 0 ||
-            fused_alloc_aligned(&pv, 32, (size_t)uv_stride * (size_t)chroma_h) != 0) {
+        if (fused_aligned_alloc(&py, 32, (size_t)y_stride  * (size_t)out_h)  != 0 ||
+            fused_aligned_alloc(&pu, 32, (size_t)uv_stride * (size_t)chroma_h) != 0 ||
+            fused_aligned_alloc(&pv, 32, (size_t)uv_stride * (size_t)chroma_h) != 0) {
             /* Allocation failure - free what we got and reject this step */
-            free(py); free(pu); free(pv);
+            fused_aligned_free(py); fused_aligned_free(pu); fused_aligned_free(pv);
             fused_log(&ctx->log_warnings, FUSED_LOG_WARN,
                 "funnelcake: %s rejected: out-of-memory allocating output planes\n",
                 sd->name);
@@ -434,10 +436,10 @@ int fused_scaler_init(fused_scaler_ctx_t *ctx)
         int chroma_h  = up_h / 2;
 
         void *py = NULL, *pu = NULL, *pv = NULL;
-        if (fused_alloc_aligned(&py, 32, (size_t)y_stride  * (size_t)up_h)   != 0 ||
-            fused_alloc_aligned(&pu, 32, (size_t)uv_stride * (size_t)chroma_h) != 0 ||
-            fused_alloc_aligned(&pv, 32, (size_t)uv_stride * (size_t)chroma_h) != 0) {
-            free(py); free(pu); free(pv);
+        if (fused_aligned_alloc(&py, 32, (size_t)y_stride  * (size_t)up_h)   != 0 ||
+            fused_aligned_alloc(&pu, 32, (size_t)uv_stride * (size_t)chroma_h) != 0 ||
+            fused_aligned_alloc(&pv, 32, (size_t)uv_stride * (size_t)chroma_h) != 0) {
+            fused_aligned_free(py); fused_aligned_free(pu); fused_aligned_free(pv);
             fused_log(&ctx->log_warnings, FUSED_LOG_WARN,
                 "funnelcake: upscale level %dx rejected: out-of-memory\n",
                 (1 << (k + 1)));
@@ -506,10 +508,10 @@ int fused_scaler_init(fused_scaler_ctx_t *ctx)
         int chroma_h    = tail_h / 2;
 
         void *py = NULL, *pu = NULL, *pv = NULL;
-        if (fused_alloc_aligned(&py, 32, (size_t)y_stride  * (size_t)tail_h)   != 0 ||
-            fused_alloc_aligned(&pu, 32, (size_t)uv_stride * (size_t)chroma_h) != 0 ||
-            fused_alloc_aligned(&pv, 32, (size_t)uv_stride * (size_t)chroma_h) != 0) {
-            free(py); free(pu); free(pv);
+        if (fused_aligned_alloc(&py, 32, (size_t)y_stride  * (size_t)tail_h)   != 0 ||
+            fused_aligned_alloc(&pu, 32, (size_t)uv_stride * (size_t)chroma_h) != 0 ||
+            fused_aligned_alloc(&pv, 32, (size_t)uv_stride * (size_t)chroma_h) != 0) {
+            fused_aligned_free(py); fused_aligned_free(pu); fused_aligned_free(pv);
             fused_log(&ctx->log_warnings, FUSED_LOG_WARN,
                 "funnelcake: upscale 1.5x tail rejected: out-of-memory\n");
             warn_bits |= FUSED_WARN_BIT_PARTIAL;
@@ -561,7 +563,7 @@ tail_done:
         fused_scaler_free(ctx);
         fused_log(&ctx->log_errors, FUSED_LOG_ERROR,
             "funnelcake: out-of-memory allocating internal state\n");
-        return FUSED_ERR_NO_STEPS;
+        return FUSED_ERR_OUT_OF_MEMORY;
     }
 
     fused_kernel_params_t *p = &state->params;
@@ -643,7 +645,7 @@ tail_done:
              * Each row is 64-byte aligned so both stay SIMD-friendly. */
             size_t row = (size_t)((max_scratch_w + 63) & ~63);
             void *sp = NULL;
-            if (posix_memalign(&sp, 64, row * 2) == 0) {
+            if (fused_aligned_alloc(&sp, 64, row * 2) == 0) {
                 p->upscale_scratch  = (uint8_t *)sp;
                 p->upscale_scratch2 = (uint8_t *)sp + row;
             } else {
@@ -688,13 +690,13 @@ tail_done:
         if (pool_bytes > 0) {
             void *sp = NULL;
             size_t aligned_bytes = (pool_bytes + 63) & ~(size_t)63;
-            if (posix_memalign(&sp, 64, aligned_bytes) == 0) {
+            if (fused_aligned_alloc(&sp, 64, aligned_bytes) == 0) {
                 p->scratch_pool      = (uint8_t *)sp;
                 p->scratch_pool_size = aligned_bytes;
             } else {
                 fused_log(&ctx->log_warnings, FUSED_LOG_WARN,
                     "funnelcake: failed to allocate downscale scratch pool "
-                    "(%zu bytes)\n", aligned_bytes);
+                    "(%llu bytes)\n", (unsigned long long)aligned_bytes);
             }
         }
     }
@@ -745,15 +747,14 @@ void fused_scaler_run(fused_scaler_ctx_t *ctx,
 
     /* Check source plane alignment */
     if (((uintptr_t)src_y & 31) || ((uintptr_t)src_u & 31) || ((uintptr_t)src_v & 31)) {
-        /* Warn once about misaligned source planes */
-        static int warned = 0;
-        if (!warned) {
+        /* Warn once per context about misaligned source planes */
+        if (!state->src_misaligned_warned) {
             fused_log(&ctx->log_errors, FUSED_LOG_ERROR,
                 "funnelcake: source planes are not 32-byte aligned "
                 "(Y=%p U=%p V=%p). Falling back to scalar kernel. "
-                "Performance will be significantly reduced.",
+                "Performance will be significantly reduced.\n",
                 (const void*)src_y, (const void*)src_u, (const void*)src_v);
-            warned = 1;
+            state->src_misaligned_warned = 1;
         }
         /* Fall back to scalar - pick the variant matching the configured
          * (want_down, want_up) combination. */
@@ -786,25 +787,25 @@ void fused_scaler_free(fused_scaler_ctx_t *ctx)
 {
     if (!ctx) return;
     for (int i = 0; i < 8; i++) {
-        free(ctx->outputs[i].plane_y);
-        free(ctx->outputs[i].plane_u);
-        free(ctx->outputs[i].plane_v);
+        fused_aligned_free(ctx->outputs[i].plane_y);
+        fused_aligned_free(ctx->outputs[i].plane_u);
+        fused_aligned_free(ctx->outputs[i].plane_v);
         memset(&ctx->outputs[i], 0, sizeof(fused_scale_output_t));
     }
     for (int i = 0; i < FUSED_MAX_UPSCALE_STEPS; i++) {
-        free(ctx->upscale_outputs[i].plane_y);
-        free(ctx->upscale_outputs[i].plane_u);
-        free(ctx->upscale_outputs[i].plane_v);
+        fused_aligned_free(ctx->upscale_outputs[i].plane_y);
+        fused_aligned_free(ctx->upscale_outputs[i].plane_u);
+        fused_aligned_free(ctx->upscale_outputs[i].plane_v);
         memset(&ctx->upscale_outputs[i], 0, sizeof(fused_scale_output_t));
     }
     if (ctx->_internal) {
         fused_internal_t *state = (fused_internal_t *)ctx->_internal;
-        free(state->params.upscale_scratch);
+        fused_aligned_free(state->params.upscale_scratch);
         state->params.upscale_scratch = NULL;
         /* upscale_scratch2 aliases into the upscale_scratch allocation;
          * it must not be freed separately, only cleared. */
         state->params.upscale_scratch2 = NULL;
-        free(state->params.scratch_pool);
+        fused_aligned_free(state->params.scratch_pool);
         state->params.scratch_pool = NULL;
         state->params.scratch_pool_size = 0;
     }
@@ -814,4 +815,6 @@ void fused_scaler_free(fused_scaler_ctx_t *ctx)
     ctx->rejected_flags         = 0;
     ctx->achieved_upscale_flags = 0;
     ctx->achieved_upscale_tail  = 0;
+    ctx->effective_width        = 0;
+    ctx->effective_height       = 0;
 }

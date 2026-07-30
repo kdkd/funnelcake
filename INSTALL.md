@@ -121,7 +121,63 @@ from any Docker host with `buildx` enabled:
     ./scripts/build-linux-ubuntu20.sh
 
 Artifacts are written to `dist/` as per-architecture tarballs containing
-`libfunnelcake.a`, `include/funnelcake.h`, and basic build metadata. These
-release archives are built with `CC=clang LTO=0` so the static library contains
-standard object files suitable for downstream linkers that do not understand
-Clang LTO bitcode.
+`libfunnelcake.a`, `include/funnelcake.h`, `include/funnelcake_helpers.h`, and
+basic build metadata. These release archives are built with `CC=clang LTO=0`
+so the static library contains standard object files suitable for downstream
+linkers that do not understand Clang LTO bitcode.
+
+## macOS Release Artifacts
+
+To build a native macOS release archive:
+
+    ./scripts/build-macos.sh
+
+The script must be run on macOS with Xcode command line tools installed. It
+writes `dist/funnelcake-macos-<arch>.tar.gz` containing `libfunnelcake.a`,
+`include/funnelcake.h`, the README, install notes, and `BUILD_INFO`.
+
+## Windows Release Artifacts
+
+To build Windows release archives:
+
+    ./scripts/build-windows.sh             # bash / MSYS2 / Git Bash
+    scripts\build-windows.ps1              # native PowerShell 5.1+
+
+By default the script builds every Windows target whose toolchain is available.
+MinGW-w64 artifacts contain `libfunnelcake.a`; MSVC artifacts contain
+`funnelcake.lib`. Both package layouts include `include/funnelcake.h`, the
+README, install notes, and `BUILD_INFO`.
+
+For MinGW-w64 only:
+
+    ./scripts/build-windows.sh --mingw
+    scripts\build-windows.ps1 -Mingw
+
+For `x86_64` MinGW, install tools that provide `x86_64-w64-mingw32-gcc` and
+`x86_64-w64-mingw32-ar`. For Windows on ARM64 MinGW, install tools that provide
+`aarch64-w64-mingw32-gcc` and `aarch64-w64-mingw32-ar`.
+
+For MSVC only, run from a Visual Studio developer shell where `cl.exe` and
+`lib.exe` are in `PATH`:
+
+    ./scripts/build-windows.sh --msvc
+    scripts\build-windows.ps1 -Msvc
+
+Both MinGW and MSVC builds use the normal source selection (AVX2 on `x86_64`,
+NEON on `aarch64`/ARM64). The NEON kernels guard on `__aarch64__ || _M_ARM64`,
+so MSVC ARM64 picks up the same SIMD coverage as the MinGW cross-compile.
+
+### Windows ARM64 only
+
+For a Windows-on-ARM64 build without touching the x86_64 paths, use the
+dedicated PowerShell driver:
+
+    scripts\build-windows-arm64.ps1                # MinGW + MSVC, whichever is available
+    scripts\build-windows-arm64.ps1 -Mingw         # cross-compile via aarch64-w64-mingw32-gcc
+    scripts\build-windows-arm64.ps1 -Msvc          # native ARM64 MSVC
+
+The `-Msvc` path requires an "ARM64 Native Tools Command Prompt for VS" or
+an equivalent Developer PowerShell with `VSCMD_ARG_TGT_ARCH=arm64`; the
+script refuses to run if the shell is not configured for ARM64. Both
+artifact layouts mirror `build-windows.ps1`: a per-toolchain `dist/`
+package plus a `.zip.sha256`.

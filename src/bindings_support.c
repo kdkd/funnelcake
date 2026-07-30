@@ -21,7 +21,7 @@
  * Makefile's CFLAGS).
  */
 
-#ifndef _POSIX_C_SOURCE
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
 #define _POSIX_C_SOURCE 200112L  /* posix_memalign */
 #endif
 
@@ -29,6 +29,9 @@
 #include "funnelcake.h"
 
 #include <stdlib.h>
+#if defined(_WIN32)
+#include <malloc.h>
+#endif
 
 /* Round `n` up to the next multiple of 32 (the SIMD stride/alignment unit). */
 static int round_up_32(int n)
@@ -45,15 +48,26 @@ void *fused_aligned_alloc(size_t alignment, size_t size)
     if (size == 0) {
         size = 1;
     }
+#if defined(_WIN32)
+    p = _aligned_malloc(size, alignment);
+    if (!p) {
+        return NULL;
+    }
+#else
     if (posix_memalign(&p, alignment, size) != 0) {
         return NULL;
     }
+#endif
     return p;
 }
 
 void fused_free(void *p)
 {
+#if defined(_WIN32)
+    _aligned_free(p);
+#else
     free(p);
+#endif
 }
 
 void fused_plane_strides(int width, int *y_stride, int *uv_stride)

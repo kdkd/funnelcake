@@ -260,9 +260,9 @@ struct means write to stderr.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `target` | `int` | One of the `FUSED_LOG_*` constants. |
+| `target` | `int` | One of the `FUSED_LOG_*` target constants. |
 | `file` | `FILE *` | Used when `target == FUSED_LOG_FILE`. Must be a valid open file. |
-| `callback` | `void (*)(int level, const char *msg, void *ctx)` | Used when `target == FUSED_LOG_CALLBACK`. `level` is `FUSED_LOG_ERROR` or `FUSED_LOG_WARN`. |
+| `callback` | `void (*)(int level, const char *msg, void *ctx)` | Used when `target == FUSED_LOG_CALLBACK`. `level` is one of `FUSED_LOG_ERROR`, `FUSED_LOG_WARN`, `FUSED_LOG_INFO`. |
 | `callback_ctx` | `void *` | Passed through opaquely as the `ctx` argument to `callback`. |
 
 Log target constants:
@@ -274,6 +274,15 @@ Log target constants:
 | `FUSED_LOG_FILE` | 2 | Write to `config.file` |
 | `FUSED_LOG_SUPPRESS` | 3 | Discard all messages |
 | `FUSED_LOG_CALLBACK` | 4 | Call `config.callback` |
+
+Log level constants (passed to callbacks; stderr/stdout/file targets emit
+every message regardless of level):
+
+| Constant | Value | Meaning |
+|----------|-------|---------|
+| `FUSED_LOG_ERROR` | 0 | Hard error — init failed, no resources allocated. Routed via `log_errors`. |
+| `FUSED_LOG_WARN`  | 1 | Partial success or fallback — request still produced output. Routed via `log_warnings`. |
+| `FUSED_LOG_INFO`  | 2 | Low-frequency status / diagnostic. Routed via `log_warnings`; filter on `level` in a callback to drop. |
 
 
 ## Scale Step Flags
@@ -554,6 +563,7 @@ are valid, and `fused_scaler_run` must not be called.
 | `FUSED_ERR_NO_STEPS` | -2 | No valid step flags remain after filtering (all were rejected or none were set). |
 | `FUSED_ERR_BAD_DIMENSIONS` | -3 | `src_width` or `src_height` is <= 0, or too small for the requested steps. |
 | `FUSED_ERR_BAD_ALIGNMENT` | -4 | `src_y_stride` or `src_uv_stride` is not 32-byte aligned. |
+| `FUSED_ERR_OUT_OF_MEMORY` | -5 | Allocation of internal state failed; output buffers (if any were allocated earlier in init) have already been released. |
 
 
 ## Alignment Requirements
@@ -817,9 +827,12 @@ scaler.log_warnings.callback     = my_log;
 scaler.log_warnings.callback_ctx = my_logger_instance;
 ```
 
-The `level` argument to the callback is `FUSED_LOG_ERROR` (0) or
-`FUSED_LOG_WARN` (1). The `msg` string is a complete formatted message;
-do not call `fused_scaler_*` functions from within the callback.
+The `level` argument to the callback is `FUSED_LOG_ERROR` (0),
+`FUSED_LOG_WARN` (1), or `FUSED_LOG_INFO` (2). Info-level messages
+(e.g. "tone map LUTs generated") share the `log_warnings` config — to
+keep warnings but drop info, install a callback and filter on `level`.
+The `msg` string is a complete formatted message; do not call
+`fused_scaler_*` functions from within the callback.
 
 
 ## HDR10 API Reference

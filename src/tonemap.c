@@ -18,9 +18,11 @@
 #if defined(__x86_64__)
 #include <immintrin.h>
 #endif
-#if defined(__aarch64__)
+#if defined(__aarch64__) || defined(_M_ARM64)
 #include <arm_neon.h>
 #endif
+
+/* FUSED_HOT and FUSED_PREFETCH are provided by internal.h. */
 
 
 /* --------------------------------------------------------------------------
@@ -386,7 +388,10 @@ void fused_tonemap_generate_luts(fused_hdr_internal_t *hdr,
         hdr->chroma_out_max = dst_full ? 255 : 240;
     }
 
-    fused_log(log_warn, FUSED_LOG_WARN,
+    /* One-time-per-init diagnostic: emitted at INFO level so callback-based
+     * loggers can filter it out without losing real warnings. Stderr/file
+     * targets will see it on every init. */
+    fused_log(log_warn, FUSED_LOG_INFO,
         "funnelcake: tone map LUTs generated - transfer=%s curve=%d "
         "peak=%d target=%d range=%s/%s\n",
         (src_transfer == FUSED_TRC_HLG) ? "HLG" : "PQ",
@@ -475,7 +480,7 @@ static void tonemap_luma_avx2(const uint8_t *lut_y,
 #endif /* __x86_64__ */
 
 
-#if defined(__aarch64__)
+#if defined(__aarch64__) || defined(_M_ARM64)
 
 /*
  * tonemap_luma_neon - exact LUT tone mapping, 16 pixels per iteration.
@@ -497,7 +502,7 @@ static void tonemap_luma_neon(const uint8_t *lut_y,
         int x = 0;
 
         if (y + 1 < height)
-            __builtin_prefetch(sy + src_y_pitch, 0, 2);
+            FUSED_PREFETCH(sy + src_y_pitch);
 
         for (; x < simd_w; x += 16) {
             uint16x8_t v0 = vandq_u16(vld1q_u16(sy + x),     mask10);
@@ -542,7 +547,7 @@ static void tonemap_luma_neon(const uint8_t *lut_y,
  * -------------------------------------------------------------------------- */
 
 
-__attribute__((hot))
+FUSED_HOT
 void fused_tonemap_apply(
     const fused_hdr_internal_t *state,
     const uint16_t *src_y,  int src_y_stride,
@@ -573,7 +578,7 @@ void fused_tonemap_apply(
             tonemap_luma_avx2(lut_y, src_y, src_y_stride, dst_y, dst_y_stride,
                               width, height);
         } else
-#elif defined(__aarch64__)
+#elif defined(__aarch64__) || defined(_M_ARM64)
         if (fused_detect_cpu()->has_neon) {
             tonemap_luma_neon(lut_y, src_y, src_y_stride, dst_y, dst_y_stride,
                               width, height);
@@ -627,7 +632,7 @@ void fused_tonemap_apply(
                                  width, height);
         return;
     }
-#elif defined(__aarch64__)
+#elif defined(__aarch64__) || defined(_M_ARM64)
     if (fused_detect_cpu()->has_neon) {
         fused_tonemap_apply_neon(state, src_y, src_y_stride,
                                  src_u, src_uv_stride, src_v,
@@ -665,7 +670,7 @@ void fused_tonemap_apply(
  * tests compare against this function.
  * -------------------------------------------------------------------------- */
 
-__attribute__((hot))
+FUSED_HOT
 void fused_tonemap_apply_scalar(
     const fused_hdr_internal_t *state,
     const uint16_t *src_y,  int src_y_stride,
@@ -708,7 +713,7 @@ void fused_tonemap_apply_scalar(
  * fused_tonemap_apply_p010 - interleaved P010 chroma
  * -------------------------------------------------------------------------- */
 
-__attribute__((hot))
+FUSED_HOT
 void fused_tonemap_apply_p010(
     const fused_hdr_internal_t *state,
     const uint16_t *src_y,  int src_y_stride,
@@ -733,7 +738,7 @@ void fused_tonemap_apply_p010(
             tonemap_luma_avx2(lut_y, src_y, src_y_stride, dst_y, dst_y_stride,
                               width, height);
         } else
-#elif defined(__aarch64__)
+#elif defined(__aarch64__) || defined(_M_ARM64)
         if (fused_detect_cpu()->has_neon) {
             tonemap_luma_neon(lut_y, src_y, src_y_stride, dst_y, dst_y_stride,
                               width, height);
@@ -781,7 +786,7 @@ void fused_tonemap_apply_p010(
                                       width, height);
         return;
     }
-#elif defined(__aarch64__)
+#elif defined(__aarch64__) || defined(_M_ARM64)
     if (fused_detect_cpu()->has_neon) {
         fused_tonemap_apply_p010_neon(state, src_y, src_y_stride,
                                       src_uv, src_uv_stride,
@@ -813,7 +818,7 @@ void fused_tonemap_apply_p010(
  * fused_tonemap_apply_p010_scalar - built-in-curve reference path (P010)
  * -------------------------------------------------------------------------- */
 
-__attribute__((hot))
+FUSED_HOT
 void fused_tonemap_apply_p010_scalar(
     const fused_hdr_internal_t *state,
     const uint16_t *src_y,  int src_y_stride,

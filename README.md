@@ -69,7 +69,7 @@ downscale workloads libswscale also supports a "cascade" mode where each
 output feeds the next, which is roughly 1.5–2× faster than independent
 mode on multi-level ladders; even against cascaded libswscale, funnelcake
 remains 3–10× faster on every tested AVX2/NEON CPU and 13–16× faster on
-the AVX-512 path. 
+the AVX-512 path.
 
 Each workload label spells out the exact scales being produced. For
 example:
@@ -680,7 +680,8 @@ benchmark comparison; without it the library and headers install but
 
 The scalar fallback is correct on all platforms but significantly slower.
 On hardware without AVX2, NEON, or RVV, the library logs a one-time notice
-to stderr at first init.
+through the configured `log_warnings` channel at first init (default:
+stderr).
 
 Call `fused_simd_available()` to query this at runtime: it returns `1` when
 the SIMD kernels will be used and `0` when the scalars will. It uses the same

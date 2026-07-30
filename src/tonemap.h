@@ -282,7 +282,7 @@ void fused_tonemap_apply_p010_avx2(
 
 #endif /* __x86_64__ */
 
-#if defined(__aarch64__)
+#if defined(__aarch64__) || defined(_M_ARM64)
 
 /* NEON kernels in tonemap_neon.c (NEON is baseline on aarch64; selected
  * at runtime behind has_neon). */
@@ -306,7 +306,7 @@ void fused_tonemap_apply_p010_neon(
     uint8_t *dst_v,
     int width, int height);
 
-#endif /* __aarch64__ */
+#endif /* __aarch64__ || _M_ARM64 */
 
 #if defined(__riscv) && (__riscv_xlen == 64)
 

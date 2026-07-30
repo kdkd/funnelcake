@@ -182,13 +182,14 @@ static void detect_x86(void)
 #endif /* __x86_64__ */
 
 
-#if defined(__aarch64__)
+#if defined(__aarch64__) || defined(_M_ARM64)
 
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(_WIN32)
 
 /*
- * On aarch64 macOS (Apple Silicon), NEON is architecturally mandatory and
- * always available. No runtime detection needed.
+ * On aarch64 Apple Silicon and Windows on ARM, NEON (Advanced SIMD) is
+ * architecturally mandatory and always available. No runtime detection
+ * needed - just assert it.
  */
 static void detect_aarch64(void)
 {
@@ -215,7 +216,7 @@ static void detect_aarch64(void)
     }
 }
 
-#else /* aarch64 Linux (and other non-Apple aarch64) */
+#else /* aarch64 Linux (and other non-Apple, non-Windows aarch64) */
 
 #include <stdio.h>
 
@@ -246,9 +247,9 @@ static void detect_aarch64(void)
     fclose(f);
 }
 
-#endif /* __APPLE__ */
+#endif /* __APPLE__ || _WIN32 */
 
-#endif /* __aarch64__ */
+#endif /* __aarch64__ || _M_ARM64 */
 
 
 #if defined(__riscv) && (__riscv_xlen == 64)
@@ -398,7 +399,7 @@ const fused_cpu_caps_t *fused_detect_cpu(void)
         if (force_scalar == NULL || force_scalar[0] == '\0') {
 #if defined(__x86_64__)
             detect_x86();
-#elif defined(__aarch64__)
+#elif defined(__aarch64__) || defined(_M_ARM64)
             detect_aarch64();
 #elif defined(__riscv) && (__riscv_xlen == 64)
             detect_riscv();
@@ -427,7 +428,7 @@ int fused_simd_available(void)
     const fused_cpu_caps_t *caps = fused_detect_cpu();
 #if defined(__x86_64__)
     return caps->has_avx2 ? 1 : 0;
-#elif defined(__aarch64__)
+#elif defined(__aarch64__) || defined(_M_ARM64)
     return caps->has_neon ? 1 : 0;
 #elif defined(__riscv) && (__riscv_xlen == 64)
     return caps->has_rvv ? 1 : 0;

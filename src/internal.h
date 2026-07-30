@@ -13,8 +13,53 @@
 
 #include <stddef.h>
 #include <stdlib.h>     /* posix_memalign */
+#if defined(_WIN32)
+#include <malloc.h>
+#endif
 #if defined(__linux__)
 #  include <sys/mman.h> /* madvise, MADV_HUGEPAGE */
+#endif
+
+static inline int fused_aligned_alloc(void **ptr, size_t alignment, size_t size)
+{
+#if defined(_WIN32)
+    void *p = _aligned_malloc(size ? size : alignment, alignment);
+    if (!p) return -1;
+    *ptr = p;
+    return 0;
+#else
+    return posix_memalign(ptr, alignment, size);
+#endif
+}
+
+static inline void fused_aligned_free(void *ptr)
+{
+#if defined(_WIN32)
+    _aligned_free(ptr);
+#else
+    free(ptr);
+#endif
+}
+
+/* --------------------------------------------------------------------------
+ * Portability macros
+ *
+ * GCC/Clang ship a few extensions the NEON kernels rely on; MSVC (used for
+ * the Windows ARM64 build) needs equivalents.
+ * -------------------------------------------------------------------------- */
+#if defined(__GNUC__) || defined(__clang__)
+#  define FUSED_HOT           __attribute__((hot))
+#  define FUSED_ALWAYS_INLINE __attribute__((always_inline))
+#  define FUSED_PREFETCH(p)   __builtin_prefetch(p)
+#else
+#  define FUSED_HOT
+#  define FUSED_ALWAYS_INLINE
+#  if defined(_M_ARM64) || defined(_M_ARM64EC)
+#    include <intrin.h>
+#    define FUSED_PREFETCH(p) __prefetch((const void *)(p))
+#  else
+#    define FUSED_PREFETCH(p) ((void)0)
+#  endif
 #endif
 
 /* --------------------------------------------------------------------------
@@ -32,13 +77,13 @@
  * waste memory if rounded up to a 2 MB huge page. */
 #define FUSED_THP_HINT_THRESHOLD ((size_t)(2 * 1024 * 1024))
 
-/* posix_memalign + size-gated MADV_HUGEPAGE hint.  The madvise call is
- * a hint: kernels with transparent_hugepage=never silently ignore it,
- * and on non-Linux platforms the call is compiled out entirely.  The
- * underlying allocation is a normal heap pointer that free()s normally. */
+/* Portable aligned allocation + size-gated MADV_HUGEPAGE hint.  The madvise
+ * call is a hint: kernels with transparent_hugepage=never silently ignore it,
+ * and on non-Linux platforms the call is compiled out entirely.  Release the
+ * resulting pointer with fused_aligned_free(). */
 static inline int fused_alloc_aligned(void **out, size_t alignment, size_t size)
 {
-    int rc = posix_memalign(out, alignment, size);
+    int rc = fused_aligned_alloc(out, alignment, size);
     if (rc != 0) return rc;
 #if defined(__linux__) && defined(MADV_HUGEPAGE)
     if (size >= FUSED_THP_HINT_THRESHOLD) {
@@ -201,6 +246,7 @@ typedef struct {
     fused_kernel_params_t params;
     fused_kernel_fn       kernel_fn;
     int                   has_simd;  /* 1 if a SIMD kernel was selected, 0 = scalar only */
+    int                   src_misaligned_warned; /* per-context one-shot flag for run() */
 } fused_internal_t;
 
 
@@ -255,7 +301,7 @@ void fused_kernel_pow2_avx512(const fused_kernel_params_t *p,
                               const uint8_t *src_v);
 #endif /* __x86_64__ */
 
-#if defined(__aarch64__)
+#if defined(__aarch64__) || defined(_M_ARM64)
 /* NEON (aarch64 only) */
 void fused_kernel_thirds_neon(const fused_kernel_params_t *p,
                                const uint8_t *src_y,
@@ -340,7 +386,7 @@ void fused_kernel_pow2_up_avx512(const fused_kernel_params_t *p,
                                  const uint8_t *src_v);
 #endif /* __x86_64__ */
 
-#if defined(__aarch64__)
+#if defined(__aarch64__) || defined(_M_ARM64)
 void fused_kernel_upscale_neon(const fused_kernel_params_t *p,
                                const uint8_t *src_y,
                                const uint8_t *src_u,
@@ -587,6 +633,7 @@ typedef struct {
     uint32_t upscale_sdr_levels;
 
     int      is_custom_lut;  /* 1 if using FUSED_TONEMAP_CUSTOM (skip RGB chroma path) */
+    int      src_misaligned_warned; /* per-context one-shot flag for run() */
 } fused_hdr_internal_t;
 
 
@@ -628,7 +675,7 @@ void fused_kernel_pow2_hdr_avx512(const fused_hdr_kernel_params_t *p,
                                   const uint16_t *src_v);
 #endif /* __x86_64__ */
 
-#if defined(__aarch64__)
+#if defined(__aarch64__) || defined(_M_ARM64)
 /* NEON (aarch64 only) */
 void fused_kernel_thirds_hdr_neon(const fused_hdr_kernel_params_t *p,
                                    const uint16_t *src_y,
@@ -715,7 +762,7 @@ void fused_kernel_pow2_up_hdr_avx512(const fused_hdr_kernel_params_t *p,
                                      const uint16_t *src_v);
 #endif /* __x86_64__ */
 
-#if defined(__aarch64__)
+#if defined(__aarch64__) || defined(_M_ARM64)
 void fused_kernel_upscale_hdr_neon(const fused_hdr_kernel_params_t *p,
                                    const uint16_t *src_y,
                                    const uint16_t *src_u,

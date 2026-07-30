@@ -38,7 +38,7 @@
  * runtime behind caps->has_neon.
  */
 
-#if defined(__aarch64__)
+#if defined(__aarch64__) || defined(_M_ARM64)
 
 #include "internal.h"
 #include "tonemap.h"
@@ -55,7 +55,7 @@
  * x << 5 never goes below -16384, so it cannot fire.)
  * ----------------------------------------------------------------------- */
 
-static inline __attribute__((always_inline)) int16x8_t
+static inline FUSED_ALWAYS_INLINE int16x8_t
 tm_delta8_neon(uint16x8_t codes, int16x8_t coef)
 {
     int16x8_t x = vshlq_n_s16(
@@ -65,7 +65,7 @@ tm_delta8_neon(uint16x8_t codes, int16x8_t coef)
 
 /* dG = g_cr(Cr) + g_cb(Cb): each term rounds exactly like its scalar
  * table entry, and the sum (magnitude < 1024) stays in 16-bit. */
-static inline __attribute__((always_inline)) int16x8_t
+static inline FUSED_ALWAYS_INLINE int16x8_t
 tm_delta8_g_neon(uint16x8_t cb, uint16x8_t cr, int16x8_t gcb, int16x8_t gcr)
 {
     int16x8_t c512 = vdupq_n_s16(512);
@@ -81,7 +81,7 @@ tm_delta8_g_neon(uint16x8_t cb, uint16x8_t cr, int16x8_t gcb, int16x8_t gcr)
  * Deltas arrive already expanded to luma rate (d0 = px 0..7, d1 = 8..15).
  * ----------------------------------------------------------------------- */
 
-static inline __attribute__((always_inline)) void
+static inline FUSED_ALWAYS_INLINE void
 tm_indices_neon(uint16x8_t y0, uint16x8_t y1, int16x8_t d0, int16x8_t d1,
                 uint16x8_t *i0_out, uint16x8_t *i1_out)
 {
@@ -96,7 +96,7 @@ tm_indices_neon(uint16x8_t y0, uint16x8_t y1, int16x8_t d0, int16x8_t d1,
 /* 16 lookups from a pair of index vectors into a byte buffer.  Lane
  * extraction goes through GPRs (umov) rather than a stack round-trip;
  * the 16 table loads are independent and pipeline behind each other. */
-static inline __attribute__((always_inline)) void
+static inline FUSED_ALWAYS_INLINE void
 tm_lookup16_neon(const uint8_t *lut, uint16x8_t i0, uint16x8_t i1,
                  uint8_t *out)
 {
@@ -124,7 +124,7 @@ tm_lookup16_neon(const uint8_t *lut, uint16x8_t i0, uint16x8_t i1,
  * Inputs are the even-position r/g/b/y values widened to 16-bit.
  * ----------------------------------------------------------------------- */
 
-static inline __attribute__((always_inline)) void
+static inline FUSED_ALWAYS_INLINE void
 tm_chroma_dots_neon(uint16x8_t r, uint16x8_t g, uint16x8_t b, uint16x8_t y,
                     int16x8_t cbs, int16x8_t crs,
                     int16x8_t cmin, int16x8_t cmax,
@@ -192,7 +192,7 @@ tm_chroma_dots_neon(uint16x8_t r, uint16x8_t g, uint16x8_t b, uint16x8_t y,
  * ragged edges are handled by the caller with fused_tm_block).
  * ----------------------------------------------------------------------- */
 
-static inline __attribute__((always_inline)) void
+static inline FUSED_ALWAYS_INLINE void
 tm_chunk_neon(const fused_hdr_internal_t *state,
               const uint16_t *su, const uint16_t *sv,
               const uint16_t *suv, int p010,
@@ -304,7 +304,7 @@ tm_chunk_neon(const fused_hdr_internal_t *state,
  * Frame driver.  p010 is a compile-time literal at both call sites.
  * ----------------------------------------------------------------------- */
 
-static inline __attribute__((always_inline)) void
+static inline FUSED_ALWAYS_INLINE void
 tm_frame_neon(const fused_hdr_internal_t *state,
               const uint16_t *src_y, int src_y_stride,
               const uint16_t *src_u, const uint16_t *src_v,
@@ -358,7 +358,7 @@ tm_frame_neon(const fused_hdr_internal_t *state,
     }
 }
 
-__attribute__((hot))
+FUSED_HOT
 void fused_tonemap_apply_neon(
     const fused_hdr_internal_t *state,
     const uint16_t *src_y,  int src_y_stride,
@@ -375,7 +375,7 @@ void fused_tonemap_apply_neon(
                   width, height);
 }
 
-__attribute__((hot))
+FUSED_HOT
 void fused_tonemap_apply_p010_neon(
     const fused_hdr_internal_t *state,
     const uint16_t *src_y,  int src_y_stride,
@@ -391,4 +391,4 @@ void fused_tonemap_apply_p010_neon(
                   width, height);
 }
 
-#endif /* __aarch64__ */
+#endif /* __aarch64__ || _M_ARM64 */

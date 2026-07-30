@@ -45,7 +45,7 @@
  *
  */
 
-#if defined(__aarch64__)
+#if defined(__aarch64__) || defined(_M_ARM64)
 
 #include "internal.h"
 #include "upscale_chunk.h"
@@ -91,13 +91,13 @@ static void up_h_2x_row_neon(const uint8_t *src, int src_w, uint8_t *dst)
     }
 }
 
-static inline __attribute__((always_inline)) uint8x16_t
+static inline FUSED_ALWAYS_INLINE uint8x16_t
 up_h_2x_mid_neon(uint8x16_t r, uint8x16_t next)
 {
     return vrhaddq_u8(r, vextq_u8(r, next, 1));
 }
 
-static inline __attribute__((always_inline)) void
+static inline FUSED_ALWAYS_INLINE void
 up_h_2x_store_neon(uint8x16_t r, uint8x16_t mid, uint8_t *dst)
 {
     uint8x16x2_t zipped = { { vzip1q_u8(r, mid), vzip2q_u8(r, mid) } };
@@ -539,13 +539,13 @@ static void up_h_2x_row_neon_u16(const uint16_t *src, int src_w, uint16_t *dst)
     }
 }
 
-static inline __attribute__((always_inline)) uint16x8_t
+static inline FUSED_ALWAYS_INLINE uint16x8_t
 up_h_2x_mid_neon_u16(uint16x8_t r, uint16x8_t next)
 {
     return vrhaddq_u16(r, vextq_u16(r, next, 1));
 }
 
-static inline __attribute__((always_inline)) void
+static inline FUSED_ALWAYS_INLINE void
 up_h_2x_store_neon_u16(uint16x8_t r, uint16x8_t mid, uint16_t *dst)
 {
     vst1q_u16(dst, vzip1q_u16(r, mid));
@@ -614,7 +614,7 @@ static void up_2x_plane_neon_u16(const uint16_t *src, int src_w, int src_h,
     }
 }
 
-static inline __attribute__((always_inline)) uint16x8x3_t
+static inline FUSED_ALWAYS_INLINE uint16x8x3_t
 up_h_1_5x_make_neon_u16(uint16x8_t even, uint16x8_t odd,
                         uint16_t next_even)
 {

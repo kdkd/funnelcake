@@ -140,14 +140,22 @@ extern "C" {
 #define FUSED_ERR_NO_STEPS       (-2)  /* no valid step flags set after filtering   */
 #define FUSED_ERR_BAD_DIMENSIONS (-3)  /* src_width/height <= 0 or too small        */
 #define FUSED_ERR_BAD_ALIGNMENT  (-4)  /* strides not 32-byte aligned               */
+#define FUSED_ERR_OUT_OF_MEMORY  (-5)  /* allocation of internal state failed       */
 
 
 /* --------------------------------------------------------------------------
  * Log levels
+ *
+ * Levels are passed to FUSED_LOG_CALLBACK callbacks (which can filter on
+ * them); stderr/stdout/file targets emit every message regardless of level.
+ * Routing of info-level diagnostics shares the warnings logger config, so
+ * callers that want to drop info but keep warnings should install a callback
+ * and filter by level.
  * -------------------------------------------------------------------------- */
 
 #define FUSED_LOG_ERROR     0
 #define FUSED_LOG_WARN      1
+#define FUSED_LOG_INFO      2   /* low-frequency diagnostic / status messages */
 
 
 /* --------------------------------------------------------------------------

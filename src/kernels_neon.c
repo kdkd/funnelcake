@@ -136,10 +136,11 @@ static void h_filter_1_5x(const uint8_t *restrict src, int src_w,
         uint8x16_t out1 = vcombine_u8(vrshrn_n_u16(t1_lo, 8),
                                        vrshrn_n_u16(t1_hi, 8));
 
-        /* Interleave: [out0[0], out1[0], out0[1], out1[1], ...] */
-        uint8x16x2_t interleaved = vzipq_u8(out0, out1);
-        vst1q_u8(dst + c * 32,      interleaved.val[0]);
-        vst1q_u8(dst + c * 32 + 16, interleaved.val[1]);
+        /* Interleave: [out0[0], out1[0], out0[1], out1[1], ...].
+         * vst2q_u8 stores 32 bytes with hardware on-the-fly interleave,
+         * replacing vzipq_u8 + two vst1q_u8 (saves a shuffle-port pair). */
+        uint8x16x2_t interleaved = { { out0, out1 } };
+        vst2q_u8(dst + c * 32, interleaved);
     }
 
     /* Scalar tail */
@@ -669,10 +670,10 @@ static inline void h_chunk_1_5x(uint8x16_t A, uint8x16_t B, uint8x16_t C,
     uint8x16_t out1 = vcombine_u8(vrshrn_n_u16(t1_lo, 8),
                                    vrshrn_n_u16(t1_hi, 8));
 
-    /* Interleave: [out0[0], out1[0], out0[1], out1[1], ...] */
-    uint8x16x2_t interleaved = vzipq_u8(out0, out1);
-    vst1q_u8(dst,      interleaved.val[0]);
-    vst1q_u8(dst + 16, interleaved.val[1]);
+    /* Interleave: [out0[0], out1[0], out0[1], out1[1], ...]
+     * vst2q_u8 interleaves in hardware. */
+    uint8x16x2_t interleaved = { { out0, out1 } };
+    vst2q_u8(dst, interleaved);
 }
 
 /* Horizontal 3x on one deinterleaved chunk (A, B, C each 16 bytes).
@@ -1082,8 +1083,12 @@ static void __attribute__((hot)) scale_plane_thirds_neon(
                         v6x_prev[x] = avg_u8(v6x_prev[x], v6x_cur[x]);
 
                     int tail_w3 = w_3x - full_chunks * 16;
+                    /* Both hold under 16 and under 8 live bytes respectively,
+                     * but h_filter_halve reads its source a whole 16-byte
+                     * vector at a time, so each is sized to that granularity.
+                     * The extra bytes are never read back. */
                     uint8_t h3_tail[16];
-                    uint8_t h6_tail[8];
+                    uint8_t h6_tail[16];
                     h_filter_3x(v6x_prev + tail_start, tail_cols,
                                 h3_tail, tail_w3);
                     h_filter_halve(h3_tail, h6_tail, tail_w3 / 2);

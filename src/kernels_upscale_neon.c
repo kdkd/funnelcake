@@ -14,7 +14,7 @@
  *   fused_kernel_pow2_up_neon       - combined pow2 downscale + upscale
  *
  * The upscale primitives are vectorized with NEON intrinsics:
- *   - Horizontal 2x: vrhaddq_u8 + vextq_u8 + vzip1q_u8/vzip2q_u8.
+ *   - Horizontal 2x: vrhaddq_u8 + vextq_u8 -> vst2q_u8 interleaved store.
  *     16 source bytes -> 32 destination bytes per iteration.
  *   - Vertical 2x: vrhaddq_u8 to compute the midpoint row.
  *   - Horizontal 1.5x (2->3): vld2q_u8 even/odd deinterleave -> vmull_u8
@@ -23,8 +23,8 @@
  *   - Vertical 1.5x blend row: vmull_u8 + vmlal_u8 with 85/171 weights.
  *
  * HDR (10-bit) path uses the same structural approach with uint16_t data:
- *   - Horizontal/vertical 2x: vrhaddq_u16 + vzip1q_u16/vzip2q_u16 +
- *     vld1q_u16/vst1q_u16, 8 u16 per iteration.
+ *   - Horizontal/vertical 2x: vrhaddq_u16 + vld1q_u16 -> vst2q_u16
+ *     interleaved store, 8 u16 per iteration.
  *   - 85/171 blends: vmull_u16 / vmlal_u16 + vshrn_n_u32 for u16×u16->u32
  *     intermediates (required because 85*max_u16 overflows 16 bits).
  *   - Horizontal 1.5x: vld2q_u16 deinterleave -> vmull/vmlal -> vst3q_u16
@@ -76,9 +76,8 @@ static void up_h_2x_row_neon(const uint8_t *src, int src_w, uint8_t *dst)
         uint8_t edge = (x + 16 < src_w) ? src[x + 16] : src[src_w - 1];
         uint8x16_t r_next = vextq_u8(r, vdupq_n_u8(edge), 1);
         uint8x16_t r_mid  = vrhaddq_u8(r, r_next);
-        uint8x16x2_t zipped = { { vzip1q_u8(r, r_mid), vzip2q_u8(r, r_mid) } };
-        vst1q_u8(dst + 2 * x +  0, zipped.val[0]);
-        vst1q_u8(dst + 2 * x + 16, zipped.val[1]);
+        uint8x16x2_t interleaved = { { r, r_mid } };
+        vst2q_u8(dst + 2 * x, interleaved);
         x += 16;
     }
 
@@ -100,9 +99,8 @@ up_h_2x_mid_neon(uint8x16_t r, uint8x16_t next)
 static inline __attribute__((always_inline)) void
 up_h_2x_store_neon(uint8x16_t r, uint8x16_t mid, uint8_t *dst)
 {
-    uint8x16x2_t zipped = { { vzip1q_u8(r, mid), vzip2q_u8(r, mid) } };
-    vst1q_u8(dst, zipped.val[0]);
-    vst1q_u8(dst + 16, zipped.val[1]);
+    uint8x16x2_t interleaved = { { r, mid } };
+    vst2q_u8(dst, interleaved);
 }
 
 
@@ -481,8 +479,8 @@ void fused_kernel_pow2_up_neon(const fused_kernel_params_t *p,
  * Same structure as the SDR path above but operating on uint16_t planes.
  * The key difference is that 85 * max_u16 overflows 16 bits, so the
  * 85/171 blend must use u32 intermediates via vmull_u16 + vmlal_u16.
- * The 2x primitives still use u16-native avg (vrhaddq_u16) and
- * interleave (vzip1q_u16 / vzip2q_u16).
+ * The 2x primitives still use u16-native avg (vrhaddq_u16) and the
+ * interleaved store (vst2q_u16).
  *
  * Element strides: the HDR kernel params store byte strides.  Inside
  * these helpers we convert to element strides (divide by 2) for clean
@@ -522,11 +520,10 @@ static void up_h_2x_row_neon_u16(const uint16_t *src, int src_w, uint16_t *dst)
         uint16_t edge = (x + 8 < src_w) ? src[x + 8] : src[src_w - 1];
         uint16x8_t r_next = vextq_u16(r, vdupq_n_u16(edge), 1);
         uint16x8_t r_mid  = vrhaddq_u16(r, r_next);
-        /* Interleave src and mid: (r[0], r_mid[0], r[1], r_mid[1], ...). */
-        uint16x8_t out_lo = vzip1q_u16(r, r_mid);
-        uint16x8_t out_hi = vzip2q_u16(r, r_mid);
-        vst1q_u16(dst + 2 * x +  0, out_lo);
-        vst1q_u16(dst + 2 * x +  8, out_hi);
+        /* Interleave src and mid: (r[0], r_mid[0], r[1], r_mid[1], ...).
+         * vst2q_u16 interleaves in the store unit. */
+        uint16x8x2_t interleaved = { { r, r_mid } };
+        vst2q_u16(dst + 2 * x, interleaved);
         x += 8;
     }
 
@@ -548,8 +545,10 @@ up_h_2x_mid_neon_u16(uint16x8_t r, uint16x8_t next)
 static inline __attribute__((always_inline)) void
 up_h_2x_store_neon_u16(uint16x8_t r, uint16x8_t mid, uint16_t *dst)
 {
-    vst1q_u16(dst, vzip1q_u16(r, mid));
-    vst1q_u16(dst + 8, vzip2q_u16(r, mid));
+    /* Interleave: [r[0], mid[0], r[1], mid[1], ...]
+     * vst2q_u16 interleaves in the store unit. */
+    uint16x8x2_t interleaved = { { r, mid } };
+    vst2q_u16(dst, interleaved);
 }
 
 /* Four 8-lane chunks stay in registers so each output row is written as one

@@ -139,10 +139,10 @@ static void h_filter_1_5x_hdr(const uint16_t *restrict src, int src_w,
         uint16x8_t out1 = vcombine_u16(vshrn_n_u32(t1_lo, 8),
                                         vshrn_n_u32(t1_hi, 8));
 
-        /* Interleave: [out0[0], out1[0], out0[1], out1[1], ...] */
-        uint16x8x2_t interleaved = vzipq_u16(out0, out1);
-        vst1q_u16(dst + c * 16,     interleaved.val[0]);
-        vst1q_u16(dst + c * 16 + 8, interleaved.val[1]);
+        /* Interleave: [out0[0], out1[0], out0[1], out1[1], ...]
+         * vst2q_u16 interleaves in the store unit. */
+        uint16x8x2_t interleaved = { { out0, out1 } };
+        vst2q_u16(dst + c * 16, interleaved);
     }
 
     /* Scalar tail */
@@ -735,10 +735,10 @@ static inline void h_chunk_1_5x_hdr(uint16x8_t A, uint16x8_t B, uint16x8_t C,
     uint16x8_t out0 = neon_blend_reg_hdr(A, B);
     uint16x8_t out1 = neon_blend_reg_hdr(C, B);
 
-    /* Interleave: [out0[0], out1[0], out0[1], out1[1], ...] */
-    uint16x8x2_t interleaved = vzipq_u16(out0, out1);
-    vst1q_u16(dst,     interleaved.val[0]);
-    vst1q_u16(dst + 8, interleaved.val[1]);
+    /* Interleave: [out0[0], out1[0], out0[1], out1[1], ...]
+     * vst2q_u16 interleaves in the store unit. */
+    uint16x8x2_t interleaved = { { out0, out1 } };
+    vst2q_u16(dst, interleaved);
 }
 
 /* Horizontal 3x on one deinterleaved 10-bit chunk (A, B, C each 8 elements).

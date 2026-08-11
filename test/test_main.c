@@ -228,6 +228,52 @@ void print_bench_comparison_table(void)
 }
 
 /* --------------------------------------------------------------------------
+ * Usage
+ * -------------------------------------------------------------------------- */
+
+static void print_usage(FILE *out, const char *argv0)
+{
+    fprintf(out,
+"Usage: %s [option]...\n"
+"\n"
+"With no options, runs the full test suite: validation, correctness, HDR,\n"
+"tone mapping, and scalar-vs-SIMD parity. It exits with status 1 if any\n"
+"test fails, or 0 if they all pass.\n"
+"\n"
+"Test options:\n"
+"  --visual                 Write PNG/MOV renderings of each scale step to\n"
+"                           output/. Needs ffmpeg on PATH and an existing\n"
+"                           output/ directory. Use make visual, which\n"
+"                           creates it for you.\n"
+"\n"
+"Benchmark options (each accepts an optional workload filter):\n"
+"  --bench [filter]         SDR, libswscale comparison, and HDR benchmarks\n"
+"  --bench-sdr [filter]     SDR benchmarks, plus the libswscale comparison\n"
+"  --bench-hdr [filter]     HDR benchmarks (10-bit scaling and tone mapping)\n"
+"  --bench-swscale [filter] libswscale comparison only\n"
+"  --skip-bench-swscale     Skip the libswscale comparison. Useful when the\n"
+"                           build lacks libswscale or for a shorter A/B run.\n"
+"\n"
+"  -h, --help               This message\n"
+"\n"
+"The filter is a plain substring match against the workload label. For\n"
+"example, --bench-sdr 1920x1080 runs every 1080p SDR row, while\n"
+"--bench-sdr down:2x runs the 2x downscale rows at every resolution. With\n"
+"no filter, a benchmark option runs every workload in its group.\n"
+"\n"
+"Environment:\n"
+"  FUNNELCAKE_FORCE_SCALAR    Skip SIMD detection and use the scalar kernels.\n"
+"  FUNNELCAKE_NO_AVX512       On AVX-512 hardware, fall back to AVX2 for a\n"
+"                             same-build comparison of the two kernel sets.\n"
+"  FUNNELCAKE_SWSCALE_VERIFY  In the libswscale comparison, print each step's\n"
+"                             row count and Y-plane checksum.\n"
+"\n"
+"Common make targets: test, bench, bench-sdr, bench-hdr, bench-swscale,\n"
+"and visual.\n",
+    argv0);
+}
+
+/* --------------------------------------------------------------------------
  * main
  * -------------------------------------------------------------------------- */
 
@@ -238,9 +284,12 @@ int main(int argc, char *argv[])
 
     /* Parse command-line arguments */
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--bench") == 0) {
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            print_usage(stdout, argv[0]);
+            return 0;
+        } else if (strcmp(argv[i], "--bench") == 0) {
             opts.run_bench = 1;
-            /* Optional filter argument: next arg that doesn't start with '--' */
+            /* Optional filter argument: next arg that does not start with a dash */
             if (i + 1 < argc && argv[i + 1][0] != '-') {
                 opts.bench_filter = argv[i + 1];
                 i++;
@@ -267,6 +316,11 @@ int main(int argc, char *argv[])
             opts.skip_bench_swscale = 1;
         } else if (strcmp(argv[i], "--visual") == 0) {
             opts.run_visual = 1;
+        } else {
+            /* Reject typos instead of silently running the full test suite. */
+            fprintf(stderr, "%s: unrecognized option '%s'\n\n", argv[0], argv[i]);
+            print_usage(stderr, argv[0]);
+            return 2;
         }
     }
 

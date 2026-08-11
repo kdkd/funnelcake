@@ -60,16 +60,16 @@ constraints.
 ## Benchmarks
 
 All measurements are single-threaded latency over ~1000 iterations per
-workload. Each system was built with `make pgo LTO=1 TUNE=native`.
-Source frames contain pseudo-random pixel data so the benchmark is not
-cache-hot from pattern repetition. libswscale is invoked with
-`SWS_BILINEAR` and one `SwsContext` per output target - the "independent"
-configuration a naive multi-output libswscale consumer would use. For
-downscale workloads libswscale also supports a "cascade" mode where each
-output feeds the next, which is roughly 1.5–2× faster than independent
-mode on multi-level ladders; even against cascaded libswscale, funnelcake
-remains 3–10× faster on every tested AVX2/NEON CPU and 13–16× faster on
-the AVX-512 path. 
+workload. Each system was built with `make pgo LTO=1 TUNE=native` (see
+[INSTALL.md](INSTALL.md)). Source frames contain pseudo-random pixel data
+so the benchmark is not cache-hot from pattern repetition. libswscale is
+invoked with `SWS_BILINEAR` and one `SwsContext` per output target - the
+"independent" configuration a naive multi-output libswscale consumer
+would use. For downscale workloads libswscale also supports a "cascade"
+mode where each output feeds the next, which is roughly 1.5–2× faster
+than independent mode on multi-level ladders; even against cascaded
+libswscale, funnelcake remains 3–10× faster on every tested AVX2/NEON CPU
+and 13–16× faster on the AVX-512 path.
 
 Each workload label spells out the exact scales being produced. For
 example:
@@ -86,7 +86,7 @@ example:
 Cells below show `funnelcake median time (speedup vs libswscale)`.
 Smaller time is better; larger speedup is better.
 
-### SDR downscale v.s. libswscale
+### SDR downscale vs libswscale
 
 **x86_64 / AVX2 & AVX-512**
 
@@ -116,7 +116,7 @@ core and AVX2 is the faster choice anyway.
 | 2560×1440 down:2x,4x,8x           |  216 µs (23.6×) |  112 µs (14.1×) | 1177 µs  (7.9×) |
 | 3840×2160 down:1.5x,3x,6x,12x     | 1346 µs (20.7×) |  479 µs (11.7×) | 4155 µs (13.6×) |
 
-### SDR upscale v.s. libswscale
+### SDR upscale vs libswscale
 
 **x86_64 / AVX2 & AVX-512**
 
@@ -149,14 +149,14 @@ whole-call timing on that system.
 | 240×136 up:2x,4x,8x,16x         |  470 µs (10.5×) |  248 µs  (5.2×) | 1843 µs  (5.4×) |
 | 120×68 up:2x,4x,8x,16x,32x      |  467 µs  (9.5×) |  248 µs  (4.6×) | 1857 µs  (5.0×) |
 
-On x86 the 1.5× upscale tail remains slower per byte than the pure 2× steps:
-AVX2 has no 3-way interleaved store, so assembling the 2 to 3 output costs
-shuffle-port work that the 2× kernels avoid entirely.  NEON still has the
-structural advantage because the 2 to 3 bilinear maps cleanly onto
-`vld2q_u8` / `vst3q_u8`.  See [docs/API.md](docs/API.md#performance-notes)
-for a longer discussion.
+On x86 the 1.5× upscale tail is slower per byte than the pure 2× steps:
+AVX2 has no 3-way interleaved store, so assembling the 2-to-3 output costs
+shuffle-port work the 2× kernels avoid entirely. NEON has the structural
+advantage here, because the 2-to-3 bilinear maps cleanly onto `vld2q_u8` /
+`vst3q_u8`. See [docs/API.md](docs/API.md#performance-notes) for a longer
+discussion.
 
-### SDR combined downscale + upscale (single pass) v.s. libswscale
+### SDR combined downscale + upscale (single pass) vs libswscale
 
 **x86_64 / AVX2 & AVX-512**
 
@@ -180,16 +180,15 @@ The bench suite does not include a libswscale HDR comparison path, so HDR
 numbers are funnelcake's absolute time only. Rows marked `tone` produce
 tone-mapped 8-bit SDR outputs at every ladder step, `HDR+tone` produces
 both the 10-bit HDR and the tone-mapped SDR output at each step, and
-`tone 1x` is a source-resolution tone map with no scaling. Note that
-`tone` rows tone-map each output at its own resolution *after* scaling -
-a full 4K ladder tone-maps only ~59% as many pixels as `tone 1x` does,
+`tone 1x` is a source-resolution tone map with no scaling. The `tone`
+rows tone-map each output at its own resolution *after* scaling, so a
+full 4K ladder tone-maps only ~59% as many pixels as `tone 1x` does -
 which is why the 1:1 row costs more than a ladder despite doing no
-scaling work. All of them
-run the full tone-mapping pipeline (PQ-domain tone curve, BT.2020 NCL
-reconstruction, BT.2020→BT.709 gamut conversion, BT.709 re-encode)
-through the SIMD kernels - AVX-512, AVX2, NEON, and RVV all have
-dedicated tone-mapping kernels that match the scalar reference bit for
-bit.
+scaling work. All of them run the full tone-mapping pipeline (PQ-domain
+tone curve, BT.2020 NCL reconstruction, BT.2020-to-BT.709 gamut conversion,
+BT.709 re-encode) through the SIMD kernels; AVX-512, AVX2, NEON, and RVV
+each have a dedicated tone-mapping kernel that matches the scalar
+reference bit for bit.
 
 **x86_64 / AVX2 & AVX-512**
 
@@ -225,64 +224,16 @@ workload (e.g. 3495 vs 2788 µs on Epyc 7302) is the on-the-fly UV
 deinterleave cost, not a fundamental difference in scaling work.
 
 The AVX2 and NEON HDR kernels are roughly 2–4× slower per byte than
-their SDR counterparts primarily because 10-bit samples halve the
-number of pixels per SIMD register. Both now express the common weighted
-blend as a signed difference followed by a saturating rounding
-multiply-high in 16-bit lanes. AVX2 retains a widened multiply-add variant
-for the dense 12× pipeline, where mixing the two formulations balances the
-execution ports better than issuing only multiply-high instructions. The
-AVX-512 HDR kernels claw most of the
-lane-count penalty back: a 512-bit register restores
-the lane count a 256-bit register has for 8-bit samples, so on the
-Zen 5 column above the HDR rows run much closer to their SDR twins
-(e.g. 88 µs vs 56 µs at the 1080p thirds ladder).
-
-### Graviton 4 is the standout deployment target
-
-The Graviton 4 column deserves calling out explicitly. Against
-libswscale on the same hardware, funnelcake's SDR speedups on Graviton
-cluster around **16–24× on the pow2 workloads** - the 2× upscales,
-downscale ladders from 1080p through 4K, and single-pass combined
-down+up calls. For comparison, the same set of workloads sits around
-7–14× on Apple M5 Max, 7–16× on Raspberry Pi 5, and 5–14× on the
-AVX2 x86 server CPUs in the tables above; among x86 parts only the
-AVX-512 path on Zen 5 (14–32× on those same workloads) plays in the
-same league. The one exception is the 1.5×
-upscale tail (`up:2x,3x`, `up:1.5x`): that kernel is compute-bound on
-every platform and settles at ~5–6× everywhere, Graviton included.
-
-The most dramatic rows:
-
-- **Pure 2× upscales** (`480×270 up:2x`, `960×540 up:2x`,
-  `1920×1080 up:2x`): **21–23×** faster than libswscale.
-- **Single-pass combined downscale + upscale**
-  (`1920×1080 down:2x up:2x`, `down:1.5x,3x up:2x`,
-  `1280×720 down:2x,4x up:2x,4x`): **16–21×** faster.
-- **Downscale ladders** at 1080p through 4K: **21–24×** faster against
-  independent libswscale, still **~9–17×** faster even against
-  libswscale's cascade mode.
-
-In absolute numbers, a `c8g.2xlarge` instance (one Graviton 4 vCPU)
-processes a 1920×1080 thirds-family downscale ladder
-(`down:1.5x,3x,6x`) in **294 µs**, a complete 4K thirds ladder
-(`down:1.5x,3x,6x,12x`) in **1.35 ms**, and a combined 1080p
-downscale + 2× upscale in **426 µs**. At 60 fps each of those consumes
-less than 9% of a single core's frame budget - meaning a single
-Graviton 4 core can run the 1080p ladder for **~56 live streams** in
-parallel, or the full 4K ladder for **~12 streams**, with headroom left
-over.
-
-We don't have a single smoking-gun explanation for why Graviton's
-relative advantage is so much larger than other aarch64 parts. The
-likely contributors are that libswscale's ARM64 bilinear path is less
-aggressively hand-tuned than its x86 AVX2 path, the Neoverse V2 cores
-in Graviton 4 have generous SIMD throughput that funnelcake's
-`vld2q` / `vst3q` / `vrhaddq_u8` inner loops fully exploit, and
-libswscale's more cache-unfriendly memory access pattern interacts
-badly with the platform's memory subsystem. Whatever the exact cause,
-Graviton 4 is by a clear margin the deployment target where using
-funnelcake instead of libswscale produces the largest absolute savings
-per core for real-time multi-resolution video pipelines.
+their SDR counterparts, mostly because 10-bit samples halve the number
+of pixels per SIMD register. Both express the common weighted blend as a
+signed difference followed by a saturating rounding multiply-high in
+16-bit lanes. AVX2 also keeps a widened multiply-add variant for the
+dense 12× pipeline, where mixing the two formulations balances the
+execution ports better than issuing only multiply-high instructions.
+AVX-512 claws most of the lane-count penalty back - a 512-bit register
+holds as many 16-bit lanes as a 256-bit register holds 8-bit ones - so
+on the Zen 5 column above the HDR rows land much closer to their SDR
+twins (92 µs vs 53 µs at the 1080p thirds ladder).
 
 ### RISC-V (RVV 1.0)
 
@@ -307,16 +258,10 @@ specifically.
 HDR speedups land roughly half the SDR ratio because 10-bit u16 elements
 halve the per-vector throughput on the X60's 256-bit V unit.
 
-**GCC 14 is strongly recommended on RISC-V.** It ships the v1.0 RVV
-intrinsic spec including `vlseg2`/`vsseg2`/`vlseg3`/`vsseg3` segment
-loads and stores, which the kernels use for every horizontal halve, 3:1
-box average, 1.5x bilinear, and 2x upsample path.  GCC 13 only ships
-v0.11 intrinsics and doesn't expose the segment ops, so the build falls
-back to multiple strided loads/stores per chunk - on the X60 that
-typically costs **2–4× per workload** vs the GCC 14 build.  The Makefile
-detects the older spec at compile time and prints a `#pragma message`
-recommending the upgrade; the build still works either way.  All numbers
-in the table above are GCC 14.
+Numbers above are from a GCC 14 build. GCC 13 produces RVV kernels
+roughly 2–4× slower because its older intrinsic spec has no segment
+loads and stores; see [INSTALL.md](INSTALL.md#risc-v-rvv) for the
+details and for the LTO caveat on this target.
 
 Detection requires the V extension and a non-emulated misaligned-vector
 load path (queried via `riscv_hwprobe`); chips that report SLOW or
@@ -324,22 +269,14 @@ EMULATED for `RISCV_HWPROBE_KEY_MISALIGNED_VECTOR_PERF`, or that
 advertise only the embedded `Zve*` subset, fall back to the scalar
 kernel.
 
-LTO (`make LTO=1`) is auto-disabled on `riscv64` because GCC 13's LTO link
-can't resolve the RVV target builtins, and GCC 14's LTO partition pass hits
-an internal compiler error in `riscv_vector::expand_builtin`. The build
-emits a `$(warning ...)` notice and continues with `-O3` only.
-
 ### A note on the memory wall
 
-Several of the workloads in these tables have been profiled down to
-effectively one load + one pair-average + one store per output byte, and
-at that point the kernel is doing the minimum useful work per byte and
-no amount of further SIMD cleverness will make them faster on current
-CPU/memory architectures. On systems profiled while developing
-funnelcake, the following configurations were observed to hit the
-single-core memory bandwidth ceiling - funnelcake already runs at that
-ceiling, so any further speedup in these specific cases would require
-wider memory buses or multi-channel striping, not a better kernel:
+Several of the workloads in these tables profile down to one load, one
+pair-average, and one store per output byte. That is the minimum useful
+work per byte, so what limits them is the memory bus, not the code.
+These configurations were measured sitting at the single-core bandwidth
+ceiling on the machines used during development, and getting them faster
+would take a wider memory bus rather than a better kernel:
 
 - **Straight 2× upscale at 1080p on DDR5 systems**: on a Zen 5 system
   this workload is ~15 MB of source read + output write, and funnelcake
@@ -357,12 +294,10 @@ wider memory buses or multi-channel striping, not a better kernel:
   doing and really just reflects that both libraries are waiting on
   the same DRAM.
 
-In these cases the kernel's job is to get out of the memory subsystem's
-way, and the benchmarks above confirm that it does. The workloads where
-funnelcake's speedup keeps growing with CPU improvements (e.g. deep
-thirds cascades, the 1.5× upscale tail, combined down+up calls) are
-all compute-bound, and those are where the op-count and register
-scheduling work inside the kernels continues to pay off.
+The workloads where funnelcake's speedup keeps growing with faster CPUs
+(deep thirds cascades, the 1.5× upscale tail, combined down+up calls)
+are compute-bound, and those are where lower operation counts and better
+register scheduling still pay off.
 
 
 ## Source frame requirements
@@ -489,14 +424,14 @@ output exceeds 16384×16384. For example, a 1920×1080 source with
 is set in the return code.
 
 **1.5x upscale performance**: the 1.5x tail is slower per output byte
-than any of the 2× steps on AVX2 because the 2→3 output pattern has no
+than any of the 2× steps on AVX2 because the 2-to-3 output pattern has no
 3-way interleaved store and must be assembled with shuffles. The
-weighted 85/171 blends themselves now run on raw byte pairs via
+weighted 85/171 blends themselves run on raw byte pairs via
 `vpmaddubsw`, so on Zen 2 / Haswell and later the kernel is roughly 2×
-slower per output byte than a straight 2× step and several times
+slower per output byte than a straight 2× step, and still several times
 faster than libswscale's bilinear upscale. On Zen 1 the gap is wider
 because Zen 1 double-pumps 256-bit AVX2 instructions through its
-128-bit datapath. NEON does not have this bottleneck - the 2→3 pattern
+128-bit datapath. NEON does not have this bottleneck; the 2-to-3 pattern
 maps cleanly onto `vld2q_u8` / `vst3q_u8`. Choose the 1.5x tail with
 this in mind on compute-limited x86 targets.
 
@@ -534,9 +469,10 @@ platforms.
 
 ## Getting started
 
-See **[INSTALL.md](INSTALL.md)** for build instructions, compiler requirements,
-PGO and LTO setup, CPU-specific tuning recommendations, and static-library
-compatibility notes for downstream consumers.
+See **[INSTALL.md](INSTALL.md)** for build instructions, [make
+targets](INSTALL.md#make-targets), [test binary
+options](INSTALL.md#the-test-binary), architecture-specific compiler and
+tuning advice, PGO and LTO setup, and static-library compatibility notes.
 
 See **[docs/API.md](docs/API.md)** for the full API reference including data
 types, return codes, logging configuration, and libavcodec integration examples.
@@ -612,66 +548,17 @@ They are opt-in and never built by a plain `make`; see each binding's docs (and
 the `bindings-<lang>` / `test-<lang>` Makefile targets).
 
 
-## Releases
+## Releases and packaging
 
-### Cutting a new release
-
-1. Update `VERSION` at the top of the [Makefile](Makefile) (single source of
-   truth — `funnelcake.pc` and the FreeBSD port pull from it).
-2. If the public ABI changed in a backward-incompatible way, also bump
-   `SOVERSION` in the Makefile. This drives the installed `libfunnelcake.so.N`
-   suffix; downstream packages will need to be rebuilt against the new
-   major.
-3. Commit the version bump, then tag:
-   ```
-   git tag -a v0.1.0 -m "Release 0.1.0"
-   git push origin v0.1.0
-   ```
-4. GitHub auto-generates a tarball at
-   `https://github.com/<owner>/funnelcake/archive/refs/tags/v0.1.0.tar.gz`
-   that the FreeBSD port consumes via `USE_GITHUB`.
-
-### Building and submitting the FreeBSD port
-
-A port skeleton lives in [scripts/freebsd/](scripts/freebsd/). To exercise
-or update the port locally:
-
-```sh
-# 1. Copy the skeleton into your ports tree.
-sudo mkdir -p /usr/ports/multimedia/funnelcake
-sudo cp scripts/freebsd/Makefile scripts/freebsd/pkg-descr \
-        scripts/freebsd/pkg-plist /usr/ports/multimedia/funnelcake/
-
-# 2. Update DISTVERSION in the port Makefile to match the upstream tag.
-
-# 3. Generate the distfile checksum:
-cd /usr/ports/multimedia/funnelcake
-sudo make makesum
-
-# 4. Lint, build, install, and verify the packaging list. BATCH=yes skips
-#    the interactive options-config dialog (which hangs over a non-TTY
-#    SSH session if you have OPTIONS_DEFINE knobs):
-sudo make BATCH=yes stage check-plist
-sudo make BATCH=yes package
-sudo pkg add work/pkg/funnelcake-*.pkg
-
-# 5. Run the official lint pass (portaudit-equivalent):
-sudo portlint -A
-```
-
-Once the port builds and lints cleanly, submit it as a bug report against
-the FreeBSD ports tree per the
-[Porter's Handbook §3.7](https://docs.freebsd.org/en/books/porters-handbook/book/#porting-submitting).
-The optional `FFMPEG` knob pulls in `multimedia/ffmpeg` for the swscale
-benchmark comparison; without it the library and headers install but
-`fetch-samples` / `bench-swscale` are unavailable at runtime.
+Cutting a release and building the FreeBSD port are covered in
+[INSTALL.md](INSTALL.md#releases-and-packaging).
 
 
 ## Platform support
 
 | Platform | SIMD | Notes |
 |----------|------|-------|
-| x86-64 with AVX-512 F+BW+VL+VBMI (Zen 4+, Ice Lake+) | AVX-512 | Detected at runtime via cpuid + xgetbv; needs a compiler that accepts the AVX-512 flags (gcc ≥ 8, clang ≥ 7), otherwise the build quietly carries AVX2 as its best tier |
+| x86-64 with AVX-512 F+BW+VL+VBMI (Zen 4+, Ice Lake+) | AVX-512 | Detected at runtime via cpuid + xgetbv; builds with an older compiler top out at AVX2 |
 | x86-64 with AVX2 (Linux, macOS, FreeBSD) | AVX2 | Detected at runtime via cpuid; also used on CPUs whose AVX-512 lacks VBMI (e.g. Skylake-SP, where 512-bit downclocking favors AVX2 anyway) |
 | x86-64 without AVX2 | Scalar | Broadwell and later all have AVX2 |
 | aarch64 (Apple Silicon, AWS Graviton, FreeBSD/arm64) | NEON | All aarch64 cores have NEON |

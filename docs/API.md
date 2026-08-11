@@ -2,8 +2,8 @@
 
 Funnelcake is a fused multi-resolution YUV420 scaler. A single call to
 `fused_scaler_run` produces multiple downscaled and/or upscaled outputs in
-one pass over the source, using AVX2 or NEON SIMD kernels with a portable
-scalar fallback.
+one pass over the source, using AVX2/AVX-512, NEON, or RVV SIMD kernels
+with a portable scalar fallback.
 
 Input and output are I420 planar (Y, U, V separate planes), 8-bit. An
 HDR10 API handles 10-bit PQ/HLG input with optional tone mapping and
@@ -17,6 +17,43 @@ thirds (1.5x, 3x, 6x, 12x) or pow2 (2x, 4x, 8x, 16x). See
 4x, 8x, 16x, 32x) plus an optional 1.5x tail. Upscale may be combined
 with downscale in the same init call; both directions are produced in a
 single pass. See [Upscale Step Flags](#upscale-step-flags).
+
+
+## Contents
+
+**8-bit SDR API:**
+[Quick start](#quick-start),
+[`fused_scaler_init`](#fused_scaler_init),
+[`fused_scaler_run`](#fused_scaler_run),
+[`fused_scaler_free`](#fused_scaler_free),
+[`fused_simd_available`](#fused_simd_available),
+[Data types](#data-types)
+
+**Configuration:**
+[Scale step flags](#scale-step-flags),
+[Upscale step flags](#upscale-step-flags),
+[Option flags](#option-flags),
+[Return codes](#return-codes),
+[Alignment](#alignment-requirements),
+[Logging](#logging-configuration),
+[Environment variables](#environment-variables)
+
+**10-bit HDR API:**
+[Quick start (HDR)](#quick-start-hdr),
+[`fused_hdr_init`](#fused_hdr_init),
+[`fused_hdr_run`](#fused_hdr_run),
+[`fused_hdr_free`](#fused_hdr_free),
+[HDR data types](#hdr-data-types),
+[Pixel formats](#input-pixel-formats),
+[Transfer functions](#transfer-functions),
+[Tone mapping curves](#tone-mapping-curves),
+[Per-step output selection](#per-step-output-selection)
+
+**Integration:**
+[NUMA and thread affinity](#numa-and-thread-affinity),
+[libavcodec (SDR)](#libavcodec-integration),
+[libavcodec (HDR)](#libavcodec-integration-hdr),
+[Handling rejected steps](#handling-rejected-steps)
 
 
 ## Quick Start
@@ -120,6 +157,10 @@ per frame after a successful `fused_scaler_init`.
 | `src_y` | Pointer to the start of the luma plane. |
 | `src_u` | Pointer to the start of the Cb (U) chroma plane. |
 | `src_v` | Pointer to the start of the Cr (V) chroma plane. |
+
+All three pointers must be **32-byte aligned** for the SIMD kernel.
+Misaligned pointers fall back to the scalar kernel with a one-time
+warning; the output is still correct, just much slower.
 
 Strides are taken from `ctx->src_y_stride` and `ctx->src_uv_stride`.
 Only the effective region (`ctx->effective_width` x
@@ -456,18 +497,18 @@ typically running near memory bandwidth limits. The cascade amortizes
 source reads: level 0 (2x) reads the source once, and each subsequent
 level reads from the previous level's L1/L2-hot output buffer.
 
-The **1.5x tail is significantly more expensive than any 2x step**. It
-uses a weighted 85/171 bilinear blend rather than a pair-average, and
-the AVX2 implementation is shuffle-port throughput limited - the
-deinterleave, weighted-sum, pack, and interleave-store sequence costs
-roughly 13 shuffle-port micro-ops per chunk. On Zen 2 and later and on
-Intel Haswell-and-later, the 256-bit implementation is roughly 5-8x
-slower per byte than a straight 2x step, which is still faster than
-libswscale's bilinear upscale. On Zen 1 the 2x step wins by a larger
-margin because Zen 1 double-pumps every 256-bit AVX2 instruction through
-its 128-bit datapath, so the wider kernel provides no benefit there.
+The **1.5x tail is more expensive than any 2x step**. It uses a weighted
+85/171 bilinear blend rather than a pair-average, and the AVX2
+implementation is shuffle-port throughput limited: the 2-to-3 output
+pattern has no 3-way interleaved store, so it must be assembled with
+shuffles. The blends themselves run on raw byte pairs via `vpmaddubsw`,
+which takes roughly twice as long per output byte as a straight 2x step
+on Zen 2 and Intel Haswell and later. It is still several times faster
+than libswscale's bilinear upscale. On Zen 1 the gap is wider because
+Zen 1 double-pumps every 256-bit AVX2 instruction through its 128-bit
+datapath and the wider kernel buys nothing there.
 
-The NEON path does not have this bottleneck - the 2->3 bilinear maps
+The NEON path does not have this bottleneck; the 2-to-3 bilinear maps
 cleanly onto `vld2q_u8` / `vst3q_u8` load/store permute instructions
 which share ports with other vector ops and achieve near-optimal
 throughput.
@@ -577,9 +618,10 @@ uint8_t *plane_v = aligned_alloc(32, uv_stride * (height / 2));
 ```
 
 Misaligned strides cause `fused_scaler_init` to return
-`FUSED_ERR_BAD_ALIGNMENT`. Misaligned buffer pointers do not cause a
-hard error at init time but will produce incorrect results or faults
-at runtime on steps that use the SIMD kernel.
+`FUSED_ERR_BAD_ALIGNMENT`. Misaligned plane *pointers* are not an error:
+`fused_scaler_run` detects them, logs a one-time warning, and processes
+the frame with the scalar kernel. Results stay correct, but the frame
+costs several times more than the SIMD path would.
 
 SIMD steps additionally require the chroma width to be a multiple of 32
 (i.e., `src_width / 2` must be a multiple of 32, meaning `src_width`
@@ -822,6 +864,20 @@ The `level` argument to the callback is `FUSED_LOG_ERROR` (0) or
 do not call `fused_scaler_*` functions from within the callback.
 
 
+## Environment Variables
+
+Both are diagnostic overrides read once during the first CPU probe. Any
+non-empty value enables them; they are not intended for production use.
+
+| Variable | Effect |
+|----------|--------|
+| `FUNNELCAKE_FORCE_SCALAR` | Skips every SIMD probe, so all steps use the scalar kernels. `fused_simd_available()` then returns 0 and init reports `FUSED_WARN_BIT_SCALAR`. Used to compare scalar and SIMD output in one process. |
+| `FUNNELCAKE_NO_AVX512` | On AVX-512 hardware, drops back to the AVX2 kernels. Gives a same-build A/B between the two x86 kernel sets. No effect on other architectures. |
+
+Because the probe result is cached, setting either variable after the
+first `fused_scaler_init` or `fused_hdr_init` has no effect.
+
+
 ## HDR10 API Reference
 
 The HDR API is a separate set of types and functions for 10-bit PQ/HLG
@@ -1047,6 +1103,8 @@ struct member. Zero-initialise before use.
 | `sdr_flags` | `uint32_t` | Subset of `requested_flags` - produce 8-bit tone-mapped SDR outputs for these downscale steps. |
 | `upscale_flags` | `uint32_t` | Bitmask of `FUSED_UPSCALE_*` flags. Must be a contiguous prefix of the cascade. Same semantics as the 8-bit API. |
 | `upscale_tail_1_5x` | `int` | Set to 1 to append a 1.5x output to the deepest pow2 upscale level. |
+| `upscale_sdr_flags` | `uint32_t` | Subset of `upscale_flags` - also produce an 8-bit tone-mapped copy of these upscale levels. |
+| `upscale_sdr_tail_1_5x` | `int` | Set to 1 to also produce an SDR copy of the 1.5x tail (requires `upscale_tail_1_5x`). |
 | `options` | `uint32_t` | `FUSED_OPT_*` bitmask (same as 8-bit API). |
 | `tonemap_1x` | `int` | If non-zero, produce an 8-bit tone-mapped copy at source resolution. |
 | `tonemap` | `fused_tonemap_config_t` | Tone mapping curve and parameters. |
@@ -1068,8 +1126,6 @@ struct member. Zero-initialise before use.
 | `sdr_outputs[8]` | `fused_scale_output_t` | 8-bit tone-mapped downscale outputs. Slots not in `achieved_sdr_flags` have NULL planes. |
 | `output_1x` | `fused_scale_output_t` | 8-bit tone-mapped output at source resolution. Only valid if `tonemap_1x` was set. |
 | `upscale_hdr_outputs[6]` | `fused_hdr_output_t` | 10-bit upscale outputs, indexed by `FUSED_UP_IDX_*`. |
-| `upscale_sdr_flags` | `uint32_t` | Subset of `upscale_flags`: levels that should also produce an 8-bit tone-mapped SDR copy. |
-| `upscale_sdr_tail_1_5x` | `int` | 1 to also produce an SDR copy of the 1.5x tail (requires `upscale_tail_1_5x`). |
 | `achieved_upscale_sdr_flags` | `uint32_t` | SDR upscale copies that will be produced. |
 | `achieved_upscale_sdr_tail` | `int` | 1 if the SDR tail copy will be produced. |
 | `upscale_sdr_outputs[6]` | `fused_scale_output_t` | 8-bit tone-mapped upscale copies, indexed by `FUSED_UP_IDX_*`. Slots not achieved have NULL planes. |

@@ -18,12 +18,17 @@
  * resident (NEON has 32), so a vqtbl4q chain would reload four table
  * registers per 64-byte group per channel - far more memory traffic
  * than the lookups themselves.  Instead this kernel vectorizes all the
- * arithmetic (Q10 chroma deltas, index clamps, luma dot, chroma-rate
+ * arithmetic (Q10 chroma deltas, index adds, luma dot, chroma-rate
  * gamut/encode dots) and performs the three byte lookups per pixel as
- * scalar L1 loads through small stack buffers.  Apple and Neoverse
- * cores sustain 3+ loads per cycle with deep out-of-order windows, so
- * the 48 independent lookups per 16-pixel group pipeline well - the
- * same idiom the custom-LUT luma pass (tonemap_luma_neon) already uses.
+ * scalar L1 loads.  Index vectors leave the register file as 64-bit
+ * halves (two moves per eight indices; the vector-to-GPR path is a
+ * single port on Apple and Arm big cores, so it is kept lightly loaded),
+ * each 16-bit index is peeled off with a shift or bitfield extract, and
+ * the gathered bytes are reassembled into a vector without touching the
+ * stack.  The 48 independent lookups per 16-pixel row segment pipeline
+ * well behind deep out-of-order windows.  The table is a 4096-entry
+ * padded copy so that no clamp is needed on the indices (see
+ * TM_LUT_BIAS below).
  *
  * All arithmetic uses the scalar reference's widths and shifts: deltas
  * evaluated from the shared Q10 coefficients (state->delta_coef_*), the
@@ -44,6 +49,7 @@
 #include "tonemap.h"
 
 #include <arm_neon.h>
+#include <string.h>
 
 /* -----------------------------------------------------------------------
  * Q10 delta evaluation for 8 chroma codes (one uint16x8) -> 8 deltas.
@@ -56,66 +62,91 @@
  * ----------------------------------------------------------------------- */
 
 static inline __attribute__((always_inline)) int16x8_t
-tm_delta8_neon(uint16x8_t codes, int16x8_t coef)
+tm_delta8_neon(uint16x8_t codes, int16x8_t coef, int16x8_t bias)
 {
     int16x8_t x = vshlq_n_s16(
         vsubq_s16(vreinterpretq_s16_u16(codes), vdupq_n_s16(512)), 5);
-    return vqrdmulhq_s16(x, coef);
+    return vaddq_s16(vqrdmulhq_s16(x, coef), bias);
 }
 
 /* dG = g_cr(Cr) + g_cb(Cb): each term rounds exactly like its scalar
  * table entry, and the sum (magnitude < 1024) stays in 16-bit. */
 static inline __attribute__((always_inline)) int16x8_t
-tm_delta8_g_neon(uint16x8_t cb, uint16x8_t cr, int16x8_t gcb, int16x8_t gcr)
+tm_delta8_g_neon(uint16x8_t cb, uint16x8_t cr, int16x8_t gcb, int16x8_t gcr,
+                 int16x8_t bias)
 {
     int16x8_t c512 = vdupq_n_s16(512);
     int16x8_t xb = vshlq_n_s16(
         vsubq_s16(vreinterpretq_s16_u16(cb), c512), 5);
     int16x8_t xr = vshlq_n_s16(
         vsubq_s16(vreinterpretq_s16_u16(cr), c512), 5);
-    return vaddq_s16(vqrdmulhq_s16(xr, gcr), vqrdmulhq_s16(xb, gcb));
+    return vaddq_s16(vaddq_s16(vqrdmulhq_s16(xr, gcr), bias),
+                     vqrdmulhq_s16(xb, gcb));
 }
 
 /* -----------------------------------------------------------------------
- * Index computation for one 16-pixel row segment: clamp(Y' + delta).
- * Deltas arrive already expanded to luma rate (d0 = px 0..7, d1 = 8..15).
+ * Clamp-free indexing.
+ *
+ * The scalar reference clamps Y' + delta to [0, 1023] before indexing the
+ * 1024-entry pq_to_sdr table.  |delta| is bounded by 512 * 1.8814 < 1024
+ * (the largest Q10 NCL coefficient, full-range Cb - see tonemap.c), so
+ * Y' + delta + TM_LUT_BIAS always lands in [60, 3011].  The kernel
+ * therefore indexes a 4096-entry copy of the table whose entries outside
+ * the central 1024 replicate the end values, which is exactly what the
+ * clamp would have selected.  The bias is folded into the deltas at
+ * chroma rate (3 adds per 16 pixels), so each per-channel index costs a
+ * single add.
  * ----------------------------------------------------------------------- */
+
+#define TM_LUT_BIAS 1024
+#define TM_LUT_PAD  4096
+
+static void tm_build_padded_lut(const uint8_t *lut, uint8_t *pad)
+{
+    memset(pad, lut[0], TM_LUT_BIAS);
+    memcpy(pad + TM_LUT_BIAS, lut, 1024);
+    memset(pad + TM_LUT_BIAS + 1024, lut[1023],
+           TM_LUT_PAD - TM_LUT_BIAS - 1024);
+}
 
 static inline __attribute__((always_inline)) void
 tm_indices_neon(uint16x8_t y0, uint16x8_t y1, int16x8_t d0, int16x8_t d1,
                 uint16x8_t *i0_out, uint16x8_t *i1_out)
 {
-    int16x8_t zero = vdupq_n_s16(0);
-    int16x8_t top  = vdupq_n_s16(1023);
-    *i0_out = vreinterpretq_u16_s16(vminq_s16(vmaxq_s16(
-        vaddq_s16(vreinterpretq_s16_u16(y0), d0), zero), top));
-    *i1_out = vreinterpretq_u16_s16(vminq_s16(vmaxq_s16(
-        vaddq_s16(vreinterpretq_s16_u16(y1), d1), zero), top));
+    *i0_out = vaddq_u16(y0, vreinterpretq_u16_s16(d0));
+    *i1_out = vaddq_u16(y1, vreinterpretq_u16_s16(d1));
 }
 
-/* 16 lookups from a pair of index vectors into a byte buffer.  Lane
- * extraction goes through GPRs (umov) rather than a stack round-trip;
- * the 16 table loads are independent and pipeline behind each other. */
-static inline __attribute__((always_inline)) void
-tm_lookup16_neon(const uint8_t *lut, uint16x8_t i0, uint16x8_t i1,
-                 uint8_t *out)
+/* 8 lookups from one index vector into a byte table, packed into a
+ * 64-bit GPR.  The index vector leaves the register file as two 64-bit
+ * halves (one fmov/umov each); the vector-to-GPR path is a single port
+ * on Apple and Arm big cores, so the fewer lane moves the better.  The
+ * gathered bytes are OR-shifted into a GPR, so no stack buffer is
+ * involved and there is no wide reload of narrow stores to fail
+ * store forwarding.  clang lowers the packing to ld1 lane loads and gcc
+ * keeps the ldrb + orr form; both measure well. */
+static inline __attribute__((always_inline)) uint64_t
+tm_gather4_neon(const uint8_t *lut, uint64_t q)
 {
-    out[ 0] = lut[vgetq_lane_u16(i0, 0)];
-    out[ 1] = lut[vgetq_lane_u16(i0, 1)];
-    out[ 2] = lut[vgetq_lane_u16(i0, 2)];
-    out[ 3] = lut[vgetq_lane_u16(i0, 3)];
-    out[ 4] = lut[vgetq_lane_u16(i0, 4)];
-    out[ 5] = lut[vgetq_lane_u16(i0, 5)];
-    out[ 6] = lut[vgetq_lane_u16(i0, 6)];
-    out[ 7] = lut[vgetq_lane_u16(i0, 7)];
-    out[ 8] = lut[vgetq_lane_u16(i1, 0)];
-    out[ 9] = lut[vgetq_lane_u16(i1, 1)];
-    out[10] = lut[vgetq_lane_u16(i1, 2)];
-    out[11] = lut[vgetq_lane_u16(i1, 3)];
-    out[12] = lut[vgetq_lane_u16(i1, 4)];
-    out[13] = lut[vgetq_lane_u16(i1, 5)];
-    out[14] = lut[vgetq_lane_u16(i1, 6)];
-    out[15] = lut[vgetq_lane_u16(i1, 7)];
+    return (uint64_t)lut[q & 0xFFFF]
+         | (uint64_t)lut[(q >> 16) & 0xFFFF] << 8
+         | (uint64_t)lut[(q >> 32) & 0xFFFF] << 16
+         | (uint64_t)lut[q >> 48] << 24;
+}
+
+static inline __attribute__((always_inline)) uint8x8_t
+tm_lookup8_neon(const uint8_t *lut, uint16x8_t idx)
+{
+    uint64x2_t q = vreinterpretq_u64_u16(idx);
+    uint64_t lo = tm_gather4_neon(lut, vgetq_lane_u64(q, 0));
+    uint64_t hi = tm_gather4_neon(lut, vgetq_lane_u64(q, 1));
+    return vcreate_u8(lo | hi << 32);
+}
+
+static inline __attribute__((always_inline)) uint8x16_t
+tm_lookup16_neon(const uint8_t *lut, uint16x8_t i0, uint16x8_t i1)
+{
+    return vcombine_u8(tm_lookup8_neon(lut, i0), tm_lookup8_neon(lut, i1));
 }
 
 /* -----------------------------------------------------------------------
@@ -193,7 +224,7 @@ tm_chroma_dots_neon(uint16x8_t r, uint16x8_t g, uint16x8_t b, uint16x8_t y,
  * ----------------------------------------------------------------------- */
 
 static inline __attribute__((always_inline)) void
-tm_chunk_neon(const fused_hdr_internal_t *state,
+tm_chunk_neon(const fused_hdr_internal_t *state, const uint8_t *lut,
               const uint16_t *su, const uint16_t *sv,
               const uint16_t *suv, int p010,
               const uint16_t *sy0, const uint16_t *sy1,
@@ -201,8 +232,8 @@ tm_chunk_neon(const fused_hdr_internal_t *state,
               uint8_t *du, uint8_t *dv,
               int16x8_t cbs, int16x8_t crs, int16x8_t cmin, int16x8_t cmax)
 {
-    const uint8_t *lut = state->pq_to_sdr;
     uint16x8_t mask10 = vdupq_n_u16(0x3FF);
+    int16x8_t bias = vdupq_n_s16(TM_LUT_BIAS);
 
     /* ---- chroma load ---- */
     uint16x8_t cb, cr;
@@ -217,86 +248,67 @@ tm_chunk_neon(const fused_hdr_internal_t *state,
 
     /* ---- Q10 deltas at chroma rate ---- */
     int16x8_t dr = tm_delta8_neon(
-        cr, vdupq_n_s16((int16_t)state->delta_coef_r));
+        cr, vdupq_n_s16((int16_t)state->delta_coef_r), bias);
     int16x8_t db = tm_delta8_neon(
-        cb, vdupq_n_s16((int16_t)state->delta_coef_b));
+        cb, vdupq_n_s16((int16_t)state->delta_coef_b), bias);
     int16x8_t dg = tm_delta8_g_neon(
         cb, cr,
         vdupq_n_s16((int16_t)state->delta_coef_g_cb),
-        vdupq_n_s16((int16_t)state->delta_coef_g_cr));
+        vdupq_n_s16((int16_t)state->delta_coef_g_cr), bias);
 
     /* ---- expand to luma rate: zip with itself duplicates each word ---- */
     int16x8_t dr0 = vzip1q_s16(dr, dr), dr1 = vzip2q_s16(dr, dr);
     int16x8_t dg0 = vzip1q_s16(dg, dg), dg1 = vzip2q_s16(dg, dg);
     int16x8_t db0 = vzip1q_s16(db, db), db1 = vzip2q_s16(db, db);
 
-    /* ---- both rows: compute all 96 indices, then look them all up ---- */
-    uint8_t obuf[6][16];
-
-    {
-        uint16x8_t i0, i1;
-        for (int row = 0; row < 2; row++) {
-            const uint16_t *sy = row ? sy1 : sy0;
-            uint16x8_t y0 = vandq_u16(vld1q_u16(sy),     mask10);
-            uint16x8_t y1 = vandq_u16(vld1q_u16(sy + 8), mask10);
-            tm_indices_neon(y0, y1, dr0, dr1, &i0, &i1);
-            tm_lookup16_neon(lut, i0, i1, obuf[row * 3 + 0]);
-            tm_indices_neon(y0, y1, dg0, dg1, &i0, &i1);
-            tm_lookup16_neon(lut, i0, i1, obuf[row * 3 + 1]);
-            tm_indices_neon(y0, y1, db0, db1, &i0, &i1);
-            tm_lookup16_neon(lut, i0, i1, obuf[row * 3 + 2]);
-        }
-    }
-
-    /* ---- luma dot + store, both rows ----
-     * Widening multiply-accumulate straight from the bytes:
-     * (67r + 174g + 15b + 128) >> 8 in modular 16-bit (max 65408). */
+    /* ---- both rows: indices, lookups, luma dot, store ---- */
     uint8x8_t c67  = vdup_n_u8(67);
     uint8x8_t c174 = vdup_n_u8(174);
     uint8x8_t c15  = vdup_n_u8(15);
-    uint8x16_t rgb[6];
-    for (int i = 0; i < 6; i++)
-        rgb[i] = vld1q_u8(obuf[i]);
-
-    uint16x8_t ye[2];       /* even-extract source: y words of row 0 */
-    uint8x16_t reb = rgb[0], geb = rgb[1], beb = rgb[2];
+    uint8x16_t reb = vdupq_n_u8(0), geb = reb, beb = reb, yeb = reb;
 
     for (int row = 0; row < 2; row++) {
-        uint8x16_t rb = rgb[row * 3 + 0];
-        uint8x16_t gb = rgb[row * 3 + 1];
-        uint8x16_t bb = rgb[row * 3 + 2];
+        const uint16_t *sy = row ? sy1 : sy0;
+        uint16x8_t y0 = vandq_u16(vld1q_u16(sy),     mask10);
+        uint16x8_t y1 = vandq_u16(vld1q_u16(sy + 8), mask10);
+        uint16x8_t i0, i1;
 
-        uint16x8_t ys[2];
-        for (int h = 0; h < 2; h++) {
-            uint8x8_t r8 = h ? vget_high_u8(rb) : vget_low_u8(rb);
-            uint8x8_t g8 = h ? vget_high_u8(gb) : vget_low_u8(gb);
-            uint8x8_t b8 = h ? vget_high_u8(bb) : vget_low_u8(bb);
-            uint16x8_t acc = vmull_u8(r8, c67);
-            acc = vmlal_u8(acc, g8, c174);
-            acc = vmlal_u8(acc, b8, c15);
-            ys[h] = vshrq_n_u16(vaddq_u16(acc, vdupq_n_u16(128)), 8);
-        }
-        vst1q_u8(row ? dy1 : dy0,
-                 vcombine_u8(vmovn_u16(ys[0]), vmovn_u16(ys[1])));
+        tm_indices_neon(y0, y1, dr0, dr1, &i0, &i1);
+        uint8x16_t rb = tm_lookup16_neon(lut, i0, i1);
+        tm_indices_neon(y0, y1, dg0, dg1, &i0, &i1);
+        uint8x16_t gb = tm_lookup16_neon(lut, i0, i1);
+        tm_indices_neon(y0, y1, db0, db1, &i0, &i1);
+        uint8x16_t bb = tm_lookup16_neon(lut, i0, i1);
+
+        /* (67r + 174g + 15b + 128) >> 8: widening multiply-accumulate
+         * straight from the bytes.  The accumulator peaks at 65280, so
+         * the rounding narrow's +128 cannot wrap 16 bits. */
+        uint16x8_t acc_lo = vmull_u8(vget_low_u8(rb), c67);
+        acc_lo = vmlal_u8(acc_lo, vget_low_u8(gb), c174);
+        acc_lo = vmlal_u8(acc_lo, vget_low_u8(bb), c15);
+        uint16x8_t acc_hi = vmull_u8(vget_high_u8(rb), c67);
+        acc_hi = vmlal_u8(acc_hi, vget_high_u8(gb), c174);
+        acc_hi = vmlal_u8(acc_hi, vget_high_u8(bb), c15);
+        uint8x16_t yb = vcombine_u8(vrshrn_n_u16(acc_lo, 8),
+                                    vrshrn_n_u16(acc_hi, 8));
+        vst1q_u8(row ? dy1 : dy0, yb);
         if (row == 0) {
-            ye[0] = ys[0];
-            ye[1] = ys[1];
+            reb = rb; geb = gb; beb = bb; yeb = yb;
         }
     }
 
     /* ---- chroma outputs from row 0's top-left pixels ----
-     * uzp1 of the byte vector with itself compacts the even bytes into
-     * the low half; the y values are still words, so uzp1 on the word
-     * pair picks the even-position words directly. */
+     * uzp1 of a byte vector with itself compacts the even bytes into the
+     * low half. */
     uint8x16_t re = vuzp1q_u8(reb, reb);
     uint8x16_t ge = vuzp1q_u8(geb, geb);
     uint8x16_t be = vuzp1q_u8(beb, beb);
-    uint16x8_t yev = vuzp1q_u16(ye[0], ye[1]);
+    uint8x16_t ye = vuzp1q_u8(yeb, yeb);
 
     tm_chroma_dots_neon(vmovl_u8(vget_low_u8(re)),
                         vmovl_u8(vget_low_u8(ge)),
                         vmovl_u8(vget_low_u8(be)),
-                        yev,
+                        vmovl_u8(vget_low_u8(ye)),
                         cbs, crs, cmin, cmax, du, dv);
 }
 
@@ -326,6 +338,9 @@ tm_frame_neon(const fused_hdr_internal_t *state,
     int16x8_t cmin = vdupq_n_s16((int16_t)state->chroma_out_min);
     int16x8_t cmax = vdupq_n_s16((int16_t)state->chroma_out_max);
 
+    uint8_t lut_pad[TM_LUT_PAD] __attribute__((aligned(64)));
+    tm_build_padded_lut(state->pq_to_sdr, lut_pad);
+
     for (int cy = 0; cy < chroma_h; cy++) {
         const uint16_t *su  = src_u  ? src_u  + cy * src_uv_pitch : 0;
         const uint16_t *sv  = src_v  ? src_v  + cy * src_uv_pitch : 0;
@@ -339,7 +354,7 @@ tm_frame_neon(const fused_hdr_internal_t *state,
 
         int cx = 0;
         for (; cx < simd_cw; cx += 8) {
-            tm_chunk_neon(state,
+            tm_chunk_neon(state, lut_pad,
                           p010 ? 0 : su + cx, p010 ? 0 : sv + cx,
                           p010 ? suv + cx * 2 : 0, p010,
                           sy0 + cx * 2, sy1 + cx * 2,

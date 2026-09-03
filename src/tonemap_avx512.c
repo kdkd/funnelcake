@@ -33,8 +33,10 @@
  * the mechanism that keeps scalar and SIMD bit-exact.  All remaining
  * arithmetic uses the same widths and shifts as the scalar reference:
  * the luma dot in (modular) 16-bit - max value 65408 fits - and the
- * chroma-rate gamut/encode dots in 32-bit.  Parity tests enforce
- * bit-exactness against fused_tonemap_apply_scalar.
+ * chroma-rate gamut/encode dots accumulated in 32-bit from vpmaddwd
+ * word pairs (every operand is byte-range or an 8.8 scale, so the pair
+ * products are exact).  Parity tests enforce bit-exactness against
+ * fused_tonemap_apply_scalar.
  *
  * Tails run the same chunk body under element masks; no scalar tail
  * exists in this file.
@@ -96,6 +98,17 @@ static const ALIGN64 uint8_t idx_rb_hi[64] = {
     56,120, 57,121, 58,122, 59,123, 60,124, 61,125, 62,126, 63,127
 };
 
+/* vpermt2b indices that pair the even-position (top-left) pixels of two
+ * byte vectors: [a0,b0,a2,b2,...,a62,b62].  Values 0..63 select the first
+ * source and 64..127 the second; vpmovzxbw then turns each byte pair into
+ * the word pair vpmaddwd consumes. */
+static const ALIGN64 uint8_t idx_even_pairs[64] = {
+     0, 64,  2, 66,  4, 68,  6, 70,  8, 72, 10, 74, 12, 76, 14, 78,
+    16, 80, 18, 82, 20, 84, 22, 86, 24, 88, 26, 90, 28, 92, 30, 94,
+    32, 96, 34, 98, 36,100, 38,102, 40,104, 42,106, 44,108, 46,110,
+    48,112, 50,114, 52,116, 54,118, 56,120, 58,122, 60,124, 62,126
+};
+
 /* vpermt2w: split 64 interleaved UVUV... words into 32 U and 32 V. */
 static const ALIGN64 uint16_t idx_even_w[32] = {
      0, 2, 4, 6, 8,10,12,14,16,18,20,22,24,26,28,30,
@@ -105,6 +118,10 @@ static const ALIGN64 uint16_t idx_odd_w[32] = {
      1, 3, 5, 7, 9,11,13,15,17,19,21,23,25,27,29,31,
     33,35,37,39,41,43,45,47,49,51,53,55,57,59,61,63
 };
+
+/* Packed word pair for vpmaddwd: low word first. */
+#define TM_PAIR(lo, hi) \
+    ((int)(((uint32_t)(uint16_t)(hi) << 16) | (uint16_t)(lo)))
 
 static inline __mmask32 tm_mask32(int n)
 {
@@ -257,46 +274,41 @@ tm_row_avx512(const uint16_t *sy, uint8_t *dy,
 }
 
 /* -----------------------------------------------------------------------
- * Chroma-rate gamut + BT.709 encode dots for 16 dwords.
+ * Chroma-rate gamut + BT.709 encode dots for 16 samples.
  *
- * Mirrors tonemap_rgb_to_chroma_sdr exactly (32-bit arithmetic, same
- * rounding and clamps).
+ * Mirrors tonemap_rgb_to_chroma_sdr exactly (32-bit accumulation, same
+ * rounding and clamps).  rg holds [r, g] word pairs, b128 holds [b, 128]
+ * word pairs (the rounding constant rides along as the second term),
+ * and y holds the luma dwords.  The encode step packs [x709, y] the same
+ * way so (x709 - y) * scale is one vpmaddwd against [scale, -scale].
  * ----------------------------------------------------------------------- */
 
 static inline __attribute__((always_inline)) void
-tm_chroma_dots(__m512i r, __m512i g, __m512i b, __m512i y,
-               __m512i cbs, __m512i crs, __m512i cmin, __m512i cmax,
+tm_chroma_dots(__m512i rg, __m512i b128, __m512i y,
+               __m512i cbs_pair, __m512i crs_pair,
+               __m512i cmin, __m512i cmax,
                __m512i *cb_out, __m512i *cr_out)
 {
     __m512i c128  = _mm512_set1_epi32(128);
     __m512i zero  = _mm512_setzero_si512();
     __m512i c255  = _mm512_set1_epi32(255);
+    __m512i ye    = _mm512_slli_epi32(y, 16);
 
     /* Gamut rows * 256 (each sums to 256): see tonemap.c */
-    __m512i r709 = _mm512_srai_epi32(
-        _mm512_add_epi32(
-            _mm512_add_epi32(
-                _mm512_mullo_epi32(r, _mm512_set1_epi32(425)),
-                _mm512_mullo_epi32(g, _mm512_set1_epi32(-150))),
-            _mm512_add_epi32(
-                _mm512_mullo_epi32(b, _mm512_set1_epi32(-19)), c128)), 8);
-    __m512i b709 = _mm512_srai_epi32(
-        _mm512_add_epi32(
-            _mm512_add_epi32(
-                _mm512_mullo_epi32(r, _mm512_set1_epi32(-5)),
-                _mm512_mullo_epi32(g, _mm512_set1_epi32(-26))),
-            _mm512_add_epi32(
-                _mm512_mullo_epi32(b, _mm512_set1_epi32(287)), c128)), 8);
+    __m512i r709 = _mm512_srai_epi32(_mm512_add_epi32(
+        _mm512_madd_epi16(rg,   _mm512_set1_epi32(TM_PAIR(425, -150))),
+        _mm512_madd_epi16(b128, _mm512_set1_epi32(TM_PAIR(-19, 1)))), 8);
+    __m512i b709 = _mm512_srai_epi32(_mm512_add_epi32(
+        _mm512_madd_epi16(rg,   _mm512_set1_epi32(TM_PAIR(-5, -26))),
+        _mm512_madd_epi16(b128, _mm512_set1_epi32(TM_PAIR(287, 1)))), 8);
     r709 = _mm512_min_epi32(_mm512_max_epi32(r709, zero), c255);
     b709 = _mm512_min_epi32(_mm512_max_epi32(b709, zero), c255);
 
     /* cb = clamp(128 + ((b709 - y)*cbs + 128 >> 8), cmin, cmax) */
-    __m512i cb = _mm512_add_epi32(c128, _mm512_srai_epi32(
-        _mm512_add_epi32(
-            _mm512_mullo_epi32(_mm512_sub_epi32(b709, y), cbs), c128), 8));
-    __m512i cr = _mm512_add_epi32(c128, _mm512_srai_epi32(
-        _mm512_add_epi32(
-            _mm512_mullo_epi32(_mm512_sub_epi32(r709, y), crs), c128), 8));
+    __m512i cb = _mm512_add_epi32(c128, _mm512_srai_epi32(_mm512_add_epi32(
+        _mm512_madd_epi16(_mm512_or_si512(b709, ye), cbs_pair), c128), 8));
+    __m512i cr = _mm512_add_epi32(c128, _mm512_srai_epi32(_mm512_add_epi32(
+        _mm512_madd_epi16(_mm512_or_si512(r709, ye), crs_pair), c128), 8));
 
     *cb_out = _mm512_min_epi32(_mm512_max_epi32(cb, cmin), cmax);
     *cr_out = _mm512_min_epi32(_mm512_max_epi32(cr, cmin), cmax);
@@ -388,31 +400,35 @@ tm_chunk_avx512(const fused_hdr_internal_t *state,
                   &rbx, &gbx, &bbx, &ybx);
     (void)rbx; (void)gbx; (void)bbx; (void)ybx;
 
-    /* ---- chroma outputs from row 0's top-left pixels ---- */
-    __m512i evb = _mm512_load_si512((const void *)idx_even_b);
-    __m256i rq = _mm512_castsi512_si256(_mm512_permutexvar_epi8(evb, rb0));
-    __m256i gq = _mm512_castsi512_si256(_mm512_permutexvar_epi8(evb, gb0));
-    __m256i bq = _mm512_castsi512_si256(_mm512_permutexvar_epi8(evb, bb0));
-    __m256i yq = _mm512_castsi512_si256(_mm512_permutexvar_epi8(evb, yb0));
+    /* ---- chroma outputs from row 0's top-left pixels ----
+     * One byte permute pairs the even-position r and g bytes (and b with
+     * a 0x80 byte from a constant vector); zero-extending the pairs to
+     * words yields the [r, g] and [b, 128] operands directly.  Luma goes
+     * through the even-byte compaction and a dword widen. */
+    __m512i pairs = _mm512_load_si512((const void *)idx_even_pairs);
+    __m512i rg8   = _mm512_permutex2var_epi8(rb0, pairs, gb0);
+    __m512i b808  = _mm512_permutex2var_epi8(bb0, pairs,
+                                             _mm512_set1_epi8((char)0x80));
+    __m256i yq = _mm512_castsi512_si256(_mm512_permutexvar_epi8(
+        _mm512_load_si512((const void *)idx_even_b), yb0));
 
-    __m512i r_lo = _mm512_cvtepu8_epi32(_mm256_castsi256_si128(rq));
-    __m512i r_hi = _mm512_cvtepu8_epi32(_mm256_extracti128_si256(rq, 1));
-    __m512i g_lo = _mm512_cvtepu8_epi32(_mm256_castsi256_si128(gq));
-    __m512i g_hi = _mm512_cvtepu8_epi32(_mm256_extracti128_si256(gq, 1));
-    __m512i b_lo = _mm512_cvtepu8_epi32(_mm256_castsi256_si128(bq));
-    __m512i b_hi = _mm512_cvtepu8_epi32(_mm256_extracti128_si256(bq, 1));
+    __m512i rg_lo   = _mm512_cvtepu8_epi16(_mm512_castsi512_si256(rg8));
+    __m512i rg_hi   = _mm512_cvtepu8_epi16(_mm512_extracti64x4_epi64(rg8, 1));
+    __m512i b128_lo = _mm512_cvtepu8_epi16(_mm512_castsi512_si256(b808));
+    __m512i b128_hi = _mm512_cvtepu8_epi16(_mm512_extracti64x4_epi64(b808, 1));
     __m512i y_lo = _mm512_cvtepu8_epi32(_mm256_castsi256_si128(yq));
     __m512i y_hi = _mm512_cvtepu8_epi32(_mm256_extracti128_si256(yq, 1));
 
-    __m512i cbs  = _mm512_set1_epi32(state->cb_out_scale);
-    __m512i crs  = _mm512_set1_epi32(state->cr_out_scale);
+    int cbs = state->cb_out_scale, crs = state->cr_out_scale;
+    __m512i cbs_pair = _mm512_set1_epi32(TM_PAIR(cbs, -cbs));
+    __m512i crs_pair = _mm512_set1_epi32(TM_PAIR(crs, -crs));
     __m512i cmin = _mm512_set1_epi32(state->chroma_out_min);
     __m512i cmax = _mm512_set1_epi32(state->chroma_out_max);
 
     __m512i cb_lo32, cr_lo32, cb_hi32, cr_hi32;
-    tm_chroma_dots(r_lo, g_lo, b_lo, y_lo, cbs, crs, cmin, cmax,
+    tm_chroma_dots(rg_lo, b128_lo, y_lo, cbs_pair, crs_pair, cmin, cmax,
                    &cb_lo32, &cr_lo32);
-    tm_chroma_dots(r_hi, g_hi, b_hi, y_hi, cbs, crs, cmin, cmax,
+    tm_chroma_dots(rg_hi, b128_hi, y_hi, cbs_pair, crs_pair, cmin, cmax,
                    &cb_hi32, &cr_hi32);
 
     __m256i cb_b = _mm256_inserti128_si256(

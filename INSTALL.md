@@ -374,6 +374,12 @@ newer. Override tools with the normal Makefile variables.
 
 Set `CHECK_BINDINGS=0` or `CHECK_SANITIZERS=0` in the environment to omit those
 parts explicitly. `make check-native` runs just the focused native regressions.
+`make test-alloc` simulates one failed allocation at a time, and persistent
+allocation failure, in test copies of the initialization code. It checks
+cleanup, repeated free, and successful initialization after recovery. It does
+not exhaust real memory or deliberately trigger signals. This target is
+opt-in and adds no hooks to the production library.
+
 Use `gmake` for all of these commands on FreeBSD.
 
 Builds track compiler and flag settings automatically. Changing CC, tuning,

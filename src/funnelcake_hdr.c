@@ -391,6 +391,9 @@ static int fused_hdr_init_impl(fused_hdr_ctx_t *ctx, size_t *planned,
         return FUSED_ERR_NO_STEPS;
     }
 
+    /* Let failure cleanup reach temporary planes owned by state. */
+    ctx->_internal = planned ? NULL : state;
+
     for (int i = 0; i < 8; i++) {
         const step_desc_t *sd = &k_steps[i];
 
@@ -751,7 +754,6 @@ hdr_tail_done:
 
     if (achieved_any == 0 && !ctx->tonemap_1x && !hdr_want_up) {
         fused_hdr_free(ctx);
-        if (!planned) free(state);
         ctx->_internal = NULL;
         fused_log(&ctx->log_errors, FUSED_LOG_ERROR,
             "funnelcake-hdr: no valid output steps after validation\n");
@@ -782,7 +784,6 @@ hdr_tail_done:
             fused_init_alloc(&pv, 32, (size_t)uv_stride * (size_t)chroma_h, planned) != 0) {
             free(py); free(pu); free(pv);
             fused_hdr_free(ctx);
-            if (!planned) free(state);
             ctx->_internal = NULL;
             fused_log(&ctx->log_errors, FUSED_LOG_ERROR,
                 "funnelcake-hdr: out-of-memory allocating 1:1 tonemap output\n");

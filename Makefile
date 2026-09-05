@@ -375,6 +375,23 @@ check-native: $(NATIVE_TEST_BINS)
 test/funnelcake_%: test/test_%.c libfunnelcake.a
 	$(CC) $(TEST_CFLAGS) $(LINK_MARCH) -o $@ $< libfunnelcake.a $(LDFLAGS) -pthread
 
+# Allocation fault injection only replaces calls in test copies of init/free.
+ALLOC_TEST_OBJS = test/funnelcake_alloc_sdr.o test/funnelcake_alloc_hdr.o
+$(ALLOC_TEST_OBJS): .build-config test/alloc_hooks.h include/funnelcake.h src/internal.h
+
+test/funnelcake_alloc_sdr.o: src/funnelcake.c
+	$(CC) $(LIB_CFLAGS) -include test/alloc_hooks.h -c -o $@ $<
+
+test/funnelcake_alloc_hdr.o: src/funnelcake_hdr.c
+	$(CC) $(LIB_CFLAGS) -include test/alloc_hooks.h -c -o $@ $<
+
+test/funnelcake_alloc_fail: test/test_alloc_fail.c $(ALLOC_TEST_OBJS) libfunnelcake.a
+	$(CC) $(TEST_CFLAGS) $(LINK_MARCH) -o $@ $< $(ALLOC_TEST_OBJS) libfunnelcake.a $(LDFLAGS)
+
+.PHONY: test-alloc
+test-alloc: test/funnelcake_alloc_fail
+	./test/funnelcake_alloc_fail
+
 # Default target
 .PHONY: all lib shared test bench bench-sdr bench-hdr bench-swscale visual asm fetch-samples clean pgo pgo-clean install bindings-go test-go bindings-java test-java bindings-rust test-rust bindings-python test-python
 
@@ -667,7 +684,7 @@ fetch-samples:
 	@echo ""
 
 clean:
-	rm -f $(NATIVE_TEST_BINS)
+	rm -f $(NATIVE_TEST_BINS) $(ALLOC_TEST_OBJS) test/funnelcake_alloc_fail
 	rm -f $(LIB_OBJS) $(TEST_OBJS) libfunnelcake.a funnelcake_test
 	rm -f libfunnelcake.so libfunnelcake.so.* libfunnelcake.*.dylib libfunnelcake.dylib
 	rm -f funnelcake.pc
@@ -852,5 +869,5 @@ $(TEST_OBJS): include/funnelcake.h test/test_main.h test/test_patterns.h
 # Force changed configurations even on make/filesystems with coarse timestamps.
 BUILD_CHANGED := $(shell printf '%s\n' $(foreach key,$(BUILD_SETTINGS),$(call shellquote,$(key)=$($(key)))) | cmp -s - .build-config || echo yes)
 ifeq ($(BUILD_CHANGED),yes)
-$(LIB_OBJS) $(TEST_OBJS) libfunnelcake.a $(SHLIB) $(JAVA_CORE_LIB) $(PY_CORE_LIB) funnelcake_test $(NATIVE_TEST_BINS): FORCE
+$(LIB_OBJS) $(TEST_OBJS) libfunnelcake.a $(SHLIB) $(JAVA_CORE_LIB) $(PY_CORE_LIB) funnelcake_test $(NATIVE_TEST_BINS) $(ALLOC_TEST_OBJS) test/funnelcake_alloc_fail: FORCE
 endif

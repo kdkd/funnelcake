@@ -65,7 +65,7 @@ s.Run(f)
 
 out, ok := s.Output(fc.Scale2X)        // 960x540
 if ok {
-    use(out.Y(), out.U(), out.V())     // []byte views, valid until next Run/Close
+    use(out.Y(), out.U(), out.V())     // owned []byte copies
 }
 ```
 
@@ -149,10 +149,11 @@ func (f *Frame) Close()
 ```
 `Frame` is an 8-bit I420 (YUV 4:2:0 planar) input. `NewFrame` allocates the
 three planes with 32-byte alignment and aligned strides; `width`/`height` should
-be even. It returns `ErrBadDimensions` if either is `<= 0`, or a non-nil error
-on allocation failure. The `Y`/`U`/`V` methods return **writable** views into
-the frame's own memory — fill them before calling `Run`. `Close` frees the
-planes and is safe to call more than once; a finalizer frees them as a backstop.
+be even. It returns `ErrBadDimensions` for invalid or unrepresentable dimensions.
+Storage allocation follows normal Go allocation behavior. The `Y`/`U`/`V` methods return **writable** views into
+the frame's own memory; fill them before calling `Run`. `Close` releases the
+frame's references and is safe to call more than once. Existing slices retain
+their backing storage.
 
 ```go
 type HDRFrame struct {
@@ -217,8 +218,7 @@ func (o Output) Y() []byte
 func (o Output) U() []byte
 func (o Output) V() []byte
 ```
-A read-only view of one 8-bit output plane set. The slices alias scaler-owned
-memory (see lifetime note below).
+Metadata for one 8-bit output. Plane accessors return owned copies.
 
 ### HDR scaler
 
@@ -279,7 +279,7 @@ func (o HDROutput) Y() []uint16
 func (o HDROutput) U() []uint16
 func (o HDROutput) V() []uint16
 ```
-A read-only view of one 10-bit output plane set.
+Metadata for one 10-bit output. Plane accessors return owned copies.
 
 ### Constants
 
@@ -347,10 +347,9 @@ error.
 
 ## Output buffer lifetime
 
-Output plane views (`Output.Y()`, `HDROutput.Y()`, …) **alias memory owned by
-the scaler**. They are valid only until the scaler's next `Run` or `Close`. Copy
-anything you need to retain. Input frames are independent — you own them and
-free them with `Close`.
+Output plane accessors return independent Go-owned slices. Obtain these copies
+before closing the scaler; they survive subsequent Run, Close, and garbage
+collection. Input frame slices also retain their Go-owned backing storage.
 
 ## Errors and warnings
 
@@ -383,11 +382,8 @@ scalar warning is expected.
   same width/height you passed to the scaler.
 - **Custom LUT size.** A `TonemapConfig.CustomLUT` must be exactly 1024 bytes;
   otherwise `NewHDRScaler` returns `ErrCustomLUTLength`.
-- **Don't outlive the scaler with a raw slice.** Output plane slices alias
-  scaler-owned memory. While you hold the `Output`/`HDROutput` value the scaler
-  is kept alive, but if you extract a slice and then drop both the `Output` and
-  the scaler, that slice dangles. Copy what you need to keep:
-  `ycopy := append([]byte(nil), out.Y()...)`.
+- **Obtain outputs before Close.** Output access after closing the scaler
+  panics. Previously returned plane copies remain valid.
 
 ## Concurrency
 
@@ -395,3 +391,16 @@ Each `Scaler` / `HDRScaler` is independent and may run on its own goroutine. Do
 not share one scaler across goroutines without your own synchronization. The
 package forces the library's one-time CPU probe on first use, so concurrent
 first inits are safe.
+
+### Plane ownership
+
+Frame and HDRFrame plane slices use aligned Go-owned storage and remain valid
+if the frame is closed or garbage-collected. Public dimensions and strides are
+informational snapshots; changing them does not change allocation bounds or
+source validation.
+
+Output and HDROutput Y/U/V accessors return owned copies, including row padding.
+Obtain copies before closing the scaler. They remain valid after another Run,
+Close, or garbage collection, and modifying a copy never changes scaler output.
+This replaces the earlier borrowed-output-slice behavior, since a plain Go slice
+cannot keep a C allocation owner alive.

@@ -44,7 +44,9 @@ type Scaler struct {
 // a ready Scaler. A negative library return becomes an Error; non-fatal
 // conditions are reported via the Warnings field (also check SIMDAvailable).
 func NewScaler(cfg ScalerConfig) (*Scaler, error) {
-	if !validDimensions(cfg.SrcWidth, cfg.SrcHeight) { return nil, ErrBadDimensions }
+	if !validDimensions(cfg.SrcWidth, cfg.SrcHeight) {
+		return nil, ErrBadDimensions
+	}
 	ensureDetect()
 
 	ctx := (*C.fused_scaler_ctx_t)(C.calloc(1, C.size_t(unsafe.Sizeof(C.fused_scaler_ctx_t{}))))
@@ -90,13 +92,14 @@ func (s *Scaler) Run(f *Frame) {
 	if f.y == nil {
 		panic("funnelcake: Run with a closed Frame")
 	}
-	if f.Width != s.srcWidth || f.Height != s.srcHeight {
+	if f.width != s.srcWidth || f.height != s.srcHeight {
 		panic(fmt.Sprintf("funnelcake: frame %dx%d does not match scaler source %dx%d",
-			f.Width, f.Height, s.srcWidth, s.srcHeight))
+			f.width, f.height, s.srcWidth, s.srcHeight))
 	}
 	C.fused_scaler_run(s.ctx,
 		(*C.uint8_t)(f.y), (*C.uint8_t)(f.u), (*C.uint8_t)(f.v))
 	runtime.KeepAlive(f)
+	runtime.KeepAlive(s)
 }
 
 // checkOpen panics with a clear message if the scaler has been closed, instead
@@ -120,7 +123,7 @@ func (s *Scaler) AchievedFlags() ScaleFlag { s.checkOpen(); return ScaleFlag(s.c
 // produced.
 func (s *Scaler) Output(flag ScaleFlag) (Output, bool) {
 	s.checkOpen()
-	if flag == 0 || flag & (flag-1) != 0 || uint32(s.ctx.achieved_flags)&uint32(flag) == 0 {
+	if flag == 0 || flag&(flag-1) != 0 || uint32(s.ctx.achieved_flags)&uint32(flag) == 0 {
 		return Output{}, false
 	}
 	idx := bits.TrailingZeros32(uint32(flag))
@@ -132,7 +135,7 @@ func (s *Scaler) Output(flag ScaleFlag) (Output, bool) {
 // UpscaleOutput returns an upscale-cascade output for a single flag.
 func (s *Scaler) UpscaleOutput(flag UpscaleFlag) (Output, bool) {
 	s.checkOpen()
-	if flag == 0 || flag & (flag-1) != 0 || uint32(s.ctx.achieved_upscale_flags)&uint32(flag) == 0 {
+	if flag == 0 || flag&(flag-1) != 0 || uint32(s.ctx.achieved_upscale_flags)&uint32(flag) == 0 {
 		return Output{}, false
 	}
 	idx := bits.TrailingZeros32(uint32(flag))
@@ -162,9 +165,9 @@ func (s *Scaler) Close() {
 	runtime.SetFinalizer(s, nil)
 }
 
-// Output is a read-only view of one 8-bit output plane set. Its plane slices
-// alias buffers owned by the producing Scaler and are valid only until that
-// scaler's next Run or Close.
+// Output describes a native output. Y, U and V return owned copies; obtain
+// those copies before closing the scaler. Public geometry is a snapshot and
+// never controls native access bounds.
 type Output struct {
 	Width    int
 	Height   int
@@ -172,22 +175,23 @@ type Output struct {
 	UVStride int
 	Fallback bool // true if the scalar kernel was used for this step
 
-	y, u, v unsafe.Pointer
-	chromaH int
+	y, u, v       unsafe.Pointer
+	chromaH       int
+	ySize, uvSize int
 	// keepalive pins the producing scaler so that, as long as this Output is
 	// reachable, the scaler's finalizer cannot run and free the buffers these
 	// views alias. Copy data out if you need it past the scaler's lifetime.
 	keepalive interface{}
 }
 
-// Y returns the luma plane view.
-func (o Output) Y() []byte { return byteView(o.y, o.YStride*o.Height) }
+// Y copies the luma plane, including row padding.
+func (o Output) Y() []byte { return o.copyPlane(o.y, o.ySize) }
 
-// U returns the Cb plane view.
-func (o Output) U() []byte { return byteView(o.u, o.UVStride*o.chromaH) }
+// U copies the Cb plane, including row padding.
+func (o Output) U() []byte { return o.copyPlane(o.u, o.uvSize) }
 
-// V returns the Cr plane view.
-func (o Output) V() []byte { return byteView(o.v, o.UVStride*o.chromaH) }
+// V copies the Cr plane, including row padding.
+func (o Output) V() []byte { return o.copyPlane(o.v, o.uvSize) }
 
 func cToOutput(co *C.fused_scale_output_t) Output {
 	h := int(co.height)
@@ -201,6 +205,8 @@ func cToOutput(co *C.fused_scale_output_t) Output {
 		u:        unsafe.Pointer(co.plane_u),
 		v:        unsafe.Pointer(co.plane_v),
 		chromaH:  chroma420Height(h),
+		ySize:    int(co.y_stride) * h,
+		uvSize:   int(co.uv_stride) * chroma420Height(h),
 	}
 }
 
@@ -209,4 +215,21 @@ func b2i(b bool) C.int {
 		return 1
 	}
 	return 0
+}
+
+// Plane accessors return owned copies because Go slices cannot retain a
+// foreign allocation's owner or detect explicit Close after returning.
+func (o Output) copyPlane(p unsafe.Pointer, n int) []byte {
+	if o.keepalive == nil {
+		return nil
+	}
+	switch owner := o.keepalive.(type) {
+	case *Scaler:
+		owner.checkOpen()
+	case *HDRScaler:
+		owner.checkOpen()
+	}
+	result := append([]byte(nil), byteView(p, n)...)
+	runtime.KeepAlive(o.keepalive)
+	return result
 }

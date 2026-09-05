@@ -70,7 +70,9 @@ type HDRScaler struct {
 // NewHDRScaler validates the configuration, builds tone-mapping LUTs, allocates
 // outputs, and returns a ready HDRScaler.
 func NewHDRScaler(cfg HDRConfig) (*HDRScaler, error) {
-	if !validDimensions(cfg.SrcWidth, cfg.SrcHeight) { return nil, ErrBadDimensions }
+	if !validDimensions(cfg.SrcWidth, cfg.SrcHeight) {
+		return nil, ErrBadDimensions
+	}
 	ensureDetect()
 
 	if n := len(cfg.Tonemap.CustomLUT); n != 0 && n != 1024 {
@@ -151,13 +153,14 @@ func (h *HDRScaler) Run(f *HDRFrame) {
 	if f.y == nil {
 		panic("funnelcake: Run with a closed HDRFrame")
 	}
-	if f.Width != h.srcWidth || f.Height != h.srcHeight || f.Format != h.format {
+	if f.width != h.srcWidth || f.height != h.srcHeight || f.format != h.format {
 		panic(fmt.Sprintf("funnelcake: frame %dx%d fmt=%d does not match scaler %dx%d fmt=%d",
-			f.Width, f.Height, f.Format, h.srcWidth, h.srcHeight, h.format))
+			f.width, f.height, f.format, h.srcWidth, h.srcHeight, h.format))
 	}
 	C.fused_hdr_run(h.ctx,
 		(*C.uint16_t)(f.y), (*C.uint16_t)(f.u), (*C.uint16_t)(f.v))
 	runtime.KeepAlive(f)
+	runtime.KeepAlive(h)
 }
 
 // checkOpen panics with a clear message if the scaler has been closed.
@@ -176,7 +179,7 @@ func (h *HDRScaler) EffectiveHeight() int { h.checkOpen(); return int(h.ctx.effe
 // HDROutput returns the 10-bit HDR output for a downscale flag.
 func (h *HDRScaler) HDROutput(flag ScaleFlag) (HDROutput, bool) {
 	h.checkOpen()
-	if flag == 0 || flag & (flag-1) != 0 || uint32(h.ctx.achieved_hdr_flags)&uint32(flag) == 0 {
+	if flag == 0 || flag&(flag-1) != 0 || uint32(h.ctx.achieved_hdr_flags)&uint32(flag) == 0 {
 		return HDROutput{}, false
 	}
 	idx := bits.TrailingZeros32(uint32(flag))
@@ -188,7 +191,7 @@ func (h *HDRScaler) HDROutput(flag ScaleFlag) (HDROutput, bool) {
 // SDROutput returns the 8-bit tone-mapped output for a downscale flag.
 func (h *HDRScaler) SDROutput(flag ScaleFlag) (Output, bool) {
 	h.checkOpen()
-	if flag == 0 || flag & (flag-1) != 0 || uint32(h.ctx.achieved_sdr_flags)&uint32(flag) == 0 {
+	if flag == 0 || flag&(flag-1) != 0 || uint32(h.ctx.achieved_sdr_flags)&uint32(flag) == 0 {
 		return Output{}, false
 	}
 	idx := bits.TrailingZeros32(uint32(flag))
@@ -211,7 +214,7 @@ func (h *HDRScaler) Tonemap1xOutput() (Output, bool) {
 // UpscaleHDROutput returns a 10-bit upscale-cascade output for a flag.
 func (h *HDRScaler) UpscaleHDROutput(flag UpscaleFlag) (HDROutput, bool) {
 	h.checkOpen()
-	if flag == 0 || flag & (flag-1) != 0 || uint32(h.ctx.achieved_upscale_flags)&uint32(flag) == 0 {
+	if flag == 0 || flag&(flag-1) != 0 || uint32(h.ctx.achieved_upscale_flags)&uint32(flag) == 0 {
 		return HDROutput{}, false
 	}
 	idx := bits.TrailingZeros32(uint32(flag))
@@ -223,7 +226,7 @@ func (h *HDRScaler) UpscaleHDROutput(flag UpscaleFlag) (HDROutput, bool) {
 // UpscaleSDROutput returns a tone-mapped 8-bit upscale-cascade output for a flag.
 func (h *HDRScaler) UpscaleSDROutput(flag UpscaleFlag) (Output, bool) {
 	h.checkOpen()
-	if flag == 0 || flag & (flag-1) != 0 || uint32(h.ctx.achieved_upscale_sdr_flags)&uint32(flag) == 0 {
+	if flag == 0 || flag&(flag-1) != 0 || uint32(h.ctx.achieved_upscale_sdr_flags)&uint32(flag) == 0 {
 		return Output{}, false
 	}
 	idx := bits.TrailingZeros32(uint32(flag))
@@ -246,9 +249,9 @@ func (h *HDRScaler) Close() {
 	runtime.SetFinalizer(h, nil)
 }
 
-// HDROutput is a read-only view of one 10-bit output plane set. Its plane
-// slices alias buffers owned by the producing HDRScaler and are valid only
-// until that scaler's next Run or Close. Strides are in bytes.
+// HDROutput describes a native 10-bit output. Plane accessors return owned
+// copies, obtained before closing the scaler. Strides are in bytes; public
+// geometry is a snapshot and never controls native access bounds.
 type HDROutput struct {
 	Width    int
 	Height   int
@@ -256,19 +259,20 @@ type HDROutput struct {
 	UVStride int
 	Fallback bool
 
-	y, u, v   unsafe.Pointer
-	chromaH   int
-	keepalive interface{} // pins the producing HDRScaler; see Output.keepalive
+	y, u, v       unsafe.Pointer
+	chromaH       int
+	ySize, uvSize int
+	keepalive     interface{} // pins the producing HDRScaler; see Output.keepalive
 }
 
-// Y returns the luma plane view as uint16 samples.
-func (o HDROutput) Y() []uint16 { return u16View(o.y, (o.YStride/2)*o.Height) }
+// Y returns the luma plane copy as uint16 samples.
+func (o HDROutput) Y() []uint16 { return o.copyPlane(o.y, o.ySize/2) }
 
-// U returns the Cb plane view as uint16 samples.
-func (o HDROutput) U() []uint16 { return u16View(o.u, (o.UVStride/2)*o.chromaH) }
+// U returns the Cb plane copy as uint16 samples.
+func (o HDROutput) U() []uint16 { return o.copyPlane(o.u, o.uvSize/2) }
 
-// V returns the Cr plane view as uint16 samples.
-func (o HDROutput) V() []uint16 { return u16View(o.v, (o.UVStride/2)*o.chromaH) }
+// V returns the Cr plane copy as uint16 samples.
+func (o HDROutput) V() []uint16 { return o.copyPlane(o.v, o.uvSize/2) }
 
 func cToHDROutput(co *C.fused_hdr_output_t) HDROutput {
 	h := int(co.height)
@@ -282,5 +286,24 @@ func cToHDROutput(co *C.fused_hdr_output_t) HDROutput {
 		u:        unsafe.Pointer(co.plane_u),
 		v:        unsafe.Pointer(co.plane_v),
 		chromaH:  chroma420Height(h),
+		ySize:    int(co.y_stride) * h,
+		uvSize:   int(co.uv_stride) * chroma420Height(h),
 	}
+}
+
+// Plane accessors return owned copies because Go slices cannot retain a
+// foreign allocation's owner or detect explicit Close after returning.
+func (o HDROutput) copyPlane(p unsafe.Pointer, n int) []uint16 {
+	if o.keepalive == nil {
+		return nil
+	}
+	switch owner := o.keepalive.(type) {
+	case *Scaler:
+		owner.checkOpen()
+	case *HDRScaler:
+		owner.checkOpen()
+	}
+	result := append([]uint16(nil), u16View(p, n)...)
+	runtime.KeepAlive(o.keepalive)
+	return result
 }

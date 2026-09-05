@@ -36,8 +36,11 @@ type Frame struct {
 	YStride  int // bytes per luma row
 	UVStride int // bytes per chroma row
 
-	y, u, v unsafe.Pointer // 32-byte-aligned C memory
-	chromaH int
+	y, u, v       unsafe.Pointer // 32-byte-aligned C memory
+	chromaH       int
+	width, height int
+	ySize, uvSize int
+	format        PixelFormat
 }
 
 // NewFrame allocates an aligned I420 frame. width and height should be even
@@ -56,9 +59,12 @@ func NewFrame(width, height int) (*Frame, error) {
 		UVStride: int(uvs),
 		chromaH:  chroma420Height(height),
 	}
-	f.y = C.fused_aligned_alloc(32, C.size_t(f.YStride*height))
-	f.u = C.fused_aligned_alloc(32, C.size_t(f.UVStride*f.chromaH))
-	f.v = C.fused_aligned_alloc(32, C.size_t(f.UVStride*f.chromaH))
+	f.width, f.height = width, height
+	f.ySize = f.YStride * height
+	f.y = alignedGoPlane(f.ySize)
+	f.uvSize = f.UVStride * f.chromaH
+	f.u = alignedGoPlane(f.uvSize)
+	f.v = alignedGoPlane(f.uvSize)
 	if f.y == nil || f.u == nil || f.v == nil {
 		f.Close()
 		return nil, errAlloc
@@ -68,26 +74,26 @@ func NewFrame(width, height int) (*Frame, error) {
 }
 
 // Y returns a writable view of the luma plane (len = YStride*Height).
-func (f *Frame) Y() []byte { return byteView(f.y, f.YStride*f.Height) }
+func (f *Frame) Y() []byte { return byteView(f.y, f.ySize) }
 
 // U returns a writable view of the Cb plane (len = UVStride*chromaHeight).
-func (f *Frame) U() []byte { return byteView(f.u, f.UVStride*f.chromaH) }
+func (f *Frame) U() []byte { return byteView(f.u, f.uvSize) }
 
 // V returns a writable view of the Cr plane (len = UVStride*chromaHeight).
-func (f *Frame) V() []byte { return byteView(f.v, f.UVStride*f.chromaH) }
+func (f *Frame) V() []byte { return byteView(f.v, f.uvSize) }
 
 // Close frees the frame's planes. Safe to call more than once.
 func (f *Frame) Close() {
 	if f.y != nil {
-		C.fused_free(f.y)
+		// Go-backed views retain their allocation after Close.
 		f.y = nil
 	}
 	if f.u != nil {
-		C.fused_free(f.u)
+
 		f.u = nil
 	}
 	if f.v != nil {
-		C.fused_free(f.v)
+
 		f.v = nil
 	}
 	runtime.SetFinalizer(f, nil)
@@ -103,8 +109,11 @@ type HDRFrame struct {
 	YStride  int // bytes per luma row
 	UVStride int // bytes per chroma row (interleaved row for P010/P210)
 
-	y, u, v unsafe.Pointer
-	chromaH int
+	y, u, v       unsafe.Pointer
+	chromaH       int
+	width, height int
+	ySize, uvSize int
+	format        PixelFormat
 }
 
 // is422 reports whether the format is a 4:2:2 layout (chroma at full height).
@@ -133,18 +142,23 @@ func NewHDRFrame(width, height int, format PixelFormat) (*HDRFrame, error) {
 		Width:   width,
 		Height:  height,
 		Format:  format,
+		format:  format,
 		YStride: int(ys),
 		chromaH: chromaH,
 	}
-	f.y = C.fused_aligned_alloc(32, C.size_t(f.YStride*height))
+	f.width, f.height = width, height
+	f.ySize = f.YStride * height
+	f.y = alignedGoPlane(f.ySize)
 	if format.isSemiPlanar() {
 		// Interleaved UV row is the same byte width as a luma row.
 		f.UVStride = int(ys)
-		f.u = C.fused_aligned_alloc(32, C.size_t(f.UVStride*chromaH))
+		f.uvSize = f.UVStride * chromaH
+		f.u = alignedGoPlane(f.uvSize)
 	} else {
 		f.UVStride = int(uvs)
-		f.u = C.fused_aligned_alloc(32, C.size_t(f.UVStride*chromaH))
-		f.v = C.fused_aligned_alloc(32, C.size_t(f.UVStride*chromaH))
+		f.uvSize = f.UVStride * chromaH
+		f.u = alignedGoPlane(f.uvSize)
+		f.v = alignedGoPlane(f.uvSize)
 	}
 	if f.y == nil || f.u == nil || (!format.isSemiPlanar() && f.v == nil) {
 		f.Close()
@@ -155,26 +169,26 @@ func NewHDRFrame(width, height int, format PixelFormat) (*HDRFrame, error) {
 }
 
 // Y returns a writable view of the luma plane as uint16 samples.
-func (f *HDRFrame) Y() []uint16 { return u16View(f.y, (f.YStride/2)*f.Height) }
+func (f *HDRFrame) Y() []uint16 { return u16View(f.y, f.ySize/2) }
 
 // U returns the Cb plane (I010/I210) or the interleaved UV plane (P010/P210).
-func (f *HDRFrame) U() []uint16 { return u16View(f.u, (f.UVStride/2)*f.chromaH) }
+func (f *HDRFrame) U() []uint16 { return u16View(f.u, f.uvSize/2) }
 
 // V returns the Cr plane for planar formats, or nil for P010/P210.
-func (f *HDRFrame) V() []uint16 { return u16View(f.v, (f.UVStride/2)*f.chromaH) }
+func (f *HDRFrame) V() []uint16 { return u16View(f.v, f.uvSize/2) }
 
 // Close frees the frame's planes. Safe to call more than once.
 func (f *HDRFrame) Close() {
 	if f.y != nil {
-		C.fused_free(f.y)
+		// Go-backed views retain their allocation after Close.
 		f.y = nil
 	}
 	if f.u != nil {
-		C.fused_free(f.u)
+
 		f.u = nil
 	}
 	if f.v != nil {
-		C.fused_free(f.v)
+
 		f.v = nil
 	}
 	runtime.SetFinalizer(f, nil)
@@ -194,6 +208,13 @@ func u16View(p unsafe.Pointer, n int) []uint16 {
 		return nil
 	}
 	return unsafe.Slice((*uint16)(p), n)
+}
+
+// Go allocations keep exported slices alive independently of their Frame.
+func alignedGoPlane(n int) unsafe.Pointer {
+	backing := make([]byte, n+31)
+	offset := (-uintptr(unsafe.Pointer(&backing[0]))) & 31
+	return unsafe.Pointer(&backing[offset])
 }
 
 func validDimensions(width, height int) bool {

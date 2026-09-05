@@ -12,8 +12,8 @@
 // SIMD kernels require — correct by construction, so you never compute a stride
 // or call aligned_alloc yourself.
 //
-// Buffers produced by a Scaler/HDRScaler are owned by that scaler and remain
-// valid only until the next Run or Close. Copy anything you need to keep.
+// Output plane accessors return owned Go slices. Obtain them before closing
+// the scaler; the returned data survives later Run and Close calls.
 package funnelcake
 
 /*

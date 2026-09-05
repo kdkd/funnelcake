@@ -381,18 +381,20 @@ $(SHLIB): $(LIB_OBJS)
 
 # pkg-config file generated at build time so that downstream consumers
 # can do `pkg-config --cflags --libs funnelcake`.
-funnelcake.pc:
-	@echo 'prefix=$(PREFIX)'                              >  $@
-	@echo 'exec_prefix=$${prefix}'                        >> $@
-	@echo 'libdir=$(LIBDIR)'                              >> $@
-	@echo 'includedir=$(INCLUDEDIR)'                      >> $@
-	@echo ''                                              >> $@
-	@echo 'Name: funnelcake'                              >> $@
-	@echo 'Description: SIMD YUV scaler with HDR/SDR tonemapping' >> $@
-	@echo 'Version: $(VERSION)'                           >> $@
-	@echo 'Cflags: -I$${includedir}'                      >> $@
-	@echo 'Libs: -L$${libdir} -lfunnelcake'               >> $@
-	@echo 'Libs.private: -lm'                             >> $@
+funnelcake.pc: FORCE
+	@echo 'prefix=$(PREFIX)'                              >  $@.tmp
+	@echo 'exec_prefix=$${prefix}'                        >> $@.tmp
+	@echo 'libdir=$(LIBDIR)'                              >> $@.tmp
+	@echo 'includedir=$(INCLUDEDIR)'                      >> $@.tmp
+	@echo ''                                              >> $@.tmp
+	@echo 'Name: funnelcake'                              >> $@.tmp
+	@echo 'Description: SIMD YUV scaler with HDR/SDR tonemapping' >> $@.tmp
+	@echo 'Version: $(VERSION)'                           >> $@.tmp
+	@echo 'Cflags: -I$${includedir}'                      >> $@.tmp
+	@echo 'Libs: -L$${libdir} -lfunnelcake'               >> $@.tmp
+	@echo 'Libs.private: -lm'                             >> $@.tmp
+
+	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv -f $@.tmp $@
 
 install: lib shared funnelcake.pc
 	$(INSTALL) -d $(DESTDIR)$(LIBDIR)

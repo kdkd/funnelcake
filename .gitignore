@@ -28,3 +28,5 @@ docs/superpowers/
 
 .build-config
 .build-config.tmp
+funnelcake.pc
+funnelcake.pc.tmp

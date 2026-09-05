@@ -176,7 +176,7 @@ func (h *HDRScaler) EffectiveHeight() int { h.checkOpen(); return int(h.ctx.effe
 // HDROutput returns the 10-bit HDR output for a downscale flag.
 func (h *HDRScaler) HDROutput(flag ScaleFlag) (HDROutput, bool) {
 	h.checkOpen()
-	if uint32(h.ctx.achieved_hdr_flags)&uint32(flag) == 0 {
+	if flag == 0 || flag & (flag-1) != 0 || uint32(h.ctx.achieved_hdr_flags)&uint32(flag) == 0 {
 		return HDROutput{}, false
 	}
 	idx := bits.TrailingZeros32(uint32(flag))
@@ -188,7 +188,7 @@ func (h *HDRScaler) HDROutput(flag ScaleFlag) (HDROutput, bool) {
 // SDROutput returns the 8-bit tone-mapped output for a downscale flag.
 func (h *HDRScaler) SDROutput(flag ScaleFlag) (Output, bool) {
 	h.checkOpen()
-	if uint32(h.ctx.achieved_sdr_flags)&uint32(flag) == 0 {
+	if flag == 0 || flag & (flag-1) != 0 || uint32(h.ctx.achieved_sdr_flags)&uint32(flag) == 0 {
 		return Output{}, false
 	}
 	idx := bits.TrailingZeros32(uint32(flag))
@@ -211,7 +211,7 @@ func (h *HDRScaler) Tonemap1xOutput() (Output, bool) {
 // UpscaleHDROutput returns a 10-bit upscale-cascade output for a flag.
 func (h *HDRScaler) UpscaleHDROutput(flag UpscaleFlag) (HDROutput, bool) {
 	h.checkOpen()
-	if uint32(h.ctx.achieved_upscale_flags)&uint32(flag) == 0 {
+	if flag == 0 || flag & (flag-1) != 0 || uint32(h.ctx.achieved_upscale_flags)&uint32(flag) == 0 {
 		return HDROutput{}, false
 	}
 	idx := bits.TrailingZeros32(uint32(flag))
@@ -223,7 +223,7 @@ func (h *HDRScaler) UpscaleHDROutput(flag UpscaleFlag) (HDROutput, bool) {
 // UpscaleSDROutput returns a tone-mapped 8-bit upscale-cascade output for a flag.
 func (h *HDRScaler) UpscaleSDROutput(flag UpscaleFlag) (Output, bool) {
 	h.checkOpen()
-	if uint32(h.ctx.achieved_upscale_sdr_flags)&uint32(flag) == 0 {
+	if flag == 0 || flag & (flag-1) != 0 || uint32(h.ctx.achieved_upscale_sdr_flags)&uint32(flag) == 0 {
 		return Output{}, false
 	}
 	idx := bits.TrailingZeros32(uint32(flag))

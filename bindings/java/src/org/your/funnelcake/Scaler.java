@@ -128,7 +128,7 @@ public final class Scaler implements AutoCloseable {
 
     /** The downscale output for a single flag, and whether it was produced. */
     public Optional<Output> output(int flag) {
-        if ((achievedFlags() & flag) == 0) {
+        if (Integer.bitCount(flag) != 1 || ((achievedFlags() & flag) == 0)) {
             return Optional.empty();
         }
         int idx = Integer.numberOfTrailingZeros(flag);
@@ -137,7 +137,7 @@ public final class Scaler implements AutoCloseable {
 
     /** An upscale-cascade output for a single flag. */
     public Optional<Output> upscaleOutput(int flag) {
-        if ((ctx.get(JAVA_INT, Native.SC_achieved_upscale_flags) & flag) == 0) {
+        if (Integer.bitCount(flag) != 1 || ((ctx.get(JAVA_INT, Native.SC_achieved_upscale_flags) & flag) == 0)) {
             return Optional.empty();
         }
         int idx = Integer.numberOfTrailingZeros(flag);

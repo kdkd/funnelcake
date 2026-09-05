@@ -51,6 +51,7 @@ public final class FunnelcakeTest {
 
             s.run(f);
 
+            check("combined output flags rejected", s.output(Funnelcake.SCALE_2X | Funnelcake.SCALE_4X).isEmpty());
             Optional<Output> opt = s.output(Funnelcake.SCALE_2X);
             check("SDR 2x produced", opt.isPresent());
             if (opt.isEmpty()) {

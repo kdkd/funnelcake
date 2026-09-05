@@ -272,3 +272,7 @@ def validate_dimensions(width, height):
             or width > 33554431 or height > 33554431
             or ((width * 2 + 31) & ~31) * height > 2147483647):
         raise ValueError("frame dimensions must be positive, even and fit native indexing")
+
+
+def single_flag(flag):
+    return isinstance(flag, int) and 0 < flag <= 0xffffffff and flag & (flag - 1) == 0

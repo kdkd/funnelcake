@@ -169,13 +169,13 @@ class HdrScaler:
 
     def hdr_output(self, flag: int) -> Optional[HdrOutput]:
         """The 10-bit HDR output for a downscale flag, or None."""
-        if not (self._ctx.achieved_hdr_flags & int(flag)):
+        if not _native.single_flag(flag) or not (self._ctx.achieved_hdr_flags & int(flag)):
             return None
         return _hdr_output_from(self._ctx.hdr_outputs[_trailing_zeros(int(flag))], self)
 
     def sdr_output(self, flag: int) -> Optional[Output]:
         """The tone-mapped 8-bit output for a downscale flag, or None."""
-        if not (self._ctx.achieved_sdr_flags & int(flag)):
+        if not _native.single_flag(flag) or not (self._ctx.achieved_sdr_flags & int(flag)):
             return None
         return _output_from(self._ctx.sdr_outputs[_trailing_zeros(int(flag))], self)
 
@@ -186,12 +186,12 @@ class HdrScaler:
         return _output_from(self._ctx.output_1x, self)
 
     def upscale_hdr_output(self, flag: int) -> Optional[HdrOutput]:
-        if not (self._ctx.achieved_upscale_flags & int(flag)):
+        if not _native.single_flag(flag) or not (self._ctx.achieved_upscale_flags & int(flag)):
             return None
         return _hdr_output_from(self._ctx.upscale_hdr_outputs[_trailing_zeros(int(flag))], self)
 
     def upscale_sdr_output(self, flag: int) -> Optional[Output]:
-        if not (self._ctx.achieved_upscale_sdr_flags & int(flag)):
+        if not _native.single_flag(flag) or not (self._ctx.achieved_upscale_sdr_flags & int(flag)):
             return None
         return _output_from(self._ctx.upscale_sdr_outputs[_trailing_zeros(int(flag))], self)
 

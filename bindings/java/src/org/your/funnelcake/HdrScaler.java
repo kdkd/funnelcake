@@ -187,7 +187,7 @@ public final class HdrScaler implements AutoCloseable {
 
     /** The 10-bit HDR output for a downscale flag. */
     public Optional<HdrOutput> hdrOutput(int flag) {
-        if ((ctx.get(JAVA_INT, Native.HC_achieved_hdr_flags) & flag) == 0) {
+        if (Integer.bitCount(flag) != 1 || ((ctx.get(JAVA_INT, Native.HC_achieved_hdr_flags) & flag) == 0)) {
             return Optional.empty();
         }
         int idx = Integer.numberOfTrailingZeros(flag);
@@ -196,7 +196,7 @@ public final class HdrScaler implements AutoCloseable {
 
     /** The tone-mapped 8-bit output for a downscale flag. */
     public Optional<Output> sdrOutput(int flag) {
-        if ((ctx.get(JAVA_INT, Native.HC_achieved_sdr_flags) & flag) == 0) {
+        if (Integer.bitCount(flag) != 1 || ((ctx.get(JAVA_INT, Native.HC_achieved_sdr_flags) & flag) == 0)) {
             return Optional.empty();
         }
         int idx = Integer.numberOfTrailingZeros(flag);
@@ -213,7 +213,7 @@ public final class HdrScaler implements AutoCloseable {
 
     /** A 10-bit upscale-cascade output for a flag. */
     public Optional<HdrOutput> upscaleHdrOutput(int flag) {
-        if ((ctx.get(JAVA_INT, Native.HC_achieved_upscale_flags) & flag) == 0) {
+        if (Integer.bitCount(flag) != 1 || ((ctx.get(JAVA_INT, Native.HC_achieved_upscale_flags) & flag) == 0)) {
             return Optional.empty();
         }
         int idx = Integer.numberOfTrailingZeros(flag);
@@ -222,7 +222,7 @@ public final class HdrScaler implements AutoCloseable {
 
     /** A tone-mapped 8-bit upscale-cascade output for a flag. */
     public Optional<Output> upscaleSdrOutput(int flag) {
-        if ((ctx.get(JAVA_INT, Native.HC_achieved_upscale_sdr_flags) & flag) == 0) {
+        if (Integer.bitCount(flag) != 1 || ((ctx.get(JAVA_INT, Native.HC_achieved_upscale_sdr_flags) & flag) == 0)) {
             return Optional.empty();
         }
         int idx = Integer.numberOfTrailingZeros(flag);

@@ -113,7 +113,7 @@ impl Scaler {
 
     /// The downscale output for a single `SCALE_*` flag.
     pub fn output(&self, flag: u32) -> Option<Output<'_>> {
-        if self.ctx.achieved_flags & flag == 0 {
+        if !flag.is_power_of_two() || self.ctx.achieved_flags & flag == 0 {
             return None;
         }
         let idx = flag.trailing_zeros() as usize;
@@ -122,7 +122,7 @@ impl Scaler {
 
     /// An upscale-cascade output for a single `UPSCALE_*` flag.
     pub fn upscale_output(&self, flag: u32) -> Option<Output<'_>> {
-        if self.ctx.achieved_upscale_flags & flag == 0 {
+        if !flag.is_power_of_two() || self.ctx.achieved_upscale_flags & flag == 0 {
             return None;
         }
         let idx = flag.trailing_zeros() as usize;

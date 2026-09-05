@@ -126,13 +126,13 @@ class Scaler:
 
     def output(self, flag: int) -> Optional[Output]:
         """The downscale output for a single ``Scale.*`` flag, or None."""
-        if not (self._ctx.achieved_flags & int(flag)):
+        if not _native.single_flag(flag) or not (self._ctx.achieved_flags & int(flag)):
             return None
         return _output_from(self._ctx.outputs[_trailing_zeros(int(flag))], self)
 
     def upscale_output(self, flag: int) -> Optional[Output]:
         """An upscale-cascade output for a single ``Upscale.*`` flag, or None."""
-        if not (self._ctx.achieved_upscale_flags & int(flag)):
+        if not _native.single_flag(flag) or not (self._ctx.achieved_upscale_flags & int(flag)):
             return None
         return _output_from(self._ctx.upscale_outputs[_trailing_zeros(int(flag))], self)
 

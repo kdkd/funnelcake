@@ -120,7 +120,7 @@ func (s *Scaler) AchievedFlags() ScaleFlag { s.checkOpen(); return ScaleFlag(s.c
 // produced.
 func (s *Scaler) Output(flag ScaleFlag) (Output, bool) {
 	s.checkOpen()
-	if uint32(s.ctx.achieved_flags)&uint32(flag) == 0 {
+	if flag == 0 || flag & (flag-1) != 0 || uint32(s.ctx.achieved_flags)&uint32(flag) == 0 {
 		return Output{}, false
 	}
 	idx := bits.TrailingZeros32(uint32(flag))
@@ -132,7 +132,7 @@ func (s *Scaler) Output(flag ScaleFlag) (Output, bool) {
 // UpscaleOutput returns an upscale-cascade output for a single flag.
 func (s *Scaler) UpscaleOutput(flag UpscaleFlag) (Output, bool) {
 	s.checkOpen()
-	if uint32(s.ctx.achieved_upscale_flags)&uint32(flag) == 0 {
+	if flag == 0 || flag & (flag-1) != 0 || uint32(s.ctx.achieved_upscale_flags)&uint32(flag) == 0 {
 		return Output{}, false
 	}
 	idx := bits.TrailingZeros32(uint32(flag))

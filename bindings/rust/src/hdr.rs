@@ -155,7 +155,7 @@ impl HdrScaler {
 
     /// The 10-bit HDR output for a downscale flag.
     pub fn hdr_output(&self, flag: u32) -> Option<HdrOutput<'_>> {
-        if self.ctx.achieved_hdr_flags & flag == 0 {
+        if !flag.is_power_of_two() || self.ctx.achieved_hdr_flags & flag == 0 {
             return None;
         }
         let idx = flag.trailing_zeros() as usize;
@@ -164,7 +164,7 @@ impl HdrScaler {
 
     /// The tone-mapped 8-bit output for a downscale flag.
     pub fn sdr_output(&self, flag: u32) -> Option<crate::Output<'_>> {
-        if self.ctx.achieved_sdr_flags & flag == 0 {
+        if !flag.is_power_of_two() || self.ctx.achieved_sdr_flags & flag == 0 {
             return None;
         }
         let idx = flag.trailing_zeros() as usize;
@@ -181,7 +181,7 @@ impl HdrScaler {
 
     /// A 10-bit upscale-cascade output for a flag.
     pub fn upscale_hdr_output(&self, flag: u32) -> Option<HdrOutput<'_>> {
-        if self.ctx.achieved_upscale_flags & flag == 0 {
+        if !flag.is_power_of_two() || self.ctx.achieved_upscale_flags & flag == 0 {
             return None;
         }
         let idx = flag.trailing_zeros() as usize;
@@ -190,7 +190,7 @@ impl HdrScaler {
 
     /// A tone-mapped 8-bit upscale-cascade output for a flag.
     pub fn upscale_sdr_output(&self, flag: u32) -> Option<crate::Output<'_>> {
-        if self.ctx.achieved_upscale_sdr_flags & flag == 0 {
+        if !flag.is_power_of_two() || self.ctx.achieved_upscale_sdr_flags & flag == 0 {
             return None;
         }
         let idx = flag.trailing_zeros() as usize;

@@ -315,6 +315,7 @@ void fused_scaler_free(fused_scaler_ctx_t *ctx);
 int fused_simd_available(void);
 
 
+
 /* ==========================================================================
  * HDR10 API - 10-bit scaling with optional tone mapping to SDR
  *
@@ -544,6 +545,17 @@ void fused_hdr_run(fused_hdr_ctx_t *ctx,
  */
 void fused_hdr_free(fused_hdr_ctx_t *ctx);
 
+
+/* Allocation-free planning. Uses init's validation, geometry and dispatch.
+ * On success, layout contains output sizes, strides, fallback and achieved /
+ * rejected flags, with NULL plane and internal pointers. memory_bytes is the
+ * total requested heap storage (outputs, intermediates, scratch and state),
+ * excluding allocator overhead. No output arguments change on hard error.
+ * Do not run a query layout. The input configuration is never modified. */
+int fused_scaler_query(const fused_scaler_ctx_t *config,
+                       fused_scaler_ctx_t *layout, size_t *memory_bytes);
+int fused_hdr_query(const fused_hdr_ctx_t *config,
+                    fused_hdr_ctx_t *layout, size_t *memory_bytes);
 
 #ifdef __cplusplus
 } /* extern "C" */

@@ -12,6 +12,7 @@
 #include "funnelcake.h"
 
 #include <stddef.h>
+#include <string.h>
 #include <stdlib.h>     /* posix_memalign */
 #if defined(__linux__)
 #  include <sys/mman.h> /* madvise, MADV_HUGEPAGE */
@@ -45,6 +46,21 @@ static inline int fused_alloc_aligned(void **out, size_t alignment, size_t size)
         (void)madvise(*out, size, MADV_HUGEPAGE);
     }
 #endif
+    return rc;
+}
+
+/* Init and query share allocation accounting. A query records bytes and
+ * leaves pointers NULL; no pixel or scratch storage is touched. */
+static inline int fused_init_alloc(void **out, size_t alignment, size_t size,
+                                   size_t *planned)
+{
+    if (planned) {
+        if (size > SIZE_MAX - *planned) return -1;
+        *planned += size;
+        *out = NULL;
+        return 0;
+    }
+    int rc = fused_alloc_aligned(out, alignment, size);
     return rc;
 }
 

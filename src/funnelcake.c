@@ -61,7 +61,8 @@ static int stride_for(int width) {
  * fused_scaler_init
  * -------------------------------------------------------------------------- */
 
-int fused_scaler_init(fused_scaler_ctx_t *ctx)
+static int fused_scaler_init_impl(fused_scaler_ctx_t *ctx, size_t *planned,
+                                fused_internal_t *query_state)
 {
     if (!ctx) return FUSED_ERR_BAD_DIMENSIONS;
 
@@ -296,7 +297,7 @@ int fused_scaler_init(fused_scaler_ctx_t *ctx)
         static atomic_int g_no_simd_warned = 0;
         const char *force_scalar_env = getenv("FUNNELCAKE_FORCE_SCALAR");
         int forced_scalar = (force_scalar_env != NULL && force_scalar_env[0] != '\0');
-        if (!forced_scalar && !atomic_exchange(&g_no_simd_warned, 1)) {
+        if (!planned && !forced_scalar && !atomic_exchange(&g_no_simd_warned, 1)) {
             fprintf(stderr,
                 "funnelcake: no SIMD support detected; using scalar kernel\n");
         }
@@ -380,9 +381,9 @@ int fused_scaler_init(fused_scaler_ctx_t *ctx)
         int chroma_h  = out_h / 2;
 
         void *py = NULL, *pu = NULL, *pv = NULL;
-        if (fused_alloc_aligned(&py, 32, (size_t)y_stride  * (size_t)out_h)  != 0 ||
-            fused_alloc_aligned(&pu, 32, (size_t)uv_stride * (size_t)chroma_h) != 0 ||
-            fused_alloc_aligned(&pv, 32, (size_t)uv_stride * (size_t)chroma_h) != 0) {
+        if (fused_init_alloc(&py, 32, (size_t)y_stride  * (size_t)out_h, planned)  != 0 ||
+            fused_init_alloc(&pu, 32, (size_t)uv_stride * (size_t)chroma_h, planned) != 0 ||
+            fused_init_alloc(&pv, 32, (size_t)uv_stride * (size_t)chroma_h, planned) != 0) {
             /* Allocation failure - free what we got and reject this step */
             free(py); free(pu); free(pv);
             fused_log(&ctx->log_warnings, FUSED_LOG_WARN,
@@ -445,9 +446,9 @@ int fused_scaler_init(fused_scaler_ctx_t *ctx)
         int chroma_h  = up_h / 2;
 
         void *py = NULL, *pu = NULL, *pv = NULL;
-        if (fused_alloc_aligned(&py, 32, (size_t)y_stride  * (size_t)up_h)   != 0 ||
-            fused_alloc_aligned(&pu, 32, (size_t)uv_stride * (size_t)chroma_h) != 0 ||
-            fused_alloc_aligned(&pv, 32, (size_t)uv_stride * (size_t)chroma_h) != 0) {
+        if (fused_init_alloc(&py, 32, (size_t)y_stride  * (size_t)up_h, planned)   != 0 ||
+            fused_init_alloc(&pu, 32, (size_t)uv_stride * (size_t)chroma_h, planned) != 0 ||
+            fused_init_alloc(&pv, 32, (size_t)uv_stride * (size_t)chroma_h, planned) != 0) {
             free(py); free(pu); free(pv);
             fused_log(&ctx->log_warnings, FUSED_LOG_WARN,
                 "funnelcake: upscale level %dx rejected: out-of-memory\n",
@@ -517,9 +518,9 @@ int fused_scaler_init(fused_scaler_ctx_t *ctx)
         int chroma_h    = tail_h / 2;
 
         void *py = NULL, *pu = NULL, *pv = NULL;
-        if (fused_alloc_aligned(&py, 32, (size_t)y_stride  * (size_t)tail_h)   != 0 ||
-            fused_alloc_aligned(&pu, 32, (size_t)uv_stride * (size_t)chroma_h) != 0 ||
-            fused_alloc_aligned(&pv, 32, (size_t)uv_stride * (size_t)chroma_h) != 0) {
+        if (fused_init_alloc(&py, 32, (size_t)y_stride  * (size_t)tail_h, planned)   != 0 ||
+            fused_init_alloc(&pu, 32, (size_t)uv_stride * (size_t)chroma_h, planned) != 0 ||
+            fused_init_alloc(&pv, 32, (size_t)uv_stride * (size_t)chroma_h, planned) != 0) {
             free(py); free(pu); free(pv);
             fused_log(&ctx->log_warnings, FUSED_LOG_WARN,
                 "funnelcake: upscale 1.5x tail rejected: out-of-memory\n");
@@ -567,7 +568,8 @@ tail_done:
     /* 7. Build kernel params and internal state                            */
     /* ------------------------------------------------------------------ */
 
-    fused_internal_t *state = calloc(1, sizeof(fused_internal_t));
+    fused_internal_t *state = planned ? query_state : calloc(1, sizeof(fused_internal_t));
+    if (planned) *planned += sizeof(fused_internal_t);
     if (!state) {
         fused_scaler_free(ctx);
         fused_log(&ctx->log_errors, FUSED_LOG_ERROR,
@@ -654,9 +656,9 @@ tail_done:
              * Each row is 64-byte aligned so both stay SIMD-friendly. */
             size_t row = (size_t)((max_scratch_w + 63) & ~63);
             void *sp = NULL;
-            if (posix_memalign(&sp, 64, row * 2) == 0) {
+            if (fused_init_alloc(&sp, 64, row * 2, planned) == 0) {
                 p->upscale_scratch  = (uint8_t *)sp;
-                p->upscale_scratch2 = (uint8_t *)sp + row;
+                p->upscale_scratch2 = sp ? (uint8_t *)sp + row : NULL;
             } else {
                 fused_log(&ctx->log_warnings, FUSED_LOG_WARN,
                     "funnelcake: failed to allocate upscale scratch buffer\n");
@@ -699,7 +701,7 @@ tail_done:
         if (pool_bytes > 0) {
             void *sp = NULL;
             size_t aligned_bytes = (pool_bytes + 63) & ~(size_t)63;
-            if (posix_memalign(&sp, 64, aligned_bytes) == 0) {
+            if (fused_init_alloc(&sp, 64, aligned_bytes, planned) == 0) {
                 p->scratch_pool      = (uint8_t *)sp;
                 p->scratch_pool_size = aligned_bytes;
             } else {
@@ -744,7 +746,7 @@ tail_done:
     }
     state->has_simd = has_simd;
 
-    ctx->_internal = state;
+    ctx->_internal = planned ? NULL : state;
 
     return warn_bits;  /* 0 == FUSED_OK if nothing was warned */
 }
@@ -832,4 +834,29 @@ void fused_scaler_free(fused_scaler_ctx_t *ctx)
     ctx->rejected_flags         = 0;
     ctx->achieved_upscale_flags = 0;
     ctx->achieved_upscale_tail  = 0;
+}
+
+int fused_scaler_init(fused_scaler_ctx_t *ctx)
+{
+    return fused_scaler_init_impl(ctx, NULL, NULL);
+}
+
+int fused_scaler_query(const fused_scaler_ctx_t *config, fused_scaler_ctx_t *layout,
+                        size_t *memory_bytes)
+{
+    if (!config || !layout || !memory_bytes) return FUSED_ERR_BAD_DIMENSIONS;
+    fused_scaler_ctx_t copy = *config;
+    fused_internal_t state = {0};
+    copy._internal = NULL;
+    memset(copy.outputs, 0, sizeof(copy.outputs));
+    memset(copy.upscale_outputs, 0, sizeof(copy.upscale_outputs));
+    copy.log_errors.target = FUSED_LOG_SUPPRESS;
+    copy.log_warnings.target = FUSED_LOG_SUPPRESS;
+    size_t bytes = 0;
+    int rc = fused_scaler_init_impl(&copy, &bytes, &state);
+    if (rc >= 0) {
+        *layout = copy;
+        *memory_bytes = bytes;
+    }
+    return rc;
 }

@@ -1305,3 +1305,39 @@ fused_hdr_free(&hdr);
 
 Note: `frame->linesize[0]` must be 32-byte aligned. Frames decoded from
 HEVC Main10 streams at standard resolutions are typically already aligned.
+
+## Planning without allocating frame buffers
+
+`fused_scaler_query(config, layout, memory_bytes)` and
+`fused_hdr_query(config, layout, memory_bytes)` use the same validation and
+output geometry decisions as initialization. They return the same warning and
+error codes, except that they cannot encounter output-allocation failures.
+The input context is not modified, and the output arguments are unchanged on
+hard error. Initialize the configuration as you would for `init`.
+
+On success, `layout` contains effective dimensions, achieved/rejected flags,
+output widths, heights, strides, and fallback decisions. All plane pointers
+and `_internal` are NULL. A query layout cannot be passed to `run`.
+
+`memory_bytes` estimates the requested heap bytes for outputs, intermediate
+planes, scratch buffers, and internal state. It excludes allocator overhead
+and caller-owned input frames. Query mode uses stack state and allocates no
+frame, scratch, or context storage. First use can still perform the normal CPU
+capability probe. This estimate is useful for checking a memory budget before
+initializing a large upscale cascade.
+
+```c
+fused_scaler_ctx_t layout;
+size_t memory_bytes;
+int rc = fused_scaler_query(&config, &layout, &memory_bytes);
+if (rc >= 0) {
+    printf("effective source: %dx%d, memory: %zu bytes\n",
+           layout.effective_width, layout.effective_height, memory_bytes);
+}
+```
+
+Source dimensions must be positive and even, at most `INT_MAX / 64`, and source
+stride times height must fit `INT_MAX`. These representability limits keep
+kernel row offsets and scale arithmetic within their native integer range.
+Binding frame constructors check these limits before native integer conversion
+and allocation. The existing 16384-pixel upscale output limit still applies.

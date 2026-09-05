@@ -166,9 +166,18 @@ static int run_sdr_capture(int src_w, int src_h, uint32_t down_flags,
                                   p->uv_stride, 1);
     }
 
+    int failed = 0;
+    for (int i = 0; i < 8; i++) {
+        captured_plane_t *p = &out->down[i];
+        if (p->present && (!p->y || !p->u || !p->v)) failed = 1;
+    }
+    for (int i = 0; i < FUSED_MAX_UPSCALE_STEPS; i++) {
+        captured_plane_t *p = &out->up[i];
+        if (p->present && (!p->y || !p->u || !p->v)) failed = 1;
+    }
     fused_scaler_free(&ctx);
     test_frame_free(&frame);
-    return 0;
+    return failed ? -1 : 0;
 }
 
 /* --------------------------------------------------------------------------
@@ -242,9 +251,18 @@ static int run_hdr_capture(int src_w, int src_h, uint32_t down_flags,
                                   p->uv_stride, 2);
     }
 
+    int failed = 0;
+    for (int i = 0; i < 8; i++) {
+        captured_plane_t *p = &out->hdr_down[i];
+        if (p->present && (!p->y || !p->u || !p->v)) failed = 1;
+    }
+    for (int i = 0; i < FUSED_MAX_UPSCALE_STEPS; i++) {
+        captured_plane_t *p = &out->hdr_up[i];
+        if (p->present && (!p->y || !p->u || !p->v)) failed = 1;
+    }
     fused_hdr_free(&ctx);
     test_hdr_frame_free(&frame);
-    return 0;
+    return failed ? -1 : 0;
 }
 
 /* --------------------------------------------------------------------------
@@ -264,7 +282,6 @@ static int compare_plane_bytes(const void *a, const void *b, int w, int h,
                                int el_size, int plane_idx, char label,
                                parity_diff_t *first_diff)
 {
-    if (a == NULL && b == NULL) return 0;
     if (a == NULL || b == NULL) {
         first_diff->plane_idx = plane_idx;
         first_diff->plane_label = label;
@@ -466,7 +483,7 @@ static int test_sdr_workload(const sdr_workload_t *w)
     int rc = run_sdr_capture(w->w, w->h, w->down_flags, w->up_flags,
                              w->up_tail, /*seed=*/0xC0FFEE, &scalar_out);
     if (rc < 0) {
-        printf("\n  FAIL [%s] scalar run init failed: rc=%d\n", w->label, rc);
+        printf("\n  FAIL [%s] scalar init or capture failed: rc=%d\n", w->label, rc);
         capture_free(&scalar_out);
         force_scalar_off();
         return -1;
@@ -477,7 +494,7 @@ static int test_sdr_workload(const sdr_workload_t *w)
     rc = run_sdr_capture(w->w, w->h, w->down_flags, w->up_flags,
                          w->up_tail, /*seed=*/0xC0FFEE, &simd_out);
     if (rc < 0) {
-        printf("\n  FAIL [%s] simd run init failed: rc=%d\n", w->label, rc);
+        printf("\n  FAIL [%s] simd init or capture failed: rc=%d\n", w->label, rc);
         capture_free(&scalar_out);
         capture_free(&simd_out);
         return -1;
@@ -540,7 +557,7 @@ static int test_hdr_workload(const hdr_workload_t *w)
     int rc = run_hdr_capture(w->w, w->h, w->down_flags, w->up_flags,
                              w->up_tail, /*seed=*/0xC0FFEE, &scalar_out);
     if (rc < 0) {
-        printf("\n  FAIL [%s] scalar run init failed: rc=%d\n", w->label, rc);
+        printf("\n  FAIL [%s] scalar init or capture failed: rc=%d\n", w->label, rc);
         capture_free_hdr(&scalar_out);
         force_scalar_off();
         return -1;
@@ -550,7 +567,7 @@ static int test_hdr_workload(const hdr_workload_t *w)
     rc = run_hdr_capture(w->w, w->h, w->down_flags, w->up_flags,
                          w->up_tail, /*seed=*/0xC0FFEE, &simd_out);
     if (rc < 0) {
-        printf("\n  FAIL [%s] simd run init failed: rc=%d\n", w->label, rc);
+        printf("\n  FAIL [%s] simd init or capture failed: rc=%d\n", w->label, rc);
         capture_free_hdr(&scalar_out);
         capture_free_hdr(&simd_out);
         return -1;
@@ -602,8 +619,25 @@ static void test_hdr_parity_all(void)
  * Entry point
  * -------------------------------------------------------------------------- */
 
+static void test_parity_missing_planes(void)
+{
+    captured_plane_t a = {0}, b = {0};
+    parity_diff_t diff = {0};
+    uint8_t pixel = 0;
+    a.present = b.present = 1;
+    a.w = b.w = a.h = b.h = 2;
+    TEST_ASSERT(compare_captured(&a, &b, 1, 0, &diff),
+                "two missing captures must fail");
+    TEST_ASSERT(compare_plane_bytes(NULL, &pixel, 1, 1, 1, 0, 'U', &diff),
+                "one missing capture must fail");
+    TEST_ASSERT(compare_plane_bytes(NULL, NULL, 1, 1, 2, 0, 'V', &diff),
+                "missing HDR captures must fail");
+    TEST_PASS();
+}
+
 void run_parity_tests(void)
 {
+    RUN_TEST(test_parity_missing_planes);
     RUN_TEST(test_sdr_parity_all);
     RUN_TEST(test_hdr_parity_all);
 }

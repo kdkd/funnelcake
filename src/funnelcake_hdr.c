@@ -864,7 +864,7 @@ hdr_tail_done:
             p->p010_tmp_v = NULL;
             fused_log(&ctx->log_warnings, FUSED_LOG_WARN,
                 "funnelcake-hdr: failed to allocate P010 deinterleave buffers\n");
-            /* Fall through - kernels will malloc per-frame as fallback */
+            goto allocation_failed;
         } else {
             p->p010_tmp_stride = tmp_stride;
         }
@@ -966,6 +966,7 @@ hdr_tail_done:
             } else {
                 fused_log(&ctx->log_warnings, FUSED_LOG_WARN,
                     "funnelcake-hdr: failed to allocate upscale scratch buffer\n");
+                goto allocation_failed;
             }
         }
     }
@@ -1000,6 +1001,7 @@ hdr_tail_done:
             } else {
                 fused_log(&ctx->log_warnings, FUSED_LOG_WARN,
                     "funnelcake-hdr: failed to allocate downscale scratch pool\n");
+                goto allocation_failed;
             }
         }
     }
@@ -1035,6 +1037,10 @@ hdr_tail_done:
     ctx->_internal = planned ? NULL : state;
 
     return warn_bits;  /* 0 == FUSED_OK if nothing was warned */
+
+allocation_failed:
+    fused_hdr_free(ctx);
+    return FUSED_ERR_NO_STEPS;
 }
 
 /* --------------------------------------------------------------------------

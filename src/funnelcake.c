@@ -577,6 +577,8 @@ tail_done:
         return FUSED_ERR_NO_STEPS;
     }
 
+    ctx->_internal = planned ? NULL : state;
+
     fused_kernel_params_t *p = &state->params;
 
     p->src_width   = eff_w;
@@ -662,6 +664,7 @@ tail_done:
             } else {
                 fused_log(&ctx->log_warnings, FUSED_LOG_WARN,
                     "funnelcake: failed to allocate upscale scratch buffer\n");
+                goto allocation_failed;
             }
         }
     }
@@ -708,6 +711,7 @@ tail_done:
                 fused_log(&ctx->log_warnings, FUSED_LOG_WARN,
                     "funnelcake: failed to allocate downscale scratch pool "
                     "(%zu bytes)\n", aligned_bytes);
+                goto allocation_failed;
             }
         }
     }
@@ -749,6 +753,10 @@ tail_done:
     ctx->_internal = planned ? NULL : state;
 
     return warn_bits;  /* 0 == FUSED_OK if nothing was warned */
+
+allocation_failed:
+    fused_scaler_free(ctx);
+    return FUSED_ERR_NO_STEPS;
 }
 
 /* --------------------------------------------------------------------------

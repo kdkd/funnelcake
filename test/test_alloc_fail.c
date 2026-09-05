@@ -61,6 +61,13 @@ static void exercise(int hdr, int mode, unsigned flags, unsigned up)
         c.log_errors.target = c.log_warnings.target = FUSED_LOG_SUPPRESS;
         int rc = fused_scaler_init(&c);
         if (rc < 0) CHECK(!c._internal && !live_count);
+        if (rc >= 0) {
+            fused_internal_t *s = c._internal;
+            CHECK(s);
+            if (c.achieved_flags) CHECK(s->params.scratch_pool);
+            if (c.achieved_upscale_flags || c.achieved_upscale_tail)
+                CHECK(s->params.upscale_scratch);
+        }
         fused_scaler_free(&c);
         fused_scaler_free(&c);
     } else {
@@ -78,6 +85,16 @@ static void exercise(int hdr, int mode, unsigned flags, unsigned up)
         c.log_errors.target = c.log_warnings.target = FUSED_LOG_SUPPRESS;
         int rc = fused_hdr_init(&c);
         if (rc < 0) CHECK(!c._internal && !live_count);
+        if (rc >= 0) {
+            fused_hdr_internal_t *s = c._internal;
+            CHECK(s);
+            if (c.achieved_hdr_flags || c.achieved_sdr_flags)
+                CHECK(s->params.scratch_pool);
+            if (c.achieved_upscale_flags || c.achieved_upscale_tail)
+                CHECK(s->params.upscale_scratch_hdr);
+            if (s->params.is_p010)
+                CHECK(s->params.p010_tmp_u && s->params.p010_tmp_v);
+        }
         fused_hdr_free(&c);
         fused_hdr_free(&c);
     }

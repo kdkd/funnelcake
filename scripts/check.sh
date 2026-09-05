@@ -4,6 +4,7 @@
 set -eu
 make_cmd=${1:-make}
 "$make_cmd" test check-native
+if [ "${CHECK_EXTENDED:-0}" = 1 ]; then "$make_cmd" test-extended; fi
 
 if [ "${CHECK_BINDINGS:-1}" = 1 ]; then
     for pair in "${GO:-go}:test-go" "${CARGO:-cargo}:test-rust" "${PYTHON:-python3}:test-python"; do
@@ -36,7 +37,9 @@ cd "$check_dir/source"
 
 if [ "${CHECK_SANITIZERS:-1}" = 1 ]; then
     sanitizer_flags='-O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all'
-    "$make_cmd" test check-native LIB_OPT="$sanitizer_flags" TEST_OPT="$sanitizer_flags" LDFLAGS='-lm -fsanitize=address,undefined' SWSCALE_TEST_CFLAGS= SWSCALE_TEST_LDFLAGS=
+    extended_target=
+    if [ "${CHECK_EXTENDED:-0}" = 1 ]; then extended_target=test-extended; fi
+    "$make_cmd" test check-native $extended_target LIB_OPT="$sanitizer_flags" TEST_OPT="$sanitizer_flags" LDFLAGS='-lm -fsanitize=address,undefined' SWSCALE_TEST_CFLAGS= SWSCALE_TEST_LDFLAGS=
 fi
 
 # Changing configuration back must replace sanitizer objects. Then another

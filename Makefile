@@ -388,7 +388,10 @@ test/funnelcake_alloc_hdr.o: src/funnelcake_hdr.c
 test/funnelcake_alloc_fail: test/test_alloc_fail.c $(ALLOC_TEST_OBJS) libfunnelcake.a
 	$(CC) $(TEST_CFLAGS) $(LINK_MARCH) -o $@ $< $(ALLOC_TEST_OBJS) libfunnelcake.a $(LDFLAGS)
 
-.PHONY: test-alloc
+.PHONY: test-extended test-alloc
+test-extended: test-alloc test/funnelcake_edges
+	./test/funnelcake_edges
+
 test-alloc: test/funnelcake_alloc_fail
 	./test/funnelcake_alloc_fail
 
@@ -684,7 +687,7 @@ fetch-samples:
 	@echo ""
 
 clean:
-	rm -f $(NATIVE_TEST_BINS) $(ALLOC_TEST_OBJS) test/funnelcake_alloc_fail
+	rm -f $(NATIVE_TEST_BINS) $(ALLOC_TEST_OBJS) test/funnelcake_alloc_fail test/funnelcake_edges
 	rm -f $(LIB_OBJS) $(TEST_OBJS) libfunnelcake.a funnelcake_test
 	rm -f libfunnelcake.so libfunnelcake.so.* libfunnelcake.*.dylib libfunnelcake.dylib
 	rm -f funnelcake.pc
@@ -869,5 +872,5 @@ $(TEST_OBJS): include/funnelcake.h test/test_main.h test/test_patterns.h
 # Force changed configurations even on make/filesystems with coarse timestamps.
 BUILD_CHANGED := $(shell printf '%s\n' $(foreach key,$(BUILD_SETTINGS),$(call shellquote,$(key)=$($(key)))) | cmp -s - .build-config || echo yes)
 ifeq ($(BUILD_CHANGED),yes)
-$(LIB_OBJS) $(TEST_OBJS) libfunnelcake.a $(SHLIB) $(JAVA_CORE_LIB) $(PY_CORE_LIB) funnelcake_test $(NATIVE_TEST_BINS) $(ALLOC_TEST_OBJS) test/funnelcake_alloc_fail: FORCE
+$(LIB_OBJS) $(TEST_OBJS) libfunnelcake.a $(SHLIB) $(JAVA_CORE_LIB) $(PY_CORE_LIB) funnelcake_test $(NATIVE_TEST_BINS) $(ALLOC_TEST_OBJS) test/funnelcake_alloc_fail test/funnelcake_edges: FORCE
 endif

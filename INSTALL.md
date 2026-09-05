@@ -380,6 +380,21 @@ cleanup, repeated free, and successful initialization after recovery. It does
 not exhaust real memory or deliberately trigger signals. This target is
 opt-in and adds no hooks to the production library.
 
+`make test-extended` adds deterministic scalar/native differential tests for
+vector and cascade boundaries, sparse output masks, minimum and padded strides,
+misaligned planes, all HDR layouts, tone mapping, and context reuse. Source
+allocations end at the final active sample. Input snapshots check for writes;
+different padding and output poison detect padding dependencies and missing
+writes. On AVX-512 systems it also runs the matrix with AVX2 forced. It reports
+aligned SIMD case counts and explicitly reports unavailable SIMD coverage.
+It also checks that adding other cascade outputs leaves existing outputs
+bit-exact.
+
+`CHECK_EXTENDED=1 make check` runs these tests in both normal and sanitizer
+builds. ASan checks the exact heap boundaries without any deliberate crashes
+or expected-signal tests. These larger checks are opt-in; `make test` keeps
+its short default suite.
+
 Use `gmake` for all of these commands on FreeBSD.
 
 Builds track compiler and flag settings automatically. Changing CC, tuning,

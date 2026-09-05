@@ -208,15 +208,15 @@ reference bit for bit.
 
 | Workload | Graviton 4 | Apple M5 Max | Raspberry Pi 5 |
 |---|---|---|---|
-| 1920×1080 I010 down:1.5x,3x,6x        |  284 µs |   138 µs |  1816 µs |
-| 3840×2160 I010 down:1.5x,3x,6x,12x    | 1585 µs |   684 µs |  8896 µs |
-| 3840×2160 P010 down:1.5x,3x,6x,12x    | 1975 µs |   875 µs | 10441 µs |
-| 1920×1080 I010 up:2x                  |  755 µs |   432 µs |  4046 µs |
-| 1920×1080 I010 down:1.5x,3x up:2x     | 1031 µs |   580 µs |  6068 µs |
-| 1920×1080 I010 down:1.5x,3x,6x tone   | 2471 µs |   744 µs |  4697 µs |
-| 3840×2160 I010 down:1.5x,3x,6x,12x tone | 10229 µs |  3334 µs | 20407 µs |
-| 1920×1080 I010 down:1.5x,3x,6x HDR+tone | 2465 µs |   746 µs |  4674 µs |
-| 3840×2160 I010 tone 1x                | 14423 µs |  4189 µs | 19323 µs |
+| 1920×1080 I010 down:1.5x,3x,6x        |  284 µs |   139 µs |  1796 µs |
+| 3840×2160 I010 down:1.5x,3x,6x,12x    | 1585 µs |   695 µs |  8904 µs |
+| 3840×2160 P010 down:1.5x,3x,6x,12x    | 1975 µs |   903 µs | 10568 µs |
+| 1920×1080 I010 up:2x                  |  755 µs |   429 µs |  5077 µs |
+| 1920×1080 I010 down:1.5x,3x up:2x     | 1031 µs |   572 µs |  6997 µs |
+| 1920×1080 I010 down:1.5x,3x,6x tone   | 2471 µs |   751 µs |  4664 µs |
+| 3840×2160 I010 down:1.5x,3x,6x,12x tone | 10229 µs |  3280 µs | 20727 µs |
+| 1920×1080 I010 down:1.5x,3x,6x HDR+tone | 2465 µs |   751 µs |  4701 µs |
+| 3840×2160 I010 tone 1x                | 14423 µs |  4196 µs | 19240 µs |
 
 The P010 row uses the Y + interleaved-UV layout that most HEVC Main10
 encoders emit natively; the P010 vs I010 gap on the matching 4K

@@ -411,6 +411,69 @@ static inline void hdr_pow2_store_h3(uint16x8_t v, uint16_t *dst)
     vst1_lane_u16(dst, vget_low_u16(v), 0);
 }
 
+typedef struct {
+    uint16x8_t lo;
+    uint16x8_t hi;
+} hdr_pow2_tile16_t;
+
+static inline __attribute__((always_inline)) hdr_pow2_tile16_t
+hdr_pow2_load_pair16(const uint16_t *base, int row, int src_el_stride, int x)
+{
+    const uint16_t *a = base + (size_t)row * src_el_stride + x;
+    const uint16_t *b = a + src_el_stride;
+    hdr_pow2_tile16_t out;
+    out.lo = vrhaddq_u16(vld1q_u16(a), vld1q_u16(b));
+    out.hi = vrhaddq_u16(vld1q_u16(a + 8), vld1q_u16(b + 8));
+    return out;
+}
+
+static inline __attribute__((always_inline)) hdr_pow2_tile16_t
+hdr_pow2_avg_tile16(hdr_pow2_tile16_t a, hdr_pow2_tile16_t b)
+{
+    hdr_pow2_tile16_t out = {
+        vrhaddq_u16(a.lo, b.lo),
+        vrhaddq_u16(a.hi, b.hi)
+    };
+    return out;
+}
+
+/* Pair sums fit in u16: valid 10-bit inputs sum to at most 2046.
+ * Reduce both halves together and retain rounding at every cascade level.
+ * The 16-column paths use these combined stores. */
+static inline __attribute__((always_inline)) void
+hdr_pow2_store_h1_tile16(hdr_pow2_tile16_t v, uint16_t *dst)
+{
+    uint16x8_t out = vrshrq_n_u16(vpaddq_u16(v.lo, v.hi), 1);
+    vst1q_u16(dst, out);
+}
+
+static inline __attribute__((always_inline)) void
+hdr_pow2_store_h2_tile16(hdr_pow2_tile16_t v, uint16_t *dst)
+{
+    uint16x8_t out = vrshrq_n_u16(vpaddq_u16(v.lo, v.hi), 1);
+    out = vrshrq_n_u16(vpaddq_u16(out, out), 1);
+    vst1_u16(dst, vget_low_u16(out));
+}
+
+static inline __attribute__((always_inline)) void
+hdr_pow2_store_h3_tile16(hdr_pow2_tile16_t v, uint16_t *dst)
+{
+    uint16x8_t out = vrshrq_n_u16(vpaddq_u16(v.lo, v.hi), 1);
+    out = vrshrq_n_u16(vpaddq_u16(out, out), 1);
+    out = vrshrq_n_u16(vpaddq_u16(out, out), 1);
+    vst1_lane_u32((uint32_t *)dst, vreinterpret_u32_u16(vget_low_u16(out)), 0);
+}
+
+static inline __attribute__((always_inline)) void
+hdr_pow2_store_h4_tile16(hdr_pow2_tile16_t v, uint16_t *dst)
+{
+    uint16x8_t out = vrshrq_n_u16(vpaddq_u16(v.lo, v.hi), 1);
+    out = vrshrq_n_u16(vpaddq_u16(out, out), 1);
+    out = vrshrq_n_u16(vpaddq_u16(out, out), 1);
+    out = vrshrq_n_u16(vpaddq_u16(out, out), 1);
+    vst1_lane_u16(dst, vget_low_u16(out), 0);
+}
+
 static void hdr_pow2_tiled_depth0(
     const uint16_t *restrict src, int src_w, int src_h, int src_el_stride,
     uint32_t active_outputs, uint16_t *restrict dst[4], int strides[4])
@@ -420,7 +483,14 @@ static void hdr_pow2_tiled_depth0(
     for (int g = 0; g < groups; g++) {
         const uint16_t *r0 = src + (size_t)(2 * g) * src_el_stride;
         const uint16_t *r1 = r0 + src_el_stride;
-        for (int x = 0; x < src_w; x += 8) {
+        int x = 0;
+        for (; x + 16 <= src_w; x += 16) {
+            hdr_pow2_tile16_t v0 = hdr_pow2_load_pair16(
+                r0, 0, src_el_stride, x);
+            if (emit0) hdr_pow2_store_h1_tile16(v0,
+                dst[0] + (size_t)g * strides[0] + x / 2);
+        }
+        for (; x < src_w; x += 8) {
             uint16x8_t v0 = vrhaddq_u16(vld1q_u16(r0 + x),
                                          vld1q_u16(r1 + x));
             if (emit0)
@@ -439,7 +509,21 @@ static void hdr_pow2_tiled_depth1(
     int emit1 = (active_outputs & (1u << 3)) != 0;
     for (int g = 0; g < groups; g++) {
         const uint16_t *base = src + (size_t)(4 * g) * src_el_stride;
-        for (int x = 0; x < src_w; x += 8) {
+        int x = 0;
+        for (; x + 16 <= src_w; x += 16) {
+            hdr_pow2_tile16_t v0 = hdr_pow2_load_pair16(
+                base, 0, src_el_stride, x);
+            if (emit0) hdr_pow2_store_h1_tile16(v0,
+                dst[0] + (size_t)(2 * g) * strides[0] + x / 2);
+            hdr_pow2_tile16_t v1 = hdr_pow2_load_pair16(
+                base, 2, src_el_stride, x);
+            if (emit0) hdr_pow2_store_h1_tile16(v1,
+                dst[0] + (size_t)(2 * g + 1) * strides[0] + x / 2);
+            hdr_pow2_tile16_t w0 = hdr_pow2_avg_tile16(v0, v1);
+            if (emit1) hdr_pow2_store_h2_tile16(w0,
+                dst[1] + (size_t)g * strides[1] + x / 4);
+        }
+        for (; x < src_w; x += 8) {
             uint16x8_t v0 = vrhaddq_u16(vld1q_u16(base + x),
                                          vld1q_u16(base + src_el_stride + x));
             uint16x8_t v1 = vrhaddq_u16(
@@ -469,7 +553,35 @@ static void hdr_pow2_tiled_depth2(
     int emit2 = (active_outputs & (1u << 5)) != 0;
     for (int g = 0; g < groups; g++) {
         const uint16_t *base = src + (size_t)(8 * g) * src_el_stride;
-        for (int x = 0; x < src_w; x += 8) {
+        int x = 0;
+        for (; x + 16 <= src_w; x += 16) {
+            hdr_pow2_tile16_t v0 = hdr_pow2_load_pair16(
+                base, 0, src_el_stride, x);
+            if (emit0) hdr_pow2_store_h1_tile16(v0,
+                dst[0] + (size_t)(4 * g) * strides[0] + x / 2);
+            hdr_pow2_tile16_t v1 = hdr_pow2_load_pair16(
+                base, 2, src_el_stride, x);
+            if (emit0) hdr_pow2_store_h1_tile16(v1,
+                dst[0] + (size_t)(4 * g + 1) * strides[0] + x / 2);
+            hdr_pow2_tile16_t v2 = hdr_pow2_load_pair16(
+                base, 4, src_el_stride, x);
+            if (emit0) hdr_pow2_store_h1_tile16(v2,
+                dst[0] + (size_t)(4 * g + 2) * strides[0] + x / 2);
+            hdr_pow2_tile16_t v3 = hdr_pow2_load_pair16(
+                base, 6, src_el_stride, x);
+            if (emit0) hdr_pow2_store_h1_tile16(v3,
+                dst[0] + (size_t)(4 * g + 3) * strides[0] + x / 2);
+            hdr_pow2_tile16_t w0 = hdr_pow2_avg_tile16(v0, v1);
+            if (emit1) hdr_pow2_store_h2_tile16(w0,
+                dst[1] + (size_t)(2 * g) * strides[1] + x / 4);
+            hdr_pow2_tile16_t w1 = hdr_pow2_avg_tile16(v2, v3);
+            if (emit1) hdr_pow2_store_h2_tile16(w1,
+                dst[1] + (size_t)(2 * g + 1) * strides[1] + x / 4);
+            hdr_pow2_tile16_t z0 = hdr_pow2_avg_tile16(w0, w1);
+            if (emit2) hdr_pow2_store_h3_tile16(z0,
+                dst[2] + (size_t)g * strides[2] + x / 8);
+        }
+        for (; x < src_w; x += 8) {
             uint16x8_t v0 = vrhaddq_u16(vld1q_u16(base + x),
                                          vld1q_u16(base + src_el_stride + x));
             uint16x8_t v1 = vrhaddq_u16(
@@ -503,69 +615,6 @@ static void hdr_pow2_tiled_depth2(
                     dst[2] + (size_t)g * strides[2] + x / 8);
         }
     }
-}
-
-typedef struct {
-    uint16x8_t lo;
-    uint16x8_t hi;
-} hdr_pow2_tile16_t;
-
-static inline __attribute__((always_inline)) hdr_pow2_tile16_t
-hdr_pow2_load_pair16(const uint16_t *base, int row, int src_el_stride, int x)
-{
-    const uint16_t *a = base + (size_t)row * src_el_stride + x;
-    const uint16_t *b = a + src_el_stride;
-    hdr_pow2_tile16_t out;
-    out.lo = vrhaddq_u16(vld1q_u16(a), vld1q_u16(b));
-    out.hi = vrhaddq_u16(vld1q_u16(a + 8), vld1q_u16(b + 8));
-    return out;
-}
-
-static inline __attribute__((always_inline)) hdr_pow2_tile16_t
-hdr_pow2_avg_tile16(hdr_pow2_tile16_t a, hdr_pow2_tile16_t b)
-{
-    hdr_pow2_tile16_t out = {
-        vrhaddq_u16(a.lo, b.lo),
-        vrhaddq_u16(a.hi, b.hi)
-    };
-    return out;
-}
-
-/* Pair sums fit in u16: valid 10-bit inputs sum to at most 2046.
- * Reduce both halves together and retain rounding at every cascade level.
- * Only the 16-column depth-3 path uses these combined stores. */
-static inline __attribute__((always_inline)) void
-hdr_pow2_store_h1_tile16(hdr_pow2_tile16_t v, uint16_t *dst)
-{
-    uint16x8_t out = vrshrq_n_u16(vpaddq_u16(v.lo, v.hi), 1);
-    vst1q_u16(dst, out);
-}
-
-static inline __attribute__((always_inline)) void
-hdr_pow2_store_h2_tile16(hdr_pow2_tile16_t v, uint16_t *dst)
-{
-    uint16x8_t out = vrshrq_n_u16(vpaddq_u16(v.lo, v.hi), 1);
-    out = vrshrq_n_u16(vpaddq_u16(out, out), 1);
-    vst1_u16(dst, vget_low_u16(out));
-}
-
-static inline __attribute__((always_inline)) void
-hdr_pow2_store_h3_tile16(hdr_pow2_tile16_t v, uint16_t *dst)
-{
-    uint16x8_t out = vrshrq_n_u16(vpaddq_u16(v.lo, v.hi), 1);
-    out = vrshrq_n_u16(vpaddq_u16(out, out), 1);
-    out = vrshrq_n_u16(vpaddq_u16(out, out), 1);
-    vst1_lane_u32((uint32_t *)dst, vreinterpret_u32_u16(vget_low_u16(out)), 0);
-}
-
-static inline __attribute__((always_inline)) void
-hdr_pow2_store_h4_tile16(hdr_pow2_tile16_t v, uint16_t *dst)
-{
-    uint16x8_t out = vrshrq_n_u16(vpaddq_u16(v.lo, v.hi), 1);
-    out = vrshrq_n_u16(vpaddq_u16(out, out), 1);
-    out = vrshrq_n_u16(vpaddq_u16(out, out), 1);
-    out = vrshrq_n_u16(vpaddq_u16(out, out), 1);
-    vst1_lane_u16(dst, vget_low_u16(out), 0);
 }
 
 static void hdr_pow2_tiled_depth3(

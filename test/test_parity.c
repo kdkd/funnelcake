@@ -619,6 +619,79 @@ static void test_hdr_parity_all(void)
  * Entry point
  * -------------------------------------------------------------------------- */
 
+/* Fixed reference values distinguish successive rounded averages from a
+ * single rounded four-sample box average, including ties and extrema. */
+static int rounding_golden(int hdr, int scalar)
+{
+    _Alignas(32) uint8_t data8[3][256];
+    _Alignas(32) uint16_t data16[3][256];
+    static const unsigned rows[2][8] = {
+        {0, 0, 255, 254, 2, 3, 0, 255},
+        {0, 1, 255, 255, 3, 4, 255, 0}
+    };
+    static const unsigned expected8[] = {1, 255, 4, 128};
+    static const unsigned expected16[] = {1, 1023, 4, 512};
+    for (int p = 0; p < 3; p++) {
+        int width = p ? 32 : 64, height = p ? 2 : 4;
+        for (int y = 0; y < height; y++) for (int x = 0; x < width; x++) {
+            unsigned v = rows[y & 1][x & 7];
+            data8[p][y * width + x] = (uint8_t)v;
+            data16[p][y * width + x] = (uint16_t)(v >= 254 ? v + 768 : v);
+        }
+    }
+    if (scalar) force_scalar_on(); else force_scalar_off();
+    int failed = 0;
+    if (hdr) {
+        fused_hdr_ctx_t c = {0};
+        c.src_width = 64; c.src_height = 4;
+        c.src_y_stride = 128; c.src_uv_stride = 64;
+        c.requested_flags = c.hdr_flags = FUSED_SCALE_2X;
+        c.log_errors.target = c.log_warnings.target = FUSED_LOG_SUPPRESS;
+        if (fused_hdr_init(&c) < 0) return -1;
+        fused_hdr_run(&c, data16[0], data16[1], data16[2]);
+        fused_hdr_output_t *o = &c.hdr_outputs[1];
+        const uint16_t *planes[] = {o->plane_y, o->plane_u, o->plane_v};
+        for (int p = 0; p < 3; p++) {
+            int width = p ? 16 : 32, height = p ? 1 : 2;
+            int stride = (p ? o->uv_stride : o->y_stride) / 2;
+            if (!planes[p]) { failed = 1; continue; }
+            for (int y = 0; y < height; y++) for (int x = 0; x < width; x++)
+                if (planes[p][y * stride + x] != expected16[x & 3]) failed = 1;
+        }
+        fused_hdr_free(&c);
+    } else {
+        fused_scaler_ctx_t c = {0};
+        c.src_width = 64; c.src_height = 4;
+        c.src_y_stride = 64; c.src_uv_stride = 32;
+        c.requested_flags = FUSED_SCALE_2X;
+        c.log_errors.target = c.log_warnings.target = FUSED_LOG_SUPPRESS;
+        if (fused_scaler_init(&c) < 0) return -1;
+        fused_scaler_run(&c, data8[0], data8[1], data8[2]);
+        fused_scale_output_t *o = &c.outputs[1];
+        const uint8_t *planes[] = {o->plane_y, o->plane_u, o->plane_v};
+        for (int p = 0; p < 3; p++) {
+            int width = p ? 16 : 32, height = p ? 1 : 2;
+            int stride = p ? o->uv_stride : o->y_stride;
+            if (!planes[p]) { failed = 1; continue; }
+            for (int y = 0; y < height; y++) for (int x = 0; x < width; x++)
+                if (planes[p][y * stride + x] != expected8[x & 3]) failed = 1;
+        }
+        fused_scaler_free(&c);
+    }
+    return failed ? -1 : 0;
+}
+
+static void test_rounding_golden(void)
+{
+    int failed = 0;
+    for (int hdr = 0; hdr < 2; hdr++)
+        for (int scalar = 0; scalar < 2; scalar++)
+            if (rounding_golden(hdr, scalar)) failed = 1;
+    force_scalar_off();
+    TEST_ASSERT(!failed, "2x rounded averages must match fixed reference values");
+    TEST_PASS();
+}
+
 static void test_parity_missing_planes(void)
 {
     captured_plane_t a = {0}, b = {0};
@@ -638,6 +711,7 @@ static void test_parity_missing_planes(void)
 void run_parity_tests(void)
 {
     RUN_TEST(test_parity_missing_planes);
+    RUN_TEST(test_rounding_golden);
     RUN_TEST(test_sdr_parity_all);
     RUN_TEST(test_hdr_parity_all);
 }

@@ -215,11 +215,8 @@ static inline __m128i avx2_halve_16_to_8_hdr(__m256i v)
     __m128i even = _mm256_castsi256_si128(permuted);
     __m128i odd  = _mm256_extracti128_si256(permuted, 1);
 
-    /* Average: (even + odd + 1) >> 1.  No _mm_avg_epu16 exists either,
-     * so we compute manually.  10-bit values: max sum = 2047 fits in uint16. */
-    __m128i sum = _mm_add_epi16(even, odd);
-    __m128i one = _mm_set1_epi16(1);
-    return _mm_srli_epi16(_mm_add_epi16(sum, one), 1);
+    /* Rounded unsigned average preserves the scalar halving exactly. */
+    return _mm_avg_epu16(even, odd);
 }
 
 
@@ -229,32 +226,19 @@ static inline __m128i avx2_halve_16_to_8_hdr(__m256i v)
  * Averages adjacent pairs from two input YMM (32 uint16_t) into one output
  * YMM (16 uint16_t):  out[i] = (in[2i] + in[2i+1] + 1) >> 1.
  *
- * Separating the even- and odd-indexed samples before averaging would lean
- * on the shuffle ports (vpshufb / vpermq / vextracti128).  vpmaddwd does the
- * pairing for free instead: multiplying each 16-bit sample by a constant 1
- * and summing adjacent products yields in[2i] + in[2i+1] directly, as 32-bit
- * values.  10-bit inputs (max 1023) stay positive and the pair sum is at most
- * 2046, so it fits a 32-bit lane with no overflow.  The rounded average
- * (sum + 1) >> 1 is then a 32-bit add and shift.  This keeps the work off the
- * shuffle ports and emits a single wide store per 16 outputs.
- *
- * vpmaddwd works within each 128-bit lane, so after packus_epi32 the 16
- * results are grouped by lane rather than in order; permute4x64(0xD8) puts
- * them back into linear sample order.
+ * Pair sums from madd_epi16 are at most 2046 for valid 10-bit input.
+ * Pack those sums before rounding so one vpavgw handles both input halves.
+ * Narrowing is exact, and averaging against zero computes (sum + 1) >> 1.
+ * The lane-local pack interleaves the two inputs by 128-bit lane;
+ * permute4x64(0xD8) restores linear sample order.
  * ----------------------------------------------------------------------- */
 
 static inline __m256i avx2_halve_32_to_16_hdr(__m256i v0, __m256i v1)
 {
-    const __m256i ones16 = _mm256_set1_epi16(1);
-    const __m256i one32  = _mm256_set1_epi32(1);
-
-    __m256i m0 = _mm256_madd_epi16(v0, ones16);  /* 8x (a + b), <= 2046 */
-    __m256i m1 = _mm256_madd_epi16(v1, ones16);
-
-    m0 = _mm256_srli_epi32(_mm256_add_epi32(m0, one32), 1);  /* (a+b+1)>>1 */
-    m1 = _mm256_srli_epi32(_mm256_add_epi32(m1, one32), 1);
-
+    __m256i m0 = _mm256_madd_epi16(v0, _mm256_set1_epi16(1));
+    __m256i m1 = _mm256_madd_epi16(v1, _mm256_set1_epi16(1));
     __m256i packed = _mm256_packus_epi32(m0, m1);
+    packed = _mm256_avg_epu16(packed, _mm256_setzero_si256());
     return _mm256_permute4x64_epi64(packed, 0xD8);
 }
 
@@ -265,7 +249,7 @@ static inline __m256i avx2_halve_32_to_16_hdr(__m256i v0, __m256i v1)
  * out[k] = avg(in[2k], in[2k+1]) = (in[2k] + in[2k+1] + 1) >> 1, for k in 0..3.
  * Same even/odd-word separation as avx2_halve_16_to_8_hdr but on a single
  * 128-bit lane: vpshufb gathers the 4 even-indexed words into the low 64 bits
- * and the 4 odd-indexed words into the high 64 bits, then (sum+1)>>1.  The 4
+ * and the 4 odd-indexed words into the high 64 bits, then vpavgw.  The 4
  * results sit in the low 64 bits, ready for _mm_storel_epi64.
  * ----------------------------------------------------------------------- */
 
@@ -279,10 +263,7 @@ static inline __m128i halve_8_to_4_hdr(__m128i v)
     __m128i s = _mm_shuffle_epi8(v, mask);
     __m128i even = s;
     __m128i odd  = _mm_srli_si128(s, 8);
-    /* 10-bit values: max sum = 2046 fits in uint16. */
-    __m128i sum = _mm_add_epi16(even, odd);
-    __m128i one = _mm_set1_epi16(1);
-    return _mm_srli_epi16(_mm_add_epi16(sum, one), 1);
+    return _mm_avg_epu16(even, odd);
 }
 
 /* Complete the horizontal pow2 cascade while a freshly computed vertical

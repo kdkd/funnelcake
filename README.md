@@ -177,8 +177,9 @@ discussion.
 ### HDR10 (10-bit PQ / HLG)
 
 The bench suite does not include a libswscale HDR comparison path, so HDR
-numbers are funnelcake's absolute time only. Rows marked `tone` produce
-tone-mapped 8-bit SDR outputs at every ladder step, `HDR+tone` produces
+numbers are funnelcake's absolute time only. The Epyc and Xeon HDR columns
+use minimum latency; the other HDR columns use medians.
+Rows marked `tone` produce tone-mapped 8-bit SDR outputs at every ladder step, `HDR+tone` produces
 both the 10-bit HDR and the tone-mapped SDR output at each step, and
 `tone 1x` is a source-resolution tone map with no scaling. The `tone`
 rows tone-map each output at its own resolution *after* scaling, so a
@@ -194,15 +195,15 @@ reference bit for bit.
 
 | Workload | Ryzen 9955HX (AVX-512) | Epyc 7302 (AVX2) | Xeon 6132 (AVX2) | Xeon E5v4 (AVX2) |
 |---|---|---|---|---|
-| 1920×1080 I010 down:1.5x,3x,6x        |   92 µs |  264 µs |  391 µs |  668 µs |
-| 3840×2160 I010 down:1.5x,3x,6x,12x    |  894 µs | 2788 µs | 2930 µs | 3619 µs |
-| 3840×2160 P010 down:1.5x,3x,6x,12x    | 1167 µs | 3495 µs | 3804 µs | 5513 µs |
-| 1920×1080 I010 up:2x                  |  480 µs | 2055 µs | 2087 µs | 2189 µs |
-| 1920×1080 I010 down:1.5x,3x up:2x     |  692 µs | 2658 µs | 2646 µs | 3305 µs |
-| 1920×1080 I010 down:1.5x,3x,6x tone   |  342 µs | 3290 µs | 5132 µs | 2538 µs |
-| 3840×2160 I010 down:1.5x,3x,6x,12x tone | 2024 µs | 15433 µs | 23328 µs | 12412 µs |
-| 1920×1080 I010 down:1.5x,3x,6x HDR+tone |  344 µs | 3285 µs | 5149 µs | 2555 µs |
-| 3840×2160 I010 tone 1x                | 2003 µs | 20753 µs | 33405 µs | 14348 µs |
+| 1920×1080 I010 down:1.5x,3x,6x        |    74 µs |   258 µs |   396 µs |   381 µs |
+| 3840×2160 I010 down:1.5x,3x,6x,12x    |   783 µs |  2523 µs |  2727 µs |  2945 µs |
+| 3840×2160 P010 down:1.5x,3x,6x,12x    |   990 µs |  3100 µs |  3668 µs |  4990 µs |
+| 1920×1080 I010 up:2x                  |   255 µs |  1917 µs |  2139 µs |  1871 µs |
+| 1920×1080 I010 down:1.5x,3x up:2x     |   536 µs |  2502 µs |  2708 µs |  2963 µs |
+| 1920×1080 I010 down:1.5x,3x,6x tone   |   319 µs |  3133 µs |  4855 µs |  2099 µs |
+| 3840×2160 I010 down:1.5x,3x,6x,12x tone |  1746 µs | 14261 µs | 21387 µs | 10882 µs |
+| 1920×1080 I010 down:1.5x,3x,6x HDR+tone |   318 µs |  3124 µs |  4860 µs |  2190 µs |
+| 3840×2160 I010 tone 1x                |  1777 µs | 19644 µs | 30683 µs | 12081 µs |
 
 **aarch64 / NEON**
 

@@ -30,3 +30,4 @@ docs/superpowers/
 .build-config.tmp
 funnelcake.pc
 funnelcake.pc.tmp
+test/funnelcake_*

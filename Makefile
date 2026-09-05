@@ -362,6 +362,19 @@ shellquote = '$(subst ','"'"',$(1))'
 
 $(LIB_OBJS) $(TEST_OBJS): .build-config
 
+NATIVE_TEST_BINS = test/funnelcake_threads test/funnelcake_bounds test/funnelcake_query test/funnelcake_output_init test/funnelcake_diagnostics
+
+.PHONY: check check-native
+check:
+	+@CC=$(call shellquote,$(CC)) GO=$(call shellquote,$(GO)) CARGO=$(call shellquote,$(CARGO)) JAVA=$(call shellquote,$(JAVA)) JAVAC=$(call shellquote,$(JAVAC)) PYTHON=$(call shellquote,$(PYTHON)) sh scripts/check.sh $(call shellquote,$(MAKE))
+
+check-native: $(NATIVE_TEST_BINS)
+	@set -e; for binary in $(NATIVE_TEST_BINS); do ./$$binary; done
+	@FUNNELCAKE_FORCE_SCALAR=1 ./test/funnelcake_diagnostics
+
+test/funnelcake_%: test/test_%.c libfunnelcake.a
+	$(CC) $(TEST_CFLAGS) $(LINK_MARCH) -o $@ $< libfunnelcake.a $(LDFLAGS) -pthread
+
 # Default target
 .PHONY: all lib shared test bench bench-sdr bench-hdr bench-swscale visual asm fetch-samples clean pgo pgo-clean install bindings-go test-go bindings-java test-java bindings-rust test-rust bindings-python test-python
 
@@ -654,6 +667,7 @@ fetch-samples:
 	@echo ""
 
 clean:
+	rm -f $(NATIVE_TEST_BINS)
 	rm -f $(LIB_OBJS) $(TEST_OBJS) libfunnelcake.a funnelcake_test
 	rm -f libfunnelcake.so libfunnelcake.so.* libfunnelcake.*.dylib libfunnelcake.dylib
 	rm -f funnelcake.pc
@@ -838,5 +852,5 @@ $(TEST_OBJS): include/funnelcake.h test/test_main.h test/test_patterns.h
 # Force changed configurations even on make/filesystems with coarse timestamps.
 BUILD_CHANGED := $(shell printf '%s\n' $(foreach key,$(BUILD_SETTINGS),$(call shellquote,$(key)=$($(key)))) | cmp -s - .build-config || echo yes)
 ifeq ($(BUILD_CHANGED),yes)
-$(LIB_OBJS) $(TEST_OBJS) libfunnelcake.a $(SHLIB) $(JAVA_CORE_LIB) $(PY_CORE_LIB) funnelcake_test: FORCE
+$(LIB_OBJS) $(TEST_OBJS) libfunnelcake.a $(SHLIB) $(JAVA_CORE_LIB) $(PY_CORE_LIB) funnelcake_test $(NATIVE_TEST_BINS): FORCE
 endif

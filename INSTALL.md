@@ -362,3 +362,21 @@ the FreeBSD ports tree per the
 The optional `FFMPEG` knob pulls in `multimedia/ffmpeg` for the swscale
 benchmark comparison; without it the library and headers install but
 `fetch-samples` / `bench-swscale` are unavailable at runtime.
+
+### Developer checks
+
+`make check` runs the C suite and focused API regressions, available language
+binding suites, an AddressSanitizer/UndefinedBehaviorSanitizer build, and a
+staged-install consumer test. The sanitizer and installation checks use a
+temporary source copy and do not replace your normal build or install files.
+Missing binding toolchains are reported as skipped; Java requires JDK 22 or
+newer. Override tools with the normal Makefile variables.
+
+Set `CHECK_BINDINGS=0` or `CHECK_SANITIZERS=0` in the environment to omit those
+parts explicitly. `make check-native` runs just the focused native regressions.
+Use `gmake` for all of these commands on FreeBSD.
+
+Builds track compiler and flag settings automatically. Changing CC, tuning,
+optimization, or LTO rebuilds affected artifacts; an identical configuration
+remains incremental. pkg-config metadata is regenerated when installation
+settings or the version change.

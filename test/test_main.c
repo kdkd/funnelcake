@@ -114,8 +114,9 @@ static void print_bench_system_info(void)
 
     /* OS: uname is POSIX; prefer the friendlier names where one file
      * read or sysctl gets them. */
-    char os[256] = "unknown";
     struct utsname un;
+    enum { os_size = sizeof(un.sysname) + sizeof(un.release) };
+    char os[os_size > 256 ? os_size : 256] = "unknown";
     if (uname(&un) == 0)
         snprintf(os, sizeof(os), "%s %s", un.sysname, un.release);
 #if defined(__APPLE__)

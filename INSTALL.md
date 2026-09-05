@@ -29,6 +29,12 @@ binaries, but the RISC-V path is slower and x86 builds top out at AVX2. See
     make CC=clang-17            # any compiler binary works
     make -j8                    # parallel builds are fully supported
 
+On FreeBSD, use `gmake` for these commands. For example:
+
+    gmake test                  # system Clang
+    gmake test CC=gcc14          # GCC installed from packages or ports
+    gmake pgo CC=gcc14 LTO=1 TUNE=native
+
 ### Make targets
 
 | Target | What it does |
@@ -95,6 +101,11 @@ clang (ThinLTO, parallelized by the linker plugin) and `-flto=auto` on gcc
 (parallel LTRANS across all cores). Both deliver substantially the same
 optimization quality as full LTO with much faster builds and no
 "using serial compilation of N LTRANS jobs" warning.
+
+GCC LTO builds automatically select `gcc-ar` from the compiler's toolchain,
+including versioned names such as `gcc-ar-14` and FreeBSD's `gcc-ar14`.
+An explicit `AR` setting takes precedence. If automatic discovery fails,
+install the matching GCC tools or set `AR` to a plugin-aware archiver.
 
     make SCALAR_ARCH=native     # optimize scalar fallback for build machine
     make SCALAR_ARCH=baseline   # maximum portability for scalar fallback (default)

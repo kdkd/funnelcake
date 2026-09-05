@@ -3,7 +3,6 @@
 # `make CC=clang-17` to pick a specific toolchain. Both gcc >= 10 and
 # clang >= 6 are known to work; older gcc may not support -flto=auto.
 CC ?= cc
-AR ?= ar
 CFLAGS_BASE = -std=c11 -D_POSIX_C_SOURCE=200112L -Wall -Wextra -Werror -fPIC -Iinclude -Isrc
 LDFLAGS = -lm
 
@@ -127,6 +126,29 @@ ifeq ($(LTO),1)
 else
   LTO_CFLAGS =
 endif
+
+# GCC LTO archives need the matching plugin-aware archiver. GNU make has
+# a built-in AR=ar, so only replace the default, never a user's override.
+ifneq ($(filter default undefined,$(origin AR)),)
+  ifneq ($(LTO_CFLAGS),)
+    ifneq ($(CC_FAMILY_IS_CLANG),1)
+      GCC_MAJOR := $(shell $(CC) -dumpversion | cut -d. -f1)
+      GCC_AR := $(shell tool=$$($(CC) -print-prog-name=gcc-ar); \
+        if test "$$tool" != gcc-ar && command -v "$$tool" >/dev/null 2>&1; then \
+          command -v "$$tool"; \
+        else \
+          command -v gcc-ar-$(GCC_MAJOR) 2>/dev/null || \
+          command -v gcc-ar$(GCC_MAJOR) 2>/dev/null || \
+          command -v gcc-ar 2>/dev/null; \
+        fi)
+      ifeq ($(GCC_AR),)
+        $(error funnelcake: GCC LTO needs gcc-ar. Install the matching GCC tools or set AR to a plugin-aware archiver)
+      endif
+      AR := $(GCC_AR)
+    endif
+  endif
+endif
+AR ?= ar
 
 # Assemble final CFLAGS. LTO_CFLAGS appears in both LIB_CFLAGS and
 # TEST_CFLAGS so the same flag drives both compile and link (the link

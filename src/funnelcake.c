@@ -1,3 +1,4 @@
+#include <stdatomic.h>
 /*
  * Copyright (c) 2020-2026 Kevin Day
  *
@@ -283,11 +284,10 @@ int fused_scaler_init(fused_scaler_ctx_t *ctx)
          * requested via FUNNELCAKE_FORCE_SCALAR (the parity test toggles
          * this on and off; printing the warning on every flip would flood
          * the test output and confuse readers into thinking SIMD is broken). */
-        static int g_no_simd_warned = 0;
+        static atomic_int g_no_simd_warned = 0;
         const char *force_scalar_env = getenv("FUNNELCAKE_FORCE_SCALAR");
         int forced_scalar = (force_scalar_env != NULL && force_scalar_env[0] != '\0');
-        if (!g_no_simd_warned && !forced_scalar) {
-            g_no_simd_warned = 1;
+        if (!forced_scalar && !atomic_exchange(&g_no_simd_warned, 1)) {
             fprintf(stderr,
                 "funnelcake: no SIMD support detected; using scalar kernel\n");
         }
@@ -756,14 +756,13 @@ void fused_scaler_run(fused_scaler_ctx_t *ctx,
     /* Check source plane alignment */
     if (((uintptr_t)src_y & 31) || ((uintptr_t)src_u & 31) || ((uintptr_t)src_v & 31)) {
         /* Warn once about misaligned source planes */
-        static int warned = 0;
-        if (!warned) {
+        static atomic_int warned = 0;
+        if (!atomic_exchange(&warned, 1)) {
             fused_log(&ctx->log_errors, FUSED_LOG_ERROR,
                 "funnelcake: source planes are not 32-byte aligned "
                 "(Y=%p U=%p V=%p). Falling back to scalar kernel. "
                 "Performance will be significantly reduced.",
                 (const void*)src_y, (const void*)src_u, (const void*)src_v);
-            warned = 1;
         }
         /* Fall back to scalar - pick the variant matching the configured
          * (want_down, want_up) combination. */

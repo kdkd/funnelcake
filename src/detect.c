@@ -8,12 +8,13 @@
 #include "detect.h"
 #include "funnelcake.h"   /* for the public fused_simd_available() prototype */
 #include <stdint.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
 /* Static cache - zero-initialised at startup */
 static fused_cpu_caps_t g_caps = {0, 0, 0, 0, 0};
-static int              g_detected = 0;
+static atomic_int g_detected = 0; /* 0: new, 1: probing, 2: ready */
 
 
 /* --------------------------------------------------------------------------
@@ -389,7 +390,9 @@ static void detect_riscv(void)
 
 const fused_cpu_caps_t *fused_detect_cpu(void)
 {
-    if (!g_detected) {
+    int expected = 0;
+    if (atomic_compare_exchange_strong_explicit(&g_detected, &expected, 1,
+            memory_order_acquire, memory_order_acquire)) {
         /* Test/diagnostic override: setting FUNNELCAKE_FORCE_SCALAR=<non-empty>
          * skips every per-arch SIMD probe, leaving caps zeroed.  Used by the
          * parity test to compare scalar output against SIMD output without
@@ -404,16 +407,17 @@ const fused_cpu_caps_t *fused_detect_cpu(void)
             detect_riscv();
 #endif
         }
-        g_detected = 1;
+        atomic_store_explicit(&g_detected, 2, memory_order_release);
     }
 
+    while (atomic_load_explicit(&g_detected, memory_order_acquire) != 2) {}
     return &g_caps;
 }
 
 void fused_detect_cpu_reset(void)
 {
     memset(&g_caps, 0, sizeof(g_caps));
-    g_detected = 0;
+    atomic_store_explicit(&g_detected, 0, memory_order_release);
 }
 
 /*

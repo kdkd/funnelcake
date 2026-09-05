@@ -310,7 +310,7 @@ void fused_scaler_free(fused_scaler_ctx_t *ctx);
  * that treat that warning bit as success should consult this function first.
  *
  * Uses the same one-time CPU probe as the scalers; the result is cached, and
- * the call is thread-safe after the first invocation.
+ * the call is thread-safe, including the first invocation.
  */
 int fused_simd_available(void);
 

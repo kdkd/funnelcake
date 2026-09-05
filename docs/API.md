@@ -219,7 +219,7 @@ if ((rc & ~allow) != 0) {
 ```
 
 Uses the same one-time CPU probe as the scalers; the result is cached,
-and the call is thread-safe after the first invocation.
+and the call is thread-safe, including the first invocation.
 
 
 ## Data Types

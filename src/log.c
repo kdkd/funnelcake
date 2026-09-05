@@ -1,3 +1,4 @@
+#include <stdatomic.h>
 /*
  * Copyright (c) 2020-2026 Kevin Day
  *
@@ -18,9 +19,8 @@
  * emit one loud diagnostic rather than corrupting silently. */
 void fused_scratch_exhausted_warn(void)
 {
-    static int warned = 0;
-    if (!warned) {
-        warned = 1;
+    static atomic_int warned = 0;
+    if (!atomic_exchange(&warned, 1)) {
         fprintf(stderr,
             "funnelcake: internal error: scratch pool exhausted - "
             "output for this frame is invalid\n");

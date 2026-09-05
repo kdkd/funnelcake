@@ -25,3 +25,6 @@ test/samples/
 #temporary and dev viles
 attic/
 docs/superpowers/
+
+.build-config
+.build-config.tmp

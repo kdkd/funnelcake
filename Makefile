@@ -348,6 +348,20 @@ JAVAC ?= javac
 # Rust toolchain for the bindings targets (override with `make CARGO=cargo`).
 CARGO ?= cargo
 
+# Record settings that affect object code or linking. Replace the stamp only
+# when contents change, so identical builds remain incremental.
+.DEFAULT_GOAL := all
+BUILD_SETTINGS = CC AR LIB_CFLAGS TEST_CFLAGS SCALAR_CFLAGS AVX512_KERNEL_CFLAGS LINK_MARCH LDFLAGS EXTRA_LDFLAGS SWSCALE_TEST_CFLAGS SWSCALE_TEST_LDFLAGS SHLIB_LDFLAGS BIND_SHLIB_LDFLAGS DETECT_CFLAGS UNAME_M UNAME_S
+.PHONY: FORCE
+FORCE:
+.build-config: FORCE
+	@printf '%s\n' $(foreach key,$(BUILD_SETTINGS),$(call shellquote,$(key)=$($(key)))) > $@.tmp
+	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv -f $@.tmp $@
+
+shellquote = '$(subst ','"'"',$(1))'
+
+$(LIB_OBJS) $(TEST_OBJS): .build-config
+
 # Default target
 .PHONY: all lib shared test bench bench-sdr bench-hdr bench-swscale visual asm fetch-samples clean pgo pgo-clean install bindings-go test-go bindings-java test-java bindings-rust test-rust bindings-python test-python
 
@@ -356,14 +370,14 @@ all: lib
 lib: libfunnelcake.a
 
 libfunnelcake.a: $(LIB_OBJS)
-	$(AR) rcs $@ $^
+	$(AR) rcs $@ $(filter %.o,$^)
 
 # Shared library (built on demand, e.g. for `make install`). The library
 # objects are already compiled with -fPIC, so they can be reused as-is.
 shared: $(SHLIB)
 
 $(SHLIB): $(LIB_OBJS)
-	$(CC) $(SHLIB_LDFLAGS) $(LINK_MARCH) -o $@ $^ $(LDFLAGS)
+	$(CC) $(SHLIB_LDFLAGS) $(LINK_MARCH) -o $@ $(filter %.o,$^) $(LDFLAGS)
 
 # pkg-config file generated at build time so that downstream consumers
 # can do `pkg-config --cflags --libs funnelcake`.
@@ -449,7 +463,7 @@ endif
 JAVA_CORE_LIB = $(JAVA_BINDING_DIR)/libfunnelcake.$(BIND_LIBEXT)
 
 $(JAVA_CORE_LIB): $(LIB_OBJS)
-	$(CC) $(BIND_SHLIB_LDFLAGS) $(LINK_MARCH) -o $@ $^ $(LDFLAGS)
+	$(CC) $(BIND_SHLIB_LDFLAGS) $(LINK_MARCH) -o $@ $(filter %.o,$^) $(LDFLAGS)
 
 bindings-java: $(JAVA_CORE_LIB)
 	@command -v $(JAVAC) >/dev/null 2>&1 || { \
@@ -486,7 +500,7 @@ PYTHON_BINDING_DIR = bindings/python
 PY_CORE_LIB = $(PYTHON_BINDING_DIR)/libfunnelcake.$(BIND_LIBEXT)
 
 $(PY_CORE_LIB): $(LIB_OBJS)
-	$(CC) $(BIND_SHLIB_LDFLAGS) $(LINK_MARCH) -o $@ $^ $(LDFLAGS)
+	$(CC) $(BIND_SHLIB_LDFLAGS) $(LINK_MARCH) -o $@ $(filter %.o,$^) $(LDFLAGS)
 
 bindings-python: $(PY_CORE_LIB)
 	@command -v $(PYTHON) >/dev/null 2>&1 || { \
@@ -818,3 +832,9 @@ test/test_swscale_bench.o: test/test_swscale_bench.c
 # Header dependencies (conservative: rebuild all on header change)
 $(LIB_OBJS): include/funnelcake.h src/internal.h src/log.h src/detect.h src/tonemap.h src/upscale_chunk.h
 $(TEST_OBJS): include/funnelcake.h test/test_main.h test/test_patterns.h
+
+# Force changed configurations even on make/filesystems with coarse timestamps.
+BUILD_CHANGED := $(shell printf '%s\n' $(foreach key,$(BUILD_SETTINGS),$(call shellquote,$(key)=$($(key)))) | cmp -s - .build-config || echo yes)
+ifeq ($(BUILD_CHANGED),yes)
+$(LIB_OBJS) $(TEST_OBJS) libfunnelcake.a $(SHLIB) $(JAVA_CORE_LIB) $(PY_CORE_LIB) funnelcake_test: FORCE
+endif

@@ -145,13 +145,19 @@ impl Drop for Scaler {
     }
 }
 
+/// Allocation metadata cannot be modified by callers.
+/// ```compile_fail
+/// fn change(mut out: funnelcake::Output<'_>) {
+///     out.height = 4096;
+/// }
+/// ```
 /// A read-only view of one 8-bit output plane set. The plane slices borrow the
 /// producing [`Scaler`], so they cannot outlive it or survive its next `run`.
 pub struct Output<'a> {
-    pub width: i32,
-    pub height: i32,
-    pub y_stride: i32,
-    pub uv_stride: i32,
+    width: i32,
+    height: i32,
+    y_stride: i32,
+    uv_stride: i32,
     pub fallback: bool,
     y: *const u8,
     u: *const u8,
@@ -175,6 +181,11 @@ impl<'a> Output<'a> {
             _marker: PhantomData,
         }
     }
+
+    pub fn width(&self) -> i32 { self.width }
+    pub fn height(&self) -> i32 { self.height }
+    pub fn y_stride(&self) -> i32 { self.y_stride }
+    pub fn uv_stride(&self) -> i32 { self.uv_stride }
 
     /// Luma plane (`y_stride * height` bytes).
     pub fn y(&self) -> &'a [u8] {

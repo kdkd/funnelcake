@@ -204,14 +204,20 @@ impl Drop for HdrScaler {
     }
 }
 
+/// Allocation metadata cannot be modified by callers.
+/// ```compile_fail
+/// fn change(mut out: funnelcake::HdrOutput<'_>) {
+///     out.height = 4096;
+/// }
+/// ```
 /// A read-only view of one 10-bit output plane set. Samples are unsigned 16-bit
 /// (10 significant bits). Strides are in bytes. The slices borrow the producing
 /// [`HdrScaler`].
 pub struct HdrOutput<'a> {
-    pub width: i32,
-    pub height: i32,
-    pub y_stride: i32,
-    pub uv_stride: i32,
+    width: i32,
+    height: i32,
+    y_stride: i32,
+    uv_stride: i32,
     pub fallback: bool,
     y: *const u16,
     u: *const u16,
@@ -235,6 +241,11 @@ impl<'a> HdrOutput<'a> {
             _marker: PhantomData,
         }
     }
+
+    pub fn width(&self) -> i32 { self.width }
+    pub fn height(&self) -> i32 { self.height }
+    pub fn y_stride(&self) -> i32 { self.y_stride }
+    pub fn uv_stride(&self) -> i32 { self.uv_stride }
 
     /// Luma plane (16-bit samples), `(y_stride/2) * height` elements.
     pub fn y(&self) -> &'a [u16] {

@@ -54,7 +54,7 @@ scaler.run(&frame);
 
 if let Some(out) = scaler.output(SCALE_2X) {  // 960x540
     let _y: &[u8] = out.y();                  // borrows `scaler`; valid until next run/drop
-    use_planes(out.y(), out.u(), out.v(), out.y_stride);
+    use_planes(out.y(), out.u(), out.v(), out.y_stride());
 }
 # Ok::<(), funnelcake::Error>(())
 ```
@@ -209,13 +209,15 @@ pub fn upscale_sdr_output(&self, flag: u32) -> Option<Output<'_>>;
 
 ```rust
 pub struct Output<'a> {     // 8-bit
-    pub width: i32, pub height: i32, pub y_stride: i32, pub uv_stride: i32,
+    // dimensions and strides are private; use width(), height(),
+    // y_stride(), and uv_stride() getters.
     pub fallback: bool,     // scalar kernel was used for this step
 }
 pub fn Output::y(&self) -> &'a [u8];  // also u(), v()
 
 pub struct HdrOutput<'a> {  // 10-bit; samples are u16 (little-endian)
-    pub width: i32, pub height: i32, pub y_stride: i32, pub uv_stride: i32,
+    // dimensions and strides are private; use width(), height(),
+    // y_stride(), and uv_stride() getters.
     pub fallback: bool,
 }
 pub fn HdrOutput::y(&self) -> &'a [u16];  // also u(), v()

@@ -19,11 +19,11 @@ fn sdr_round_trip() {
     s.run(&f);
 
     let out = s.output(SCALE_2X).expect("2x produced");
-    assert_eq!(out.width, w / 2);
-    assert_eq!(out.height, h / 2);
-    assert_eq!(out.y_stride % 32, 0);
-    assert_eq!(out.uv_stride % 32, 0);
-    assert_eq!(out.y().len(), (out.y_stride * out.height) as usize);
+    assert_eq!(out.width(), w / 2);
+    assert_eq!(out.height(), h / 2);
+    assert_eq!(out.y_stride() % 32, 0);
+    assert_eq!(out.uv_stride() % 32, 0);
+    assert_eq!(out.y().len(), (out.y_stride() * out.height()) as usize);
 
     if simd_available() {
         assert!(!out.fallback, "SIMD available but step fell back (alignment broken?)");
@@ -61,14 +61,14 @@ fn hdr_round_trip() {
     s.run(&f);
 
     let hdr = s.hdr_output(SCALE_2X).expect("hdr 2x");
-    assert_eq!((hdr.width, hdr.height), (w / 2, h / 2));
-    assert_eq!(hdr.y().len(), ((hdr.y_stride / 2) * hdr.height) as usize);
+    assert_eq!((hdr.width(), hdr.height()), (w / 2, h / 2));
+    assert_eq!(hdr.y().len(), ((hdr.y_stride() / 2) * hdr.height()) as usize);
 
     let sdr = s.sdr_output(SCALE_2X).expect("sdr 2x");
-    assert_eq!((sdr.width, sdr.height), (w / 2, h / 2));
+    assert_eq!((sdr.width(), sdr.height()), (w / 2, h / 2));
 
     let one = s.tonemap_1x_output().expect("tonemap 1x");
-    assert_eq!((one.width, one.height), (w, h));
+    assert_eq!((one.width(), one.height()), (w, h));
 }
 
 /// Mixing thirds and pow2 families is a hard error.
@@ -95,9 +95,9 @@ fn flat_field_values() {
     s.run(&f);
     let out = s.output(SCALE_2X).expect("2x");
 
-    assert_row_const(out.y(), out.y_stride, out.width, out.height, 128, "Y");
-    assert_row_const(out.u(), out.uv_stride, out.width / 2, out.height / 2, 64, "U");
-    assert_row_const(out.v(), out.uv_stride, out.width / 2, out.height / 2, 192, "V");
+    assert_row_const(out.y(), out.y_stride(), out.width(), out.height(), 128, "Y");
+    assert_row_const(out.u(), out.uv_stride(), out.width() / 2, out.height() / 2, 64, "U");
+    assert_row_const(out.v(), out.uv_stride(), out.width() / 2, out.height() / 2, 192, "V");
 }
 
 fn assert_row_const(plane: &[u8], stride: i32, width: i32, height: i32, want: u8, name: &str) {
@@ -147,7 +147,7 @@ fn hdr_p010() {
     let mut s = HdrScaler::new(&cfg).expect("init");
     s.run(&f);
     let hdr = s.hdr_output(SCALE_2X).expect("hdr 2x");
-    assert_eq!((hdr.width, hdr.height), (w / 2, h / 2));
+    assert_eq!((hdr.width(), hdr.height()), (w / 2, h / 2));
 }
 
 /// A custom LUT of the wrong length is rejected (would otherwise be an

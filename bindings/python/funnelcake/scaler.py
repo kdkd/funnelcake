@@ -62,9 +62,9 @@ def _output_from(o, owner=None) -> Output:
         y_stride=o.y_stride,
         uv_stride=o.uv_stride,
         fallback=bool(o.fallback),
-        y=_native.view_u8(_native.ptr_addr(o.plane_y), o.y_stride * h),
-        u=_native.view_u8(_native.ptr_addr(o.plane_u), o.uv_stride * chroma_h),
-        v=_native.view_u8(_native.ptr_addr(o.plane_v), o.uv_stride * chroma_h),
+        y=_native.view_u8(_native.ptr_addr(o.plane_y), o.y_stride * h, owner._storage, True),
+        u=_native.view_u8(_native.ptr_addr(o.plane_u), o.uv_stride * chroma_h, owner._storage, True),
+        v=_native.view_u8(_native.ptr_addr(o.plane_v), o.uv_stride * chroma_h, owner._storage, True),
         _owner=owner,
     )
 
@@ -91,6 +91,7 @@ class Scaler:
         if rc < 0:
             raise FunnelcakeError(rc)
         self._ctx = ctx
+        self._storage = _native.Storage(ctx, hdr=False)
         self.warnings = Warnings(rc)
         self._src_width = config.src_width
         self._src_height = config.src_height
@@ -126,25 +127,28 @@ class Scaler:
 
     def output(self, flag: int) -> Optional[Output]:
         """The downscale output for a single ``Scale.*`` flag, or None."""
+        self._check_open()
         if not _native.single_flag(flag) or not (self._ctx.achieved_flags & int(flag)):
             return None
         return _output_from(self._ctx.outputs[_trailing_zeros(int(flag))], self)
 
     def upscale_output(self, flag: int) -> Optional[Output]:
         """An upscale-cascade output for a single ``Upscale.*`` flag, or None."""
+        self._check_open()
         if not _native.single_flag(flag) or not (self._ctx.achieved_upscale_flags & int(flag)):
             return None
         return _output_from(self._ctx.upscale_outputs[_trailing_zeros(int(flag))], self)
 
     def upscale_tail(self) -> Optional[Output]:
         """The 1.5x upscale tail output, if produced."""
+        self._check_open()
         if not self._ctx.achieved_upscale_tail:
             return None
         return _output_from(self._ctx.upscale_outputs[5], self)  # FUSED_UP_IDX_TAIL
 
     def close(self) -> None:
         if not getattr(self, "_closed", True):
-            _native._core.fused_scaler_free(byref(self._ctx))
+            self._storage = None
             self._closed = True
 
     def _check_open(self) -> None:

@@ -79,9 +79,9 @@ def _hdr_output_from(o, owner=None) -> HdrOutput:
         y_stride=o.y_stride,
         uv_stride=o.uv_stride,
         fallback=bool(o.fallback),
-        y=_native.view_u16(_native.ptr_addr(o.plane_y), (o.y_stride // 2) * h),
-        u=_native.view_u16(_native.ptr_addr(o.plane_u), (o.uv_stride // 2) * chroma_h),
-        v=_native.view_u16(_native.ptr_addr(o.plane_v), (o.uv_stride // 2) * chroma_h),
+        y=_native.view_u16(_native.ptr_addr(o.plane_y), (o.y_stride // 2) * h, owner._storage, True),
+        u=_native.view_u16(_native.ptr_addr(o.plane_u), (o.uv_stride // 2) * chroma_h, owner._storage, True),
+        v=_native.view_u16(_native.ptr_addr(o.plane_v), (o.uv_stride // 2) * chroma_h, owner._storage, True),
         _owner=owner,
     )
 
@@ -136,6 +136,7 @@ class HdrScaler:
         if rc < 0:
             raise FunnelcakeError(rc)
         self._ctx = ctx
+        self._storage = _native.Storage(ctx, hdr=True)
         self.warnings = Warnings(rc)
         self._src_width = config.src_width
         self._src_height = config.src_height
@@ -169,35 +170,40 @@ class HdrScaler:
 
     def hdr_output(self, flag: int) -> Optional[HdrOutput]:
         """The 10-bit HDR output for a downscale flag, or None."""
+        self._check_open()
         if not _native.single_flag(flag) or not (self._ctx.achieved_hdr_flags & int(flag)):
             return None
         return _hdr_output_from(self._ctx.hdr_outputs[_trailing_zeros(int(flag))], self)
 
     def sdr_output(self, flag: int) -> Optional[Output]:
         """The tone-mapped 8-bit output for a downscale flag, or None."""
+        self._check_open()
         if not _native.single_flag(flag) or not (self._ctx.achieved_sdr_flags & int(flag)):
             return None
         return _output_from(self._ctx.sdr_outputs[_trailing_zeros(int(flag))], self)
 
     def tonemap_1x_output(self) -> Optional[Output]:
         """The 1:1 tone-mapped SDR copy, if produced."""
+        self._check_open()
         if not _native.ptr_addr(self._ctx.output_1x.plane_y):
             return None
         return _output_from(self._ctx.output_1x, self)
 
     def upscale_hdr_output(self, flag: int) -> Optional[HdrOutput]:
+        self._check_open()
         if not _native.single_flag(flag) or not (self._ctx.achieved_upscale_flags & int(flag)):
             return None
         return _hdr_output_from(self._ctx.upscale_hdr_outputs[_trailing_zeros(int(flag))], self)
 
     def upscale_sdr_output(self, flag: int) -> Optional[Output]:
+        self._check_open()
         if not _native.single_flag(flag) or not (self._ctx.achieved_upscale_sdr_flags & int(flag)):
             return None
         return _output_from(self._ctx.upscale_sdr_outputs[_trailing_zeros(int(flag))], self)
 
     def close(self) -> None:
         if not getattr(self, "_closed", True):
-            _native._core.fused_hdr_free(byref(self._ctx))
+            self._storage = None
             self._closed = True
 
     def _check_open(self) -> None:

@@ -233,3 +233,12 @@ Each `Scaler`/`HdrScaler` is independent; use one per thread or guard with your
 own lock — do not share a scaler across threads without synchronization. The
 binding forces the library's one-time CPU probe at import, so concurrent first
 use is safe.
+
+### Plane ownership
+
+Frame dimensions, format, and strides are read-only. Exported frame memoryviews
+retain their native allocation, including sliced views. Output views are
+read-only and also retain their allocation independently of the scaler wrapper.
+Closing a frame or scaler prevents further use of that wrapper; existing views
+remain valid until released. A subsequent run on an open scaler still overwrites
+its borrowed output views.

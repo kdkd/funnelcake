@@ -245,25 +245,49 @@ def aligned_free(addr: int) -> None:
         _core.fused_free(c_void_p(addr))
 
 
-def view_u8(addr: int, n: int):
+def view_u8(addr: int, n: int, owner=None, readonly=False):
     """Zero-copy memoryview of `n` bytes at `addr` (format 'B'), or None."""
     if not addr or n <= 0:
         return None
     # .cast('B') strips the byte-order marker ctypes arrays carry, which
     # otherwise blocks slice assignment.
-    return memoryview((c_uint8 * n).from_address(addr)).cast("B")
+    exporter = (c_uint8 * n).from_address(addr)
+    exporter._owner = owner
+    view = memoryview(exporter).cast("B")
+    return view.toreadonly() if readonly else view
 
 
-def view_u16(addr: int, n: int):
+def view_u16(addr: int, n: int, owner=None, readonly=False):
     """Zero-copy memoryview of `n` uint16 samples at `addr` (format 'H'), or None."""
     if not addr or n <= 0:
         return None
-    return memoryview((c_uint8 * (n * 2)).from_address(addr)).cast("B").cast("H")
+    exporter = (c_uint8 * (n * 2)).from_address(addr)
+    exporter._owner = owner
+    view = memoryview(exporter).cast("B").cast("H")
+    return view.toreadonly() if readonly else view
 
 
 def ptr_addr(ptr) -> int:
     """Integer address of a ctypes POINTER (0 if NULL)."""
     return cast(ptr, c_void_p).value or 0
+
+
+class Storage:
+    """Own native storage independently of frame/scaler wrapper lifetime."""
+    def __init__(self, ctx=None, hdr=False):
+        self.ctx, self.hdr, self.planes = ctx, hdr, []
+
+    def alloc(self, size):
+        addr = aligned_alloc(size)
+        self.planes.append(addr)
+        return addr
+
+    def __del__(self):
+        if self.ctx is not None:
+            fn = _core.fused_hdr_free if self.hdr else _core.fused_scaler_free
+            fn(byref(self.ctx))
+        for addr in self.planes:
+            aligned_free(addr)
 
 
 def validate_dimensions(width, height):

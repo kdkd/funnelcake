@@ -47,6 +47,7 @@ pub struct Scaler {
 impl Scaler {
     /// Validates the configuration and allocates output buffers.
     pub fn new(cfg: &ScalerConfig) -> Result<Scaler, Error> {
+        if !crate::valid_dimensions(cfg.src_width, cfg.src_height, 2) { return Err(Error::BadDimensions); }
         ensure_detect();
         // SAFETY: ScalerCtx is a repr(C) POD; an all-zero value is valid
         // (null pointers, zeroed log configs => stderr defaults).

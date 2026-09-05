@@ -97,6 +97,7 @@ class HdrScaler:
             raise ValueError(
                 f"custom tone-map LUT must be exactly 1024 bytes, got {len(lut)}"
             )
+        _native.validate_dimensions(config.src_width, config.src_height)
         ctx = _native.HdrCtx()
         fmt = PixelFormat(config.format)
         semi_planar = fmt in (PixelFormat.P010, PixelFormat.P210)

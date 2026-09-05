@@ -70,6 +70,7 @@ type HDRScaler struct {
 // NewHDRScaler validates the configuration, builds tone-mapping LUTs, allocates
 // outputs, and returns a ready HDRScaler.
 func NewHDRScaler(cfg HDRConfig) (*HDRScaler, error) {
+	if !validDimensions(cfg.SrcWidth, cfg.SrcHeight) { return nil, ErrBadDimensions }
 	ensureDetect()
 
 	if n := len(cfg.Tonemap.CustomLUT); n != 0 && n != 1024 {

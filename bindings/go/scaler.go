@@ -44,6 +44,7 @@ type Scaler struct {
 // a ready Scaler. A negative library return becomes an Error; non-fatal
 // conditions are reported via the Warnings field (also check SIMDAvailable).
 func NewScaler(cfg ScalerConfig) (*Scaler, error) {
+	if !validDimensions(cfg.SrcWidth, cfg.SrcHeight) { return nil, ErrBadDimensions }
 	ensureDetect()
 
 	ctx := (*C.fused_scaler_ctx_t)(C.calloc(1, C.size_t(unsafe.Sizeof(C.fused_scaler_ctx_t{}))))

@@ -102,6 +102,7 @@ public final class HdrScaler implements AutoCloseable {
      * @throws IllegalArgumentException if a custom LUT is not exactly 1024 bytes
      */
     public HdrScaler(Config cfg) {
+        Native.validateDimensions(cfg.srcWidth(), cfg.srcHeight());
         Tonemap tm = cfg.tonemap() != null ? cfg.tonemap() : Tonemap.defaults();
         if (tm.customLut() != null && tm.customLut().length != 1024) {
             throw new IllegalArgumentException(

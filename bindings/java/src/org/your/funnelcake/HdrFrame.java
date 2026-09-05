@@ -37,6 +37,7 @@ public final class HdrFrame implements AutoCloseable {
      *                                  format is unknown
      */
     public HdrFrame(int width, int height, int format) {
+        Native.validateDimensions(width, height);
         if (width <= 0 || height <= 0) {
             throw new IllegalArgumentException("frame dimensions must be positive");
         }

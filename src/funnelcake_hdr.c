@@ -1,4 +1,5 @@
 #include <stdatomic.h>
+#include <limits.h>
 /*
  * Copyright (c) 2020-2026 Kevin Day
  *
@@ -81,6 +82,7 @@ int fused_hdr_init(fused_hdr_ctx_t *ctx)
     /* ------------------------------------------------------------------ */
 
     if (ctx->src_width <= 0 || ctx->src_height <= 0 ||
+        ctx->src_width > INT_MAX / 64 || ctx->src_height > INT_MAX / 64 ||
         (ctx->src_width & 1) || (ctx->src_height & 1)) {
         fused_log(&ctx->log_errors, FUSED_LOG_ERROR,
             "funnelcake-hdr: src_width=%d src_height=%d must be positive and even\n",
@@ -116,6 +118,13 @@ int fused_hdr_init(fused_hdr_ctx_t *ctx)
                 ctx->src_uv_stride, min_uv_stride);
             return FUSED_ERR_BAD_ALIGNMENT;
         }
+    }
+
+    /* Kernels use int row offsets and HDR 4:2:2 doubles the UV stride. */
+    if (ctx->src_y_stride <= 0 || ctx->src_uv_stride <= 0 ||
+        ctx->src_y_stride > INT_MAX / ctx->src_height ||
+        ctx->src_uv_stride > INT_MAX / ctx->src_height) {
+        return FUSED_ERR_BAD_DIMENSIONS;
     }
 
     /* ------------------------------------------------------------------ */

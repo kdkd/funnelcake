@@ -60,7 +60,7 @@ impl Frame {
     /// # Panics
     /// If a dimension is not positive.
     pub fn new(width: i32, height: i32) -> Frame {
-        assert!(width > 0 && height > 0, "frame dimensions must be positive");
+        assert!(crate::valid_dimensions(width, height, 2), "invalid frame dimensions");
         let y_stride = align32(width);
         let uv_stride = align32(width / 2);
         let chroma_h = (height + 1) / 2;
@@ -139,7 +139,7 @@ impl HdrFrame {
     /// # Panics
     /// If a dimension is not positive.
     pub fn new(width: i32, height: i32, format: PixelFormat) -> HdrFrame {
-        assert!(width > 0 && height > 0, "frame dimensions must be positive");
+        assert!(crate::valid_dimensions(width, height, 2), "invalid frame dimensions");
         let semi_planar = matches!(format, PixelFormat::P010 | PixelFormat::P210);
         let is_422 = matches!(format, PixelFormat::I210 | PixelFormat::P210);
         let y_stride = align32(width * 2);

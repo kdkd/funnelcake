@@ -264,3 +264,11 @@ def view_u16(addr: int, n: int):
 def ptr_addr(ptr) -> int:
     """Integer address of a ctypes POINTER (0 if NULL)."""
     return cast(ptr, c_void_p).value or 0
+
+
+def validate_dimensions(width, height):
+    if (not isinstance(width, int) or not isinstance(height, int)
+            or width <= 0 or height <= 0 or width % 2 or height % 2
+            or width > 33554431 or height > 33554431
+            or ((width * 2 + 31) & ~31) * height > 2147483647):
+        raise ValueError("frame dimensions must be positive, even and fit native indexing")

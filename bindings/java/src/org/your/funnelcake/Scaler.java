@@ -67,6 +67,7 @@ public final class Scaler implements AutoCloseable {
      * @throws FunnelcakeException if the library returns a hard error
      */
     public Scaler(Config cfg) {
+        Native.validateDimensions(cfg.srcWidth(), cfg.srcHeight());
         this.arena = Arena.ofShared();
         this.ctx = arena.allocate(Native.SCALER_CTX); // zero-filled
 

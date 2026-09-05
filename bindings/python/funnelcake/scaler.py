@@ -75,6 +75,7 @@ class Scaler:
     """
 
     def __init__(self, config: ScalerConfig):
+        _native.validate_dimensions(config.src_width, config.src_height)
         ctx = _native.ScalerCtx()
         ys, uvs = _native.plane_strides(config.src_width)
         ctx.src_width = config.src_width

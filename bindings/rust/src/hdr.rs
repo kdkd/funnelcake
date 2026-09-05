@@ -64,6 +64,7 @@ pub struct HdrScaler {
 impl HdrScaler {
     /// Builds tone-mapping LUTs and allocates outputs.
     pub fn new(cfg: &HdrConfig) -> Result<HdrScaler, Error> {
+        if !crate::valid_dimensions(cfg.src_width, cfg.src_height, 2) { return Err(Error::BadDimensions); }
         ensure_detect();
         let mut ctx: Box<ffi::HdrCtx> = Box::new(unsafe { std::mem::zeroed() });
 

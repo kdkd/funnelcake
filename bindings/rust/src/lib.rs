@@ -175,5 +175,11 @@ pub fn simd_available() -> bool {
 
 /// Round up to the next multiple of 32 (the SIMD stride/alignment unit).
 pub(crate) fn align32(n: i32) -> i32 {
-    (n + 31) & !31
+    n.checked_add(31).filter(|_| n > 0).map(|v| v & !31).unwrap_or(0)
+}
+
+pub(crate) fn valid_dimensions(width: i32, height: i32, bytes: i32) -> bool {
+    width > 0 && height > 0 && width % 2 == 0 && height % 2 == 0
+        && width <= i32::MAX / 64 && height <= i32::MAX / 64
+        && i64::from(align32(width * bytes)) * i64::from(height) <= i64::from(i32::MAX)
 }

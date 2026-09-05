@@ -29,11 +29,12 @@
 #include "funnelcake.h"
 
 #include <stdlib.h>
+#include <limits.h>
 
 /* Round `n` up to the next multiple of 32 (the SIMD stride/alignment unit). */
 static int round_up_32(int n)
 {
-    return (n + 31) & ~31;
+    return n > 0 && n <= INT_MAX - 31 ? (n + 31) & ~31 : 0;
 }
 
 void *fused_aligned_alloc(size_t alignment, size_t size)
@@ -69,7 +70,7 @@ void fused_plane_strides(int width, int *y_stride, int *uv_stride)
 void fused_plane_strides_16(int width, int *y_stride, int *uv_stride)
 {
     if (y_stride) {
-        *y_stride = round_up_32(width * 2);
+        *y_stride = round_up_32(width > 0 && width <= (INT_MAX - 31) / 2 ? width * 2 : 0);
     }
     if (uv_stride) {
         /* chroma_w = width/2 samples, 2 bytes each */

@@ -19,8 +19,7 @@ class Frame:
     """
 
     def __init__(self, width: int, height: int):
-        if width <= 0 or height <= 0:
-            raise ValueError("frame dimensions must be positive")
+        _native.validate_dimensions(width, height)
         self.width = width
         self.height = height
         self.y_stride, self.uv_stride = _native.plane_strides(width)
@@ -67,8 +66,7 @@ class HdrFrame:
     """
 
     def __init__(self, width: int, height: int, format: PixelFormat):
-        if width <= 0 or height <= 0:
-            raise ValueError("frame dimensions must be positive")
+        _native.validate_dimensions(width, height)
         self.width = width
         self.height = height
         self.format = PixelFormat(format)

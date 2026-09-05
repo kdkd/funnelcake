@@ -357,6 +357,14 @@ final class Native {
 
     // ----- misc -----
 
+    static void validateDimensions(int width, int height) {
+        if (width <= 0 || height <= 0 || (width & 1) != 0 || (height & 1) != 0
+                || width > Integer.MAX_VALUE / 64 || height > Integer.MAX_VALUE / 64
+                || (((long) width * 2 + 31) & ~31L) * height > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException("invalid frame dimensions");
+        }
+    }
+
     static int align32(int n) {
         return (n + 31) & ~31;
     }

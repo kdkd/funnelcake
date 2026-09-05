@@ -43,7 +43,7 @@ type Frame struct {
 // NewFrame allocates an aligned I420 frame. width and height should be even
 // (4:2:0 chroma is half-resolution in each axis).
 func NewFrame(width, height int) (*Frame, error) {
-	if width <= 0 || height <= 0 {
+	if !validDimensions(width, height) {
 		return nil, ErrBadDimensions
 	}
 	var ys, uvs C.int
@@ -115,7 +115,7 @@ func (pf PixelFormat) isSemiPlanar() bool { return pf == PixP010 || pf == PixP21
 
 // NewHDRFrame allocates an aligned 10-bit frame for the given format.
 func NewHDRFrame(width, height int, format PixelFormat) (*HDRFrame, error) {
-	if width <= 0 || height <= 0 {
+	if !validDimensions(width, height) {
 		return nil, ErrBadDimensions
 	}
 	if format < PixI010 || format > PixP210 {
@@ -194,4 +194,10 @@ func u16View(p unsafe.Pointer, n int) []uint16 {
 		return nil
 	}
 	return unsafe.Slice((*uint16)(p), n)
+}
+
+func validDimensions(width, height int) bool {
+	return width > 0 && height > 0 && width%2 == 0 && height%2 == 0 &&
+		width <= 33554431 && height <= 33554431 &&
+		int64((width*2+31)&^31)*int64(height) <= 2147483647
 }

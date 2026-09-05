@@ -38,6 +38,7 @@ public final class Frame implements AutoCloseable {
      * @throws IllegalArgumentException if either dimension is not positive
      */
     public Frame(int width, int height) {
+        Native.validateDimensions(width, height);
         if (width <= 0 || height <= 0) {
             throw new IllegalArgumentException("frame dimensions must be positive");
         }

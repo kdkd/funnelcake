@@ -103,6 +103,7 @@ class Scaler:
     """
 
     def __init__(self, config: ScalerConfig):
+        _native.check_integer_fields(config, unsigned=("flags", "options", "upscale_flags"))
         _native.validate_dimensions(config.src_width, config.src_height)
         ctx = _native.ScalerCtx()
         ys, uvs = _native.plane_strides(config.src_width)

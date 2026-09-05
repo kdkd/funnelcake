@@ -11,3 +11,11 @@ class BoundsTests(unittest.TestCase):
                     fc.HdrFrame(w, h, fc.PixelFormat.P010)
                 with self.assertRaises(ValueError):
                     fc.Scaler(fc.ScalerConfig(w, h, fc.Scale.X2))
+
+    def test_no_integer_wrapping(self):
+        with self.assertRaises(ValueError):
+            fc.Scaler(fc.ScalerConfig(128, 64, (1 << 32) | fc.Scale.X2))
+        config = fc.HdrConfig(128, 64, flags=fc.Scale.X2, hdr_flags=fc.Scale.X2)
+        config.tonemap.peak_nits = 1 << 40
+        with self.assertRaises(ValueError):
+            fc.HdrScaler(config)

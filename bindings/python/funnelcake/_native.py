@@ -317,3 +317,11 @@ def version():
 def backend():
     """Preferred native backend; individual outputs may fall back to scalar."""
     return _core.fused_backend().decode("ascii")
+
+
+def check_integer_fields(config, signed=(), unsigned=()):
+    for name in signed + unsigned:
+        value = getattr(config, name)
+        low, high = (-2147483648, 2147483647) if name in signed else (0, 4294967295)
+        if not isinstance(value, int) or not low <= value <= high:
+            raise ValueError(f"{name} is outside the native integer range")

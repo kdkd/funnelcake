@@ -73,6 +73,11 @@ func NewHDRScaler(cfg HDRConfig) (*HDRScaler, error) {
 	if !validDimensions(cfg.SrcWidth, cfg.SrcHeight) {
 		return nil, ErrBadDimensions
 	}
+	for _, value := range []int{int(cfg.Format), int(cfg.Transfer), int(cfg.Tonemap.Curve), cfg.Tonemap.PeakNits, cfg.Tonemap.TargetNits, int(cfg.Tonemap.SrcRange), int(cfg.Tonemap.DstRange)} {
+		if int64(value) < -2147483648 || int64(value) > 2147483647 {
+			return nil, ErrInvalidFlags
+		}
+	}
 	ensureDetect()
 
 	if n := len(cfg.Tonemap.CustomLUT); n != 0 && n != 1024 {

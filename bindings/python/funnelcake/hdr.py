@@ -120,6 +120,9 @@ class HdrScaler:
     """
 
     def __init__(self, config: HdrConfig):
+        _native.check_integer_fields(config, signed=("format", "transfer"),
+                                     unsigned=("flags", "hdr_flags", "sdr_flags", "options", "upscale_flags", "upscale_sdr_flags"))
+        _native.check_integer_fields(config.tonemap, signed=("curve", "peak_nits", "target_nits", "src_range", "dst_range"))
         lut = config.tonemap.custom_lut
         if lut is not None and len(lut) != 1024:
             raise ValueError(

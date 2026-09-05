@@ -61,6 +61,8 @@ static inline int fused_init_alloc(void **out, size_t alignment, size_t size,
         return 0;
     }
     int rc = fused_alloc_aligned(out, alignment, size);
+    /* Initialize padding too: foreign bindings expose complete plane slices. */
+    if (rc == 0) memset(*out, 0, size);
     return rc;
 }
 

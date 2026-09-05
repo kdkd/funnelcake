@@ -242,3 +242,9 @@ read-only and also retain their allocation independently of the scaler wrapper.
 Closing a frame or scaler prevents further use of that wrapper; existing views
 remain valid until released. A subsequent run on an open scaler still overwrites
 its borrowed output views.
+
+### Active rows and owned copies
+
+Output and HdrOutput provide y_row(row), u_row(row), and v_row(row) views
+containing only active samples. copy() returns independent, tightly packed,
+read-only planes that survive later runs and close.

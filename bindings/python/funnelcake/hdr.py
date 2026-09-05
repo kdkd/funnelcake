@@ -70,6 +70,34 @@ class HdrOutput:
     _owner: object = None  # pins the producing scaler; see scaler.Output._owner
 
 
+    def _row(self, plane, row):
+        height = self.height if plane == "y" else (self.height + 1) // 2
+        width = self.width if plane == "y" else self.width // 2
+        stride = (self.y_stride if plane == "y" else self.uv_stride) // 2
+        if not 0 <= row < height:
+            raise IndexError("row out of range")
+        return getattr(self, plane)[row * stride:row * stride + width]
+
+    def y_row(self, row):
+        return self._row("y", row)
+
+    def u_row(self, row):
+        return self._row("u", row)
+
+    def v_row(self, row):
+        return self._row("v", row)
+
+    def copy(self):
+        """Own tightly packed planes that survive future runs and close."""
+        planes = []
+        for plane in ("y", "u", "v"):
+            rows = self.height if plane == "y" else (self.height + 1) // 2
+            data = b"".join(self._row(plane, r).tobytes() for r in range(rows))
+            planes.append(memoryview(data).cast("H"))
+        return HdrOutput(self.width, self.height, self.width * 2,
+                       self.width // 2 * 2, self.fallback, *planes)
+
+
 def _hdr_output_from(o, owner=None) -> HdrOutput:
     h = o.height
     chroma_h = (h + 1) // 2

@@ -33,4 +33,30 @@ public record Output(
         MemorySegment y,
         MemorySegment u,
         MemorySegment v) {
+    public MemorySegment yRow(int row) {
+        if (row < 0 || row >= height) throw new IndexOutOfBoundsException(row);
+        return y.asSlice((long) row * yStride, (long) (width) * 1).asReadOnly();
+    }
+    public MemorySegment uRow(int row) {
+        if (row < 0 || row >= (height + 1) / 2) throw new IndexOutOfBoundsException(row);
+        return u.asSlice((long) row * uvStride, (long) (width / 2) * 1).asReadOnly();
+    }
+    public MemorySegment vRow(int row) {
+        if (row < 0 || row >= (height + 1) / 2) throw new IndexOutOfBoundsException(row);
+        return v.asSlice((long) row * uvStride, (long) (width / 2) * 1).asReadOnly();
+    }
+    /** Independent tightly packed copy backed by Java arrays. */
+    public Output copy() {
+        int ch = (height + 1) / 2;
+        MemorySegment py = MemorySegment.ofArray(new byte[Math.multiplyExact(width * 1, height)]);
+        MemorySegment pu = MemorySegment.ofArray(new byte[Math.multiplyExact(width / 2 * 1, ch)]);
+        MemorySegment pv = MemorySegment.ofArray(new byte[Math.multiplyExact(width / 2 * 1, ch)]);
+        for (int r=0; r<height; ++r) py.asSlice((long) r * width * 1, (long) width * 1).copyFrom(yRow(r));
+        for (int r=0; r<ch; ++r) {
+            pu.asSlice((long) r * (width / 2) * 1, (long) (width / 2) * 1).copyFrom(uRow(r));
+            pv.asSlice((long) r * (width / 2) * 1, (long) (width / 2) * 1).copyFrom(vRow(r));
+        }
+        return new Output(width, height, width * 1, width / 2 * 1, fallback,
+                py.asReadOnly(), pu.asReadOnly(), pv.asReadOnly());
+    }
 }

@@ -260,3 +260,9 @@ will stop you from moving or sharing one across threads. Per-context work is
 independent, so the intended pattern is to construct and use a scaler on the
 thread that needs it. The binding forces the library's one-time CPU probe on
 first use, so concurrent first constructions on different threads are safe.
+
+### Active rows and owned copies
+
+Output and HdrOutput provide y_row(row), u_row(row), and v_row(row) slices
+containing only active samples. to_owned() returns an OwnedOutput with tightly
+packed vectors that survive the scaler and future runs.

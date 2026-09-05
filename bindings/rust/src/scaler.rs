@@ -187,6 +187,37 @@ impl<'a> Output<'a> {
     pub fn y_stride(&self) -> i32 { self.y_stride }
     pub fn uv_stride(&self) -> i32 { self.uv_stride }
 
+    /// Active samples only; panics if row is outside the plane.
+    pub fn y_row(&self, row: usize) -> &'a [u8] {
+        assert!(row < self.height as usize, "row out of range");
+        let start = row * (self.y_stride as usize / 1);
+        &self.y()[start..start + (self.width) as usize]
+    }
+
+    /// Active samples only; panics if row is outside the plane.
+    pub fn u_row(&self, row: usize) -> &'a [u8] {
+        assert!(row < self.chroma_h as usize, "row out of range");
+        let start = row * (self.uv_stride as usize / 1);
+        &self.u()[start..start + (self.width / 2) as usize]
+    }
+
+    /// Active samples only; panics if row is outside the plane.
+    pub fn v_row(&self, row: usize) -> &'a [u8] {
+        assert!(row < self.chroma_h as usize, "row out of range");
+        let start = row * (self.uv_stride as usize / 1);
+        &self.v()[start..start + (self.width / 2) as usize]
+    }
+
+    /// Independent tightly packed output, with stride padding removed.
+    pub fn to_owned(&self) -> crate::OwnedOutput<u8> {
+        crate::OwnedOutput {
+            width: self.width, height: self.height,
+            y: (0..self.height as usize).flat_map(|r| self.y_row(r).iter().copied()).collect(),
+            u: (0..self.chroma_h as usize).flat_map(|r| self.u_row(r).iter().copied()).collect(),
+            v: (0..self.chroma_h as usize).flat_map(|r| self.v_row(r).iter().copied()).collect(),
+        }
+    }
+
     /// Luma plane (`y_stride * height` bytes).
     pub fn y(&self) -> &'a [u8] {
         let n = self.y_stride as usize * self.height as usize;

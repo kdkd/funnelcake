@@ -326,7 +326,7 @@ final class Native {
      */
     private static MemorySegment plane(Arena arena, MemorySegment ctx, long off, long size) {
         MemorySegment p = ctx.get(ADDRESS, off);
-        return p.address() == 0 ? MemorySegment.NULL : p.reinterpret(size, arena, null);
+        return p.address() == 0 ? MemorySegment.NULL : p.reinterpret(size, arena, null).asReadOnly();
     }
 
     static Output readOutput(Arena arena, MemorySegment ctx, long base) {

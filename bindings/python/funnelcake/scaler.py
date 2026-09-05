@@ -53,6 +53,34 @@ class Output:
     _owner: object = None
 
 
+    def _row(self, plane, row):
+        height = self.height if plane == "y" else (self.height + 1) // 2
+        width = self.width if plane == "y" else self.width // 2
+        stride = (self.y_stride if plane == "y" else self.uv_stride) // 1
+        if not 0 <= row < height:
+            raise IndexError("row out of range")
+        return getattr(self, plane)[row * stride:row * stride + width]
+
+    def y_row(self, row):
+        return self._row("y", row)
+
+    def u_row(self, row):
+        return self._row("u", row)
+
+    def v_row(self, row):
+        return self._row("v", row)
+
+    def copy(self):
+        """Own tightly packed planes that survive future runs and close."""
+        planes = []
+        for plane in ("y", "u", "v"):
+            rows = self.height if plane == "y" else (self.height + 1) // 2
+            data = b"".join(self._row(plane, r).tobytes() for r in range(rows))
+            planes.append(memoryview(data).cast("B"))
+        return Output(self.width, self.height, self.width * 1,
+                       self.width // 2 * 1, self.fallback, *planes)
+
+
 def _output_from(o, owner=None) -> Output:
     h = o.height
     chroma_h = (h + 1) // 2

@@ -30,6 +30,7 @@ public final class FunnelcakeTest {
         hdrP010();
         customLutLength();
         frameMismatch();
+        ownedOutput();
 
         if (failures == 0) {
             System.out.println("OK  org.your.funnelcake  (all checks passed)");
@@ -38,6 +39,21 @@ public final class FunnelcakeTest {
             System.out.println("FAIL  " + failures + " check(s) failed");
             System.exit(1);
         }
+    }
+
+    private static void ownedOutput() {
+        Output copy;
+        try (Frame f = new Frame(136, 64);
+             Scaler s = new Scaler(new Scaler.Config(136, 64, Funnelcake.SCALE_2X))) {
+            f.y().fill((byte) 91);
+            s.run(f);
+            Output out = s.output(Funnelcake.SCALE_2X).orElseThrow();
+            check("output is read-only", out.y().isReadOnly());
+            check("row omits padding", out.yRow(0).byteSize() == out.width());
+            copy = out.copy();
+        }
+        check("owned output survives close", copy.y().get(JAVA_BYTE, 0) == 91);
+        check("owned output is packed", copy.y().byteSize() == (long) copy.width() * copy.height());
     }
 
     /** 256x256 -> 2x downscale; with SIMD the step must not fall back. */

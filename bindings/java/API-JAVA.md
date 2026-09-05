@@ -269,3 +269,9 @@ Each `Scaler` / `HdrScaler` is independent and may run on its own thread. Do not
 share one scaler across threads without your own synchronization. The binding
 forces the library's one-time CPU probe during class initialization, so
 concurrent first uses are safe.
+
+### Active rows and owned copies
+
+Output and HdrOutput provide yRow(row), uRow(row), and vRow(row) read-only
+segments containing only active samples. copy() returns independent, tightly
+packed, read-only planes backed by Java arrays.

@@ -183,3 +183,13 @@ pub(crate) fn valid_dimensions(width: i32, height: i32, bytes: i32) -> bool {
         && width <= i32::MAX / 64 && height <= i32::MAX / 64
         && i64::from(align32(width * bytes)) * i64::from(height) <= i64::from(i32::MAX)
 }
+
+/// Tightly packed, independent output planes. Samples are u8 or u16.
+#[derive(Debug, Clone)]
+pub struct OwnedOutput<T> {
+    pub width: i32,
+    pub height: i32,
+    pub y: Vec<T>,
+    pub u: Vec<T>,
+    pub v: Vec<T>,
+}

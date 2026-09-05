@@ -259,10 +259,11 @@ type HDROutput struct {
 	UVStride int
 	Fallback bool
 
-	y, u, v       unsafe.Pointer
-	chromaH       int
-	ySize, uvSize int
-	keepalive     interface{} // pins the producing HDRScaler; see Output.keepalive
+	y, u, v                                      unsafe.Pointer
+	chromaH                                      int
+	ySize, uvSize                                int
+	rowWidth, rowHeight, rowYStride, rowUVStride int
+	keepalive                                    interface{} // pins the producing HDRScaler; see Output.keepalive
 }
 
 // Y returns the luma plane copy as uint16 samples.
@@ -287,7 +288,8 @@ func cToHDROutput(co *C.fused_hdr_output_t) HDROutput {
 		v:        unsafe.Pointer(co.plane_v),
 		chromaH:  chroma420Height(h),
 		ySize:    int(co.y_stride) * h,
-		uvSize:   int(co.uv_stride) * chroma420Height(h),
+		rowWidth: int(co.width), rowHeight: h, rowYStride: int(co.y_stride), rowUVStride: int(co.uv_stride),
+		uvSize: int(co.uv_stride) * chroma420Height(h),
 	}
 }
 
@@ -306,4 +308,40 @@ func (o HDROutput) copyPlane(p unsafe.Pointer, n int) []uint16 {
 	result := append([]uint16(nil), u16View(p, n)...)
 	runtime.KeepAlive(o.keepalive)
 	return result
+}
+
+// YRow copies only the active samples of a row.
+func (o HDROutput) YRow(row int) []uint16 {
+	if row < 0 || row >= o.rowHeight {
+		panic("funnelcake: row out of range")
+	}
+	return o.copyPlane(unsafe.Add(o.y, row*o.rowYStride), o.rowWidth)
+}
+
+// URow copies only the active samples of a row.
+func (o HDROutput) URow(row int) []uint16 {
+	if row < 0 || row >= (o.rowHeight+1)/2 {
+		panic("funnelcake: row out of range")
+	}
+	return o.copyPlane(unsafe.Add(o.u, row*o.rowUVStride), o.rowWidth/2)
+}
+
+// VRow copies only the active samples of a row.
+func (o HDROutput) VRow(row int) []uint16 {
+	if row < 0 || row >= (o.rowHeight+1)/2 {
+		panic("funnelcake: row out of range")
+	}
+	return o.copyPlane(unsafe.Add(o.v, row*o.rowUVStride), o.rowWidth/2)
+}
+
+// Packed copies all active rows, omitting stride padding.
+func (o HDROutput) Packed() (y, u, v []uint16) {
+	for r := 0; r < o.rowHeight; r++ {
+		y = append(y, o.YRow(r)...)
+	}
+	for r := 0; r < (o.rowHeight+1)/2; r++ {
+		u = append(u, o.URow(r)...)
+		v = append(v, o.VRow(r)...)
+	}
+	return
 }

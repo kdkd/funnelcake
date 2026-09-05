@@ -175,9 +175,10 @@ type Output struct {
 	UVStride int
 	Fallback bool // true if the scalar kernel was used for this step
 
-	y, u, v       unsafe.Pointer
-	chromaH       int
-	ySize, uvSize int
+	y, u, v                                      unsafe.Pointer
+	chromaH                                      int
+	ySize, uvSize                                int
+	rowWidth, rowHeight, rowYStride, rowUVStride int
 	// keepalive pins the producing scaler so that, as long as this Output is
 	// reachable, the scaler's finalizer cannot run and free the buffers these
 	// views alias. Copy data out if you need it past the scaler's lifetime.
@@ -206,7 +207,8 @@ func cToOutput(co *C.fused_scale_output_t) Output {
 		v:        unsafe.Pointer(co.plane_v),
 		chromaH:  chroma420Height(h),
 		ySize:    int(co.y_stride) * h,
-		uvSize:   int(co.uv_stride) * chroma420Height(h),
+		rowWidth: int(co.width), rowHeight: h, rowYStride: int(co.y_stride), rowUVStride: int(co.uv_stride),
+		uvSize: int(co.uv_stride) * chroma420Height(h),
 	}
 }
 
@@ -232,4 +234,40 @@ func (o Output) copyPlane(p unsafe.Pointer, n int) []byte {
 	result := append([]byte(nil), byteView(p, n)...)
 	runtime.KeepAlive(o.keepalive)
 	return result
+}
+
+// YRow copies only the active samples of a row.
+func (o Output) YRow(row int) []byte {
+	if row < 0 || row >= o.rowHeight {
+		panic("funnelcake: row out of range")
+	}
+	return o.copyPlane(unsafe.Add(o.y, row*o.rowYStride), o.rowWidth)
+}
+
+// URow copies only the active samples of a row.
+func (o Output) URow(row int) []byte {
+	if row < 0 || row >= (o.rowHeight+1)/2 {
+		panic("funnelcake: row out of range")
+	}
+	return o.copyPlane(unsafe.Add(o.u, row*o.rowUVStride), o.rowWidth/2)
+}
+
+// VRow copies only the active samples of a row.
+func (o Output) VRow(row int) []byte {
+	if row < 0 || row >= (o.rowHeight+1)/2 {
+		panic("funnelcake: row out of range")
+	}
+	return o.copyPlane(unsafe.Add(o.v, row*o.rowUVStride), o.rowWidth/2)
+}
+
+// Packed copies all active rows, omitting stride padding.
+func (o Output) Packed() (y, u, v []byte) {
+	for r := 0; r < o.rowHeight; r++ {
+		y = append(y, o.YRow(r)...)
+	}
+	for r := 0; r < (o.rowHeight+1)/2; r++ {
+		u = append(u, o.URow(r)...)
+		v = append(v, o.VRow(r)...)
+	}
+	return
 }

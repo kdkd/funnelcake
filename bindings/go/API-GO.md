@@ -404,3 +404,9 @@ Obtain copies before closing the scaler. They remain valid after another Run,
 Close, or garbage collection, and modifying a copy never changes scaler output.
 This replaces the earlier borrowed-output-slice behavior, since a plain Go slice
 cannot keep a C allocation owner alive.
+
+### Active rows and owned copies
+
+Output and HDROutput provide YRow(row), URow(row), and VRow(row) copies
+containing only active samples. Packed() returns independent tightly packed
+y, u, v slices.

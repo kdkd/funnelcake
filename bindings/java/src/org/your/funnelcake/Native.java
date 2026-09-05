@@ -210,6 +210,7 @@ final class Native {
     private static MethodHandle MH_hdr_run;
     private static MethodHandle MH_hdr_free;
     private static MethodHandle MH_simd;
+    private static MethodHandle MH_version, MH_backend;
     private static MethodHandle MH_scaler_sizeof;
     private static MethodHandle MH_hdr_sizeof;
 
@@ -232,6 +233,8 @@ final class Native {
             MH_hdr_init = linker.downcallHandle(core.find("fused_hdr_init").orElseThrow(), initDesc);
             MH_hdr_run = linker.downcallHandle(core.find("fused_hdr_run").orElseThrow(), runDesc);
             MH_hdr_free = linker.downcallHandle(core.find("fused_hdr_free").orElseThrow(), freeDesc);
+            MH_version = linker.downcallHandle(core.find("fused_version").orElseThrow(), FunctionDescriptor.of(ADDRESS));
+            MH_backend = linker.downcallHandle(core.find("fused_backend").orElseThrow(), FunctionDescriptor.of(ADDRESS));
             MH_simd = linker.downcallHandle(core.find("fused_simd_available").orElseThrow(),
                     FunctionDescriptor.of(JAVA_INT));
             MH_scaler_sizeof = linker.downcallHandle(core.find("fused_scaler_ctx_sizeof").orElseThrow(),
@@ -306,6 +309,13 @@ final class Native {
         } catch (Throwable t) {
             throw rethrow(t);
         }
+    }
+
+    static String diagnostic(boolean version) {
+        try {
+            MemorySegment text = (MemorySegment) (version ? MH_version : MH_backend).invokeExact();
+            return text.reinterpret(Long.MAX_VALUE).getString(0);
+        } catch (Throwable t) { throw rethrow(t); }
     }
 
     static int simdAvailable() {

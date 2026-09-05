@@ -20,6 +20,7 @@ from ctypes import (
     Structure,
     byref,
     c_int,
+    c_char_p,
     c_size_t,
     c_uint8,
     c_uint16,
@@ -300,3 +301,19 @@ def validate_dimensions(width, height):
 
 def single_flag(flag):
     return isinstance(flag, int) and 0 < flag <= 0xffffffff and flag & (flag - 1) == 0
+
+
+_core.fused_version.argtypes = []
+_core.fused_version.restype = c_char_p
+_core.fused_backend.argtypes = []
+_core.fused_backend.restype = c_char_p
+
+
+def version():
+    """Version of the loaded native library."""
+    return _core.fused_version().decode("ascii")
+
+
+def backend():
+    """Preferred native backend; individual outputs may fall back to scalar."""
+    return _core.fused_backend().decode("ascii")

@@ -314,6 +314,10 @@ void fused_scaler_free(fused_scaler_ctx_t *ctx);
  */
 int fused_simd_available(void);
 
+/* Static strings, valid for the lifetime of the loaded library. Backend is
+ * the preferred available ISA; individual outputs may use scalar fallback. */
+const char *fused_version(void);
+const char *fused_backend(void);
 
 
 /* ==========================================================================

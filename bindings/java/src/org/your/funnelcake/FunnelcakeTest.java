@@ -22,6 +22,8 @@ public final class FunnelcakeTest {
     private static int failures;
 
     public static void main(String[] args) {
+        check("library version available", !Funnelcake.version().isEmpty());
+        check("backend available", java.util.Set.of("scalar","avx2","avx512","neon","rvv").contains(Funnelcake.backend()));
         sdrRoundTrip();
         hdrRoundTrip();
         invalidFlags();

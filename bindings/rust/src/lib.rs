@@ -193,3 +193,13 @@ pub struct OwnedOutput<T> {
     pub u: Vec<T>,
     pub v: Vec<T>,
 }
+
+/// Version of the linked native library.
+pub fn version() -> &'static str {
+    unsafe { std::ffi::CStr::from_ptr(ffi::fused_version()) }.to_str().unwrap_or("unknown")
+}
+
+/// Preferred native backend; individual outputs can still use scalar fallback.
+pub fn backend() -> &'static str {
+    unsafe { std::ffi::CStr::from_ptr(ffi::fused_backend()) }.to_str().unwrap_or("unknown")
+}

@@ -275,3 +275,9 @@ concurrent first uses are safe.
 Output and HdrOutput provide yRow(row), uRow(row), and vRow(row) read-only
 segments containing only active samples. copy() returns independent, tightly
 packed, read-only planes backed by Java arrays.
+
+### Runtime diagnostics
+
+`Funnelcake.version()` and `Funnelcake.backend()` report the loaded native
+library version and preferred backend. Individual outputs can still use scalar
+fallback.

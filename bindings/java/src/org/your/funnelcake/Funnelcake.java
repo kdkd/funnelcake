@@ -70,4 +70,8 @@ public final class Funnelcake {
     public static boolean simdAvailable() {
         return Native.simdAvailable() != 0;
     }
+    /** Version of the loaded native library. */
+    public static String version() { return Native.diagnostic(true); }
+    /** Preferred backend; individual outputs can use scalar fallback. */
+    public static String backend() { return Native.diagnostic(false); }
 }

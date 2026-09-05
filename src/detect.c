@@ -440,3 +440,22 @@ int fused_simd_available(void)
     return 0;
 #endif
 }
+
+#ifndef FUNNELCAKE_VERSION
+#define FUNNELCAKE_VERSION "unknown"
+#endif
+
+const char *fused_version(void) { return FUNNELCAKE_VERSION; }
+
+const char *fused_backend(void)
+{
+    const fused_cpu_caps_t *caps = fused_detect_cpu();
+#if defined(__x86_64__)
+    extern int fused_avx512_compiled(void);
+    if (caps->has_avx512 && fused_avx512_compiled()) return "avx512";
+#endif
+    if (caps->has_avx2) return "avx2";
+    if (caps->has_neon) return "neon";
+    if (caps->has_rvv) return "rvv";
+    return "scalar";
+}

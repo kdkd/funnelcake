@@ -1341,3 +1341,10 @@ stride times height must fit `INT_MAX`. These representability limits keep
 kernel row offsets and scale arithmetic within their native integer range.
 Binding frame constructors check these limits before native integer conversion
 and allocation. The existing 16384-pixel upscale output limit still applies.
+
+### Runtime diagnostics
+
+`fused_version()` returns the loaded library version as a static string.
+`fused_backend()` returns `scalar`, `avx2`, `avx512`, `neon`, or `rvv`,
+respecting compiled backend availability and diagnostic environment overrides.
+This is the preferred backend; individual output fallback flags still apply.

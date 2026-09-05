@@ -266,3 +266,8 @@ first use, so concurrent first constructions on different threads are safe.
 Output and HdrOutput provide y_row(row), u_row(row), and v_row(row) slices
 containing only active samples. to_owned() returns an OwnedOutput with tightly
 packed vectors that survive the scaler and future runs.
+
+### Runtime diagnostics
+
+`version()` and `backend()` report the linked native library version and
+preferred backend. Individual outputs can still use scalar fallback.

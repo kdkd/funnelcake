@@ -122,3 +122,9 @@ func SIMDAvailable() bool {
 	ensureDetect()
 	return C.fused_simd_available() == 1
 }
+
+// Version reports the linked native library version.
+func Version() string { return C.GoString(C.fused_version()) }
+
+// Backend reports the preferred native backend. Outputs may use scalar fallback.
+func Backend() string { return C.GoString(C.fused_backend()) }

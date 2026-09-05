@@ -12,7 +12,7 @@ create/run/free lifecycle (context-manager friendly), and outputs are exposed
 as zero-copy ``memoryview``s over library-owned buffers.
 """
 
-from ._native import simd_available
+from ._native import simd_available, version, backend
 from .enums import Option, PixelFormat, Range, Scale, TonemapCurve, Transfer, Upscale
 from .errors import FunnelcakeError, Warnings
 from .frame import Frame, HdrFrame
@@ -21,6 +21,8 @@ from .scaler import Output, Scaler, ScalerConfig
 
 __all__ = [
     "simd_available",
+    "version",
+    "backend",
     "Scale",
     "Upscale",
     "Option",

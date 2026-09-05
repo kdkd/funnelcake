@@ -410,3 +410,8 @@ cannot keep a C allocation owner alive.
 Output and HDROutput provide YRow(row), URow(row), and VRow(row) copies
 containing only active samples. Packed() returns independent tightly packed
 y, u, v slices.
+
+### Runtime diagnostics
+
+`Version()` and `Backend()` report the linked native library version and
+preferred backend. Individual outputs can still use scalar fallback.

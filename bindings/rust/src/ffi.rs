@@ -124,6 +124,8 @@ extern "C" {
     pub fn fused_hdr_free(ctx: *mut HdrCtx);
 
     pub fn fused_simd_available() -> c_int;
+    pub fn fused_version() -> *const std::ffi::c_char;
+    pub fn fused_backend() -> *const std::ffi::c_char;
 
     // From libfunnelcake_helpers (built by build.rs). Used by the layout test;
     // unused in a normal (non-test) build of the crate.

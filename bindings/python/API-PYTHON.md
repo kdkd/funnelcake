@@ -248,3 +248,8 @@ its borrowed output views.
 Output and HdrOutput provide y_row(row), u_row(row), and v_row(row) views
 containing only active samples. copy() returns independent, tightly packed,
 read-only planes that survive later runs and close.
+
+### Runtime diagnostics
+
+`version()` and `backend()` report the loaded native library version and
+preferred backend. Individual outputs can still use scalar fallback.

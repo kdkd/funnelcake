@@ -168,7 +168,7 @@ EXTRA_LDFLAGS ?=
 # bits), recording a false "XCR0 bits not set" result in the profile data.
 # The -fprofile-use pass then treats the AVX2 assignment as dead code.
 # This variable intentionally excludes LIB_OPT (where -fprofile-* lives).
-DETECT_CFLAGS = $(CFLAGS_BASE) -O2 $(TUNE_CFLAGS)
+DETECT_CFLAGS = -DFUNNELCAKE_VERSION=\"$(VERSION)\" $(CFLAGS_BASE) -O2 $(TUNE_CFLAGS)
 
 # --- PGO compiler-family handling ---
 # GCC and clang have very different PGO workflows:

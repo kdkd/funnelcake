@@ -531,35 +531,40 @@ hdr_pow2_avg_tile16(hdr_pow2_tile16_t a, hdr_pow2_tile16_t b)
     return out;
 }
 
+/* Pair sums fit in u16: valid 10-bit inputs sum to at most 2046.
+ * Reduce both halves together and retain rounding at every cascade level.
+ * Only the 16-column depth-3 path uses these combined stores. */
 static inline __attribute__((always_inline)) void
 hdr_pow2_store_h1_tile16(hdr_pow2_tile16_t v, uint16_t *dst)
 {
-    hdr_pow2_store_h1(v.lo, dst);
-    hdr_pow2_store_h1(v.hi, dst + 4);
+    uint16x8_t out = vrshrq_n_u16(vpaddq_u16(v.lo, v.hi), 1);
+    vst1q_u16(dst, out);
 }
 
 static inline __attribute__((always_inline)) void
 hdr_pow2_store_h2_tile16(hdr_pow2_tile16_t v, uint16_t *dst)
 {
-    hdr_pow2_store_h2(v.lo, dst);
-    hdr_pow2_store_h2(v.hi, dst + 2);
+    uint16x8_t out = vrshrq_n_u16(vpaddq_u16(v.lo, v.hi), 1);
+    out = vrshrq_n_u16(vpaddq_u16(out, out), 1);
+    vst1_u16(dst, vget_low_u16(out));
 }
 
 static inline __attribute__((always_inline)) void
 hdr_pow2_store_h3_tile16(hdr_pow2_tile16_t v, uint16_t *dst)
 {
-    hdr_pow2_store_h3(v.lo, dst);
-    hdr_pow2_store_h3(v.hi, dst + 1);
+    uint16x8_t out = vrshrq_n_u16(vpaddq_u16(v.lo, v.hi), 1);
+    out = vrshrq_n_u16(vpaddq_u16(out, out), 1);
+    out = vrshrq_n_u16(vpaddq_u16(out, out), 1);
+    vst1_lane_u32((uint32_t *)dst, vreinterpret_u32_u16(vget_low_u16(out)), 0);
 }
 
 static inline __attribute__((always_inline)) void
 hdr_pow2_store_h4_tile16(hdr_pow2_tile16_t v, uint16_t *dst)
 {
-    v.lo = hdr_pow2_hhalve_reg(
-        hdr_pow2_hhalve_reg(hdr_pow2_hhalve_reg(v.lo)));
-    v.hi = hdr_pow2_hhalve_reg(
-        hdr_pow2_hhalve_reg(hdr_pow2_hhalve_reg(v.hi)));
-    uint16x8_t out = vrhaddq_u16(v.lo, v.hi);
+    uint16x8_t out = vrshrq_n_u16(vpaddq_u16(v.lo, v.hi), 1);
+    out = vrshrq_n_u16(vpaddq_u16(out, out), 1);
+    out = vrshrq_n_u16(vpaddq_u16(out, out), 1);
+    out = vrshrq_n_u16(vpaddq_u16(out, out), 1);
     vst1_lane_u16(dst, vget_low_u16(out), 0);
 }
 

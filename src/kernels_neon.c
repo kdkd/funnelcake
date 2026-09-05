@@ -382,8 +382,9 @@ static void __attribute__((hot)) scale_plane_pow2_neon_buffered(
 }
 
 /* Register-tiled power-of-two reductions.  The common aligned-width path
- * keeps the complete vertical tree for one 16-column tile in registers and
- * immediately applies the required number of horizontal halvings. */
+ * keeps the vertical tree in registers and immediately applies horizontal
+ * halvings. The 2x-only path uses 16 columns; deeper paths use 32 columns
+ * with a 16-column remainder. */
 static inline uint8x16_t pow2_hhalve_reg(uint8x16_t v)
 {
     uint16x8_t sum = vpaddlq_u8(v);
@@ -418,10 +419,55 @@ static inline void pow2_store_h4(uint8x16_t v, uint8_t *dst)
     vst1_lane_u8(dst, vget_low_u8(v), 0);
 }
 
+/* Reduce two adjacent vectors together. Unzip gathers even and odd
+ * samples across both halves, and rounded add preserves each halving's
+ * rounding. Later cascade levels can use all lanes of this result. */
+typedef struct { uint8x16_t lo, hi; } sdr_tile32_t;
+static inline sdr_tile32_t tile32_load(const uint8_t *p)
+{
+    return (sdr_tile32_t){vld1q_u8(p), vld1q_u8(p + 16)};
+}
+
+static inline sdr_tile32_t tile32_avg(sdr_tile32_t a, sdr_tile32_t b)
+{
+    return (sdr_tile32_t){vrhaddq_u8(a.lo, b.lo), vrhaddq_u8(a.hi, b.hi)};
+}
+
+static inline void tile32_store_h1(sdr_tile32_t v, uint8_t *dst)
+{
+    uint8x16_t out = vrhaddq_u8(vuzp1q_u8(v.lo, v.hi),
+                                 vuzp2q_u8(v.lo, v.hi));
+    vst1q_u8(dst, out);
+}
+
+static inline void tile32_store_h2(sdr_tile32_t v, uint8_t *dst)
+{
+    uint8x16_t out = vrhaddq_u8(vuzp1q_u8(v.lo, v.hi),
+                                 vuzp2q_u8(v.lo, v.hi));
+    pow2_store_h1(out, dst);
+}
+
+static inline void tile32_store_h3(sdr_tile32_t v, uint8_t *dst)
+{
+    uint8x16_t out = vrhaddq_u8(vuzp1q_u8(v.lo, v.hi),
+                                 vuzp2q_u8(v.lo, v.hi));
+    pow2_store_h2(out, dst);
+}
+
+static inline void tile32_store_h4(sdr_tile32_t v, uint8_t *dst)
+{
+    uint8x16_t out = vrhaddq_u8(vuzp1q_u8(v.lo, v.hi),
+                                 vuzp2q_u8(v.lo, v.hi));
+    pow2_store_h3(out, dst);
+}
+
 static void pow2_tiled_depth0(
     const uint8_t *restrict src, int src_w, int src_h, int src_stride,
     uint32_t active_outputs, uint8_t *restrict dst[4], int strides[4])
 {
+    /* Cache metadata before byte stores can alias the pointer/stride arrays. */
+    uint8_t *const d0 = dst[0];
+    const int s0 = strides[0];
     int groups = src_h / 2;
     int emit0 = (active_outputs & (1u << 1)) != 0;
     for (int g = 0; g < groups; g++) {
@@ -431,7 +477,7 @@ static void pow2_tiled_depth0(
             uint8x16_t v0 = vrhaddq_u8(vld1q_u8(r0 + x),
                                         vld1q_u8(r1 + x));
             if (emit0)
-                pow2_store_h1(v0, dst[0] + (size_t)g * strides[0] + x / 2);
+                pow2_store_h1(v0, d0 + (size_t)g * s0 + x / 2);
         }
     }
 }
@@ -440,23 +486,41 @@ static void pow2_tiled_depth1(
     const uint8_t *restrict src, int src_w, int src_h, int src_stride,
     uint32_t active_outputs, uint8_t *restrict dst[4], int strides[4])
 {
+    uint8_t *const d0 = dst[0];
+    const int s0 = strides[0];
+    uint8_t *const d1 = dst[1];
+    const int s1 = strides[1];
     int groups = src_h / 4;
     int emit0 = (active_outputs & (1u << 1)) != 0;
     int emit1 = (active_outputs & (1u << 3)) != 0;
     for (int g = 0; g < groups; g++) {
         const uint8_t *base = src + (size_t)(4 * g) * src_stride;
-        for (int x = 0; x < src_w; x += 16) {
+        int x = 0;
+        for (; x + 32 <= src_w; x += 32) {
+            sdr_tile32_t v0 = tile32_avg(tile32_load(base + x),
+                                        tile32_load(base + src_stride + x));
+            sdr_tile32_t v1 = tile32_avg(tile32_load(base + 2 * (size_t)src_stride + x),
+                                        tile32_load(base + 3 * (size_t)src_stride + x));
+            if (emit0) {
+                tile32_store_h1(v0, d0 + (size_t)(2 * g) * s0 + x / 2);
+                tile32_store_h1(v1, d0 + (size_t)(2 * g + 1) * s0 + x / 2);
+            }
+            sdr_tile32_t v2 = tile32_avg(v0, v1);
+            if (emit1)
+                tile32_store_h2(v2, d1 + (size_t)g * s1 + x / 4);
+        }
+        for (; x < src_w; x += 16) {
             uint8x16_t v0 = vrhaddq_u8(vld1q_u8(base + x),
                                         vld1q_u8(base + src_stride + x));
             uint8x16_t v1 = vrhaddq_u8(vld1q_u8(base + 2 * (size_t)src_stride + x),
                                         vld1q_u8(base + 3 * (size_t)src_stride + x));
             if (emit0) {
-                pow2_store_h1(v0, dst[0] + (size_t)(2 * g) * strides[0] + x / 2);
-                pow2_store_h1(v1, dst[0] + (size_t)(2 * g + 1) * strides[0] + x / 2);
+                pow2_store_h1(v0, d0 + (size_t)(2 * g) * s0 + x / 2);
+                pow2_store_h1(v1, d0 + (size_t)(2 * g + 1) * s0 + x / 2);
             }
             uint8x16_t v2 = vrhaddq_u8(v0, v1);
             if (emit1)
-                pow2_store_h2(v2, dst[1] + (size_t)g * strides[1] + x / 4);
+                pow2_store_h2(v2, d1 + (size_t)g * s1 + x / 4);
         }
     }
 }
@@ -465,13 +529,47 @@ static void pow2_tiled_depth2(
     const uint8_t *restrict src, int src_w, int src_h, int src_stride,
     uint32_t active_outputs, uint8_t *restrict dst[4], int strides[4])
 {
+    uint8_t *const d0 = dst[0];
+    const int s0 = strides[0];
+    uint8_t *const d1 = dst[1];
+    const int s1 = strides[1];
+    uint8_t *const d2 = dst[2];
+    const int s2 = strides[2];
     int groups = src_h / 8;
     int emit0 = (active_outputs & (1u << 1)) != 0;
     int emit1 = (active_outputs & (1u << 3)) != 0;
     int emit2 = (active_outputs & (1u << 5)) != 0;
     for (int g = 0; g < groups; g++) {
         const uint8_t *base = src + (size_t)(8 * g) * src_stride;
-        for (int x = 0; x < src_w; x += 16) {
+        int x = 0;
+        for (; x + 32 <= src_w; x += 32) {
+            sdr_tile32_t v0 = tile32_avg(tile32_load(base + x),
+                                        tile32_load(base + src_stride + x));
+            sdr_tile32_t v1 = tile32_avg(tile32_load(base + 2 * (size_t)src_stride + x),
+                                        tile32_load(base + 3 * (size_t)src_stride + x));
+            sdr_tile32_t v2 = tile32_avg(tile32_load(base + 4 * (size_t)src_stride + x),
+                                        tile32_load(base + 5 * (size_t)src_stride + x));
+            sdr_tile32_t v3 = tile32_avg(tile32_load(base + 6 * (size_t)src_stride + x),
+                                        tile32_load(base + 7 * (size_t)src_stride + x));
+            if (emit0) {
+                uint8_t *out = d0 + (size_t)(4 * g) * s0 + x / 2;
+                tile32_store_h1(v0, out);
+                tile32_store_h1(v1, out + s0);
+                tile32_store_h1(v2, out + 2 * (size_t)s0);
+                tile32_store_h1(v3, out + 3 * (size_t)s0);
+            }
+            sdr_tile32_t v4 = tile32_avg(v0, v1);
+            sdr_tile32_t v5 = tile32_avg(v2, v3);
+            if (emit1) {
+                uint8_t *out = d1 + (size_t)(2 * g) * s1 + x / 4;
+                tile32_store_h2(v4, out);
+                tile32_store_h2(v5, out + s1);
+            }
+            sdr_tile32_t v6 = tile32_avg(v4, v5);
+            if (emit2)
+                tile32_store_h3(v6, d2 + (size_t)g * s2 + x / 8);
+        }
+        for (; x < src_w; x += 16) {
             uint8x16_t v0 = vrhaddq_u8(vld1q_u8(base + x),
                                         vld1q_u8(base + src_stride + x));
             uint8x16_t v1 = vrhaddq_u8(vld1q_u8(base + 2 * (size_t)src_stride + x),
@@ -481,22 +579,22 @@ static void pow2_tiled_depth2(
             uint8x16_t v3 = vrhaddq_u8(vld1q_u8(base + 6 * (size_t)src_stride + x),
                                         vld1q_u8(base + 7 * (size_t)src_stride + x));
             if (emit0) {
-                uint8_t *out = dst[0] + (size_t)(4 * g) * strides[0] + x / 2;
+                uint8_t *out = d0 + (size_t)(4 * g) * s0 + x / 2;
                 pow2_store_h1(v0, out);
-                pow2_store_h1(v1, out + strides[0]);
-                pow2_store_h1(v2, out + 2 * (size_t)strides[0]);
-                pow2_store_h1(v3, out + 3 * (size_t)strides[0]);
+                pow2_store_h1(v1, out + s0);
+                pow2_store_h1(v2, out + 2 * (size_t)s0);
+                pow2_store_h1(v3, out + 3 * (size_t)s0);
             }
             uint8x16_t v4 = vrhaddq_u8(v0, v1);
             uint8x16_t v5 = vrhaddq_u8(v2, v3);
             if (emit1) {
-                uint8_t *out = dst[1] + (size_t)(2 * g) * strides[1] + x / 4;
+                uint8_t *out = d1 + (size_t)(2 * g) * s1 + x / 4;
                 pow2_store_h2(v4, out);
-                pow2_store_h2(v5, out + strides[1]);
+                pow2_store_h2(v5, out + s1);
             }
             uint8x16_t v6 = vrhaddq_u8(v4, v5);
             if (emit2)
-                pow2_store_h3(v6, dst[2] + (size_t)g * strides[2] + x / 8);
+                pow2_store_h3(v6, d2 + (size_t)g * s2 + x / 8);
         }
     }
 }
@@ -505,6 +603,14 @@ static void pow2_tiled_depth3(
     const uint8_t *restrict src, int src_w, int src_h, int src_stride,
     uint32_t active_outputs, uint8_t *restrict dst[4], int strides[4])
 {
+    uint8_t *const d0 = dst[0];
+    const int s0 = strides[0];
+    uint8_t *const d1 = dst[1];
+    const int s1 = strides[1];
+    uint8_t *const d2 = dst[2];
+    const int s2 = strides[2];
+    uint8_t *const d3 = dst[3];
+    const int s3 = strides[3];
     int groups = src_h / 16;
     int emit0 = (active_outputs & (1u << 1)) != 0;
     int emit1 = (active_outputs & (1u << 3)) != 0;
@@ -512,7 +618,51 @@ static void pow2_tiled_depth3(
     int emit3 = (active_outputs & (1u << 7)) != 0;
     for (int g = 0; g < groups; g++) {
         const uint8_t *base = src + (size_t)(16 * g) * src_stride;
-        for (int x = 0; x < src_w; x += 16) {
+        int x = 0;
+        for (; x + 32 <= src_w; x += 32) {
+            sdr_tile32_t v[8];
+#if defined(__clang__)
+            #pragma clang loop unroll(full)
+#elif defined(__GNUC__)
+            #pragma GCC unroll 8
+#endif
+            for (int r = 0; r < 8; r++) {
+                const uint8_t *ra = base + (size_t)(2 * r) * src_stride + x;
+                v[r] = tile32_avg(tile32_load(ra), tile32_load(ra + src_stride));
+            }
+            if (emit0) {
+                uint8_t *out = d0 + (size_t)(8 * g) * s0 + x / 2;
+#if defined(__clang__)
+                #pragma clang loop unroll(full)
+#elif defined(__GNUC__)
+                #pragma GCC unroll 8
+#endif
+                for (int r = 0; r < 8; r++)
+                    tile32_store_h1(v[r], out + (size_t)r * s0);
+            }
+            sdr_tile32_t w0 = tile32_avg(v[0], v[1]);
+            sdr_tile32_t w1 = tile32_avg(v[2], v[3]);
+            sdr_tile32_t w2 = tile32_avg(v[4], v[5]);
+            sdr_tile32_t w3 = tile32_avg(v[6], v[7]);
+            if (emit1) {
+                uint8_t *out = d1 + (size_t)(4 * g) * s1 + x / 4;
+                tile32_store_h2(w0, out);
+                tile32_store_h2(w1, out + s1);
+                tile32_store_h2(w2, out + 2 * (size_t)s1);
+                tile32_store_h2(w3, out + 3 * (size_t)s1);
+            }
+            sdr_tile32_t z0 = tile32_avg(w0, w1);
+            sdr_tile32_t z1 = tile32_avg(w2, w3);
+            if (emit2) {
+                uint8_t *out = d2 + (size_t)(2 * g) * s2 + x / 8;
+                tile32_store_h3(z0, out);
+                tile32_store_h3(z1, out + s2);
+            }
+            sdr_tile32_t q0 = tile32_avg(z0, z1);
+            if (emit3)
+                tile32_store_h4(q0, d3 + (size_t)g * s3 + x / 16);
+        }
+        for (; x < src_w; x += 16) {
             uint8x16_t v[8];
 #if defined(__clang__)
             #pragma clang loop unroll(full)
@@ -524,36 +674,36 @@ static void pow2_tiled_depth3(
                 v[r] = vrhaddq_u8(vld1q_u8(ra), vld1q_u8(ra + src_stride));
             }
             if (emit0) {
-                uint8_t *out = dst[0] + (size_t)(8 * g) * strides[0] + x / 2;
+                uint8_t *out = d0 + (size_t)(8 * g) * s0 + x / 2;
 #if defined(__clang__)
                 #pragma clang loop unroll(full)
 #elif defined(__GNUC__)
                 #pragma GCC unroll 8
 #endif
                 for (int r = 0; r < 8; r++)
-                    pow2_store_h1(v[r], out + (size_t)r * strides[0]);
+                    pow2_store_h1(v[r], out + (size_t)r * s0);
             }
             uint8x16_t w0 = vrhaddq_u8(v[0], v[1]);
             uint8x16_t w1 = vrhaddq_u8(v[2], v[3]);
             uint8x16_t w2 = vrhaddq_u8(v[4], v[5]);
             uint8x16_t w3 = vrhaddq_u8(v[6], v[7]);
             if (emit1) {
-                uint8_t *out = dst[1] + (size_t)(4 * g) * strides[1] + x / 4;
+                uint8_t *out = d1 + (size_t)(4 * g) * s1 + x / 4;
                 pow2_store_h2(w0, out);
-                pow2_store_h2(w1, out + strides[1]);
-                pow2_store_h2(w2, out + 2 * (size_t)strides[1]);
-                pow2_store_h2(w3, out + 3 * (size_t)strides[1]);
+                pow2_store_h2(w1, out + s1);
+                pow2_store_h2(w2, out + 2 * (size_t)s1);
+                pow2_store_h2(w3, out + 3 * (size_t)s1);
             }
             uint8x16_t z0 = vrhaddq_u8(w0, w1);
             uint8x16_t z1 = vrhaddq_u8(w2, w3);
             if (emit2) {
-                uint8_t *out = dst[2] + (size_t)(2 * g) * strides[2] + x / 8;
+                uint8_t *out = d2 + (size_t)(2 * g) * s2 + x / 8;
                 pow2_store_h3(z0, out);
-                pow2_store_h3(z1, out + strides[2]);
+                pow2_store_h3(z1, out + s2);
             }
             uint8x16_t q0 = vrhaddq_u8(z0, z1);
             if (emit3)
-                pow2_store_h4(q0, dst[3] + (size_t)g * strides[3] + x / 16);
+                pow2_store_h4(q0, d3 + (size_t)g * s3 + x / 16);
         }
     }
 }

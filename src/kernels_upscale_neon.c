@@ -257,6 +257,20 @@ static void up_h_1_5x_row_neon(const uint8_t *src, int w, uint8_t *dst)
          * m2 = (c*85 + b*171 + 128) >> 8. */
         uint16x8_t base_lo = vmull_u8(vget_low_u8(b),  w171_8);
         uint16x8_t base_hi = vmull_u8(vget_high_u8(b), w171_8);
+#if defined(__clang__)
+        /* Keep the shared b*171 product opaque across both midpoint
+         * computations.  Clang reassociates the two vmlal_u8 consumers into
+         * independent umull+umlal chains, emitting eight multiply ops where
+         * six suffice (8% of the chunk's ALU work).  An empty "+w"
+         * constraint pins the values in registers; a `volatile` qualifier
+         * makes things worse (spill+reload).
+         *
+         * GCC already keeps the shared product fused (verified: 6 multiply
+         * ops in up_h_1_5x_row_neon), and the constraint only adds a
+         * scheduling restriction there - measured ~6% slower on Pi 5 and
+         * RK3588 with gcc-12.  Hence clang-only. */
+        __asm__ volatile("" : "+w"(base_lo), "+w"(base_hi));
+#endif
 
         uint16x8_t m1_lo = vmlal_u8(base_lo, vget_low_u8(a),     w85_8);
         uint16x8_t m1_hi = vmlal_u8(base_hi, vget_high_u8(a),    w85_8);

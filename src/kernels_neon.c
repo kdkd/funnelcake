@@ -473,7 +473,14 @@ static void pow2_tiled_depth0(
     for (int g = 0; g < groups; g++) {
         const uint8_t *r0 = src + (size_t)(2 * g) * src_stride;
         const uint8_t *r1 = r0 + src_stride;
-        for (int x = 0; x < src_w; x += 16) {
+        int x = 0;
+        for (; x + 32 <= src_w; x += 32) {
+            sdr_tile32_t v = tile32_avg(tile32_load(r0 + x),
+                                        tile32_load(r1 + x));
+            if (emit0)
+                tile32_store_h1(v, d0 + (size_t)g * s0 + x / 2);
+        }
+        for (; x < src_w; x += 16) {
             uint8x16_t v0 = vrhaddq_u8(vld1q_u8(r0 + x),
                                         vld1q_u8(r1 + x));
             if (emit0)

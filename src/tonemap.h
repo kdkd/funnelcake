@@ -306,6 +306,35 @@ void fused_tonemap_apply_p010_neon(
     uint8_t *dst_v,
     int width, int height);
 
+#include <arm_neon.h>
+
+/* 8 lookups from one index vector into a byte table, packed into a
+ * 64-bit GPR.  Shared by the built-in-curve kernels in tonemap_neon.c and
+ * the custom-LUT luma path in tonemap.c.  The index vector leaves the
+ * register file as two 64-bit halves (one fmov/umov each); the
+ * vector-to-GPR path is a single port on Apple and Arm big cores, so the
+ * fewer lane moves the better.  The gathered bytes are OR-shifted into a
+ * GPR, so no stack buffer is involved and there is no wide reload of
+ * narrow stores to fail store forwarding.  clang lowers the packing to ld1
+ * lane loads and gcc keeps the ldrb + orr form; both measure well. */
+static inline __attribute__((always_inline)) uint64_t
+tm_gather4_neon(const uint8_t *lut, uint64_t q)
+{
+    return (uint64_t)lut[q & 0xFFFF]
+         | (uint64_t)lut[(q >> 16) & 0xFFFF] << 8
+         | (uint64_t)lut[(q >> 32) & 0xFFFF] << 16
+         | (uint64_t)lut[q >> 48] << 24;
+}
+
+static inline __attribute__((always_inline)) uint8x8_t
+tm_lookup8_neon(const uint8_t *lut, uint16x8_t idx)
+{
+    uint64x2_t q = vreinterpretq_u64_u16(idx);
+    uint64_t lo = tm_gather4_neon(lut, vgetq_lane_u64(q, 0));
+    uint64_t hi = tm_gather4_neon(lut, vgetq_lane_u64(q, 1));
+    return vcreate_u8(lo | hi << 32);
+}
+
 #endif /* __aarch64__ */
 
 #if defined(__riscv) && (__riscv_xlen == 64)

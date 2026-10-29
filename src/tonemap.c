@@ -480,7 +480,9 @@ static void tonemap_luma_avx2(const uint8_t *lut_y,
 /*
  * tonemap_luma_neon - exact LUT tone mapping, 16 pixels per iteration.
  *
- * Extracts each lane for scalar LUT lookup, packs results into uint8x16_t.
+ * Each 8 masked 10-bit indices go through tm_lookup8_neon (tonemap.h),
+ * which gathers in GPRs and builds the output vector without a stack
+ * buffer.
  */
 static void tonemap_luma_neon(const uint8_t *lut_y,
                               const uint16_t *src_y, int src_y_stride,
@@ -502,28 +504,14 @@ static void tonemap_luma_neon(const uint8_t *lut_y,
         for (; x < simd_w; x += 16) {
             uint16x8_t v0 = vandq_u16(vld1q_u16(sy + x),     mask10);
             uint16x8_t v1 = vandq_u16(vld1q_u16(sy + x + 8), mask10);
-
-            uint8_t buf[16];
-            buf[0]  = lut_y[vgetq_lane_u16(v0, 0)];
-            buf[1]  = lut_y[vgetq_lane_u16(v0, 1)];
-            buf[2]  = lut_y[vgetq_lane_u16(v0, 2)];
-            buf[3]  = lut_y[vgetq_lane_u16(v0, 3)];
-            buf[4]  = lut_y[vgetq_lane_u16(v0, 4)];
-            buf[5]  = lut_y[vgetq_lane_u16(v0, 5)];
-            buf[6]  = lut_y[vgetq_lane_u16(v0, 6)];
-            buf[7]  = lut_y[vgetq_lane_u16(v0, 7)];
-            buf[8]  = lut_y[vgetq_lane_u16(v1, 0)];
-            buf[9]  = lut_y[vgetq_lane_u16(v1, 1)];
-            buf[10] = lut_y[vgetq_lane_u16(v1, 2)];
-            buf[11] = lut_y[vgetq_lane_u16(v1, 3)];
-            buf[12] = lut_y[vgetq_lane_u16(v1, 4)];
-            buf[13] = lut_y[vgetq_lane_u16(v1, 5)];
-            buf[14] = lut_y[vgetq_lane_u16(v1, 6)];
-            buf[15] = lut_y[vgetq_lane_u16(v1, 7)];
-
-            vst1q_u8(dy + x, vld1q_u8(buf));
+            uint8x16_t out = vcombine_u8(tm_lookup8_neon(lut_y, v0),
+                                         tm_lookup8_neon(lut_y, v1));
+            vst1q_u8(dy + x, out);
         }
 
+#if defined(__clang__)
+        #pragma clang loop vectorize(disable)
+#endif
         for (; x < width; x++)
             dy[x] = lut_y[sy[x] & 0x3FF];
     }

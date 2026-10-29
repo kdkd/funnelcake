@@ -488,6 +488,10 @@ typedef struct {
     size_t   scratch_pool_size;
 } fused_hdr_kernel_params_t;
 
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
 /* Deinterleave the effective P010/P210 chroma region into the persistent
  * planar temp buffers allocated by fused_hdr_init.  For P210, src_uv_el_stride
  * has already been doubled by init so this naturally skips every other chroma
@@ -500,13 +504,31 @@ static inline int fused_hdr_deinterleave_p010(const fused_hdr_kernel_params_t *p
 
     int chroma_w = p->src_width / 2;
     int chroma_h = p->src_height / 2;
+    int uv_el_stride = p->src_uv_el_stride;
     int planar_el_stride = p->p010_tmp_stride / (int)sizeof(uint16_t);
 
     for (int y = 0; y < chroma_h; y++) {
-        const uint16_t *row = src_uv + (size_t)y * (size_t)p->src_uv_el_stride;
-        uint16_t *u_row = p->p010_tmp_u + (size_t)y * (size_t)planar_el_stride;
-        uint16_t *v_row = p->p010_tmp_v + (size_t)y * (size_t)planar_el_stride;
-        for (int x = 0; x < chroma_w; x++) {
+        const uint16_t *restrict row = src_uv + (size_t)y * (size_t)uv_el_stride;
+        uint16_t *restrict u_row = p->p010_tmp_u + (size_t)y * (size_t)planar_el_stride;
+        uint16_t *restrict v_row = p->p010_tmp_v + (size_t)y * (size_t)planar_el_stride;
+        int x = 0;
+#if defined(__aarch64__)
+        for (; x + 8 <= chroma_w; x += 8) {
+            uint16x8x2_t uv = vld2q_u16(row + 2 * x);
+            vst1q_u16(u_row + x, uv.val[0]);
+            vst1q_u16(v_row + x, uv.val[1]);
+        }
+        if (x + 4 <= chroma_w) {
+            uint16x4x2_t uv = vld2_u16(row + 2 * x);
+            vst1_u16(u_row + x, uv.val[0]);
+            vst1_u16(v_row + x, uv.val[1]);
+            x += 4;
+        }
+#if defined(__clang__)
+        #pragma clang loop vectorize(disable)
+#endif
+#endif
+        for (; x < chroma_w; x++) {
             u_row[x] = row[2 * x];
             v_row[x] = row[2 * x + 1];
         }

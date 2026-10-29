@@ -78,9 +78,9 @@ static inline uint16_t div3_u32(uint32_t sum)
  * floor(sum * 10923 / 32768); 10923 is ceil(32768 / 3), and its positive
  * error stays below 0.032 over this input range, so it cannot cross the next
  * integer for any residue modulo three. */
-static inline uint16x8_t neon_div3_u16x8_hdr(uint16x8_t sum)
+static inline uint16x8_t neon_div3_u16x8_hdr(uint16x8_t sum, int16x8_t div3_k)
 {
-    int16x8_t q = vqdmulhq_n_s16(vreinterpretq_s16_u16(sum), 10923);
+    int16x8_t q = vqdmulhq_s16(vreinterpretq_s16_u16(sum), div3_k);
     return vreinterpretq_u16_s16(q);
 }
 
@@ -88,97 +88,48 @@ static inline uint16x8_t neon_div3_u16x8_hdr(uint16x8_t sum)
  * 256, rewrite this as a + round((b-a)*85/256).  SQRDMULH with 10880
  * (85/256 in Q15) has exactly the scalar rounding behavior for the signed
  * difference range -1023..1023 and avoids widening both vector halves. */
-static inline uint16x8_t neon_blend_reg_hdr(uint16x8_t a, uint16x8_t b)
+static inline uint16x8_t neon_blend_reg_hdr(uint16x8_t a, uint16x8_t b,
+                                            int16x8_t blend_k)
 {
     int16x8_t diff = vreinterpretq_s16_u16(vsubq_u16(b, a));
-    int16x8_t delta = vqrdmulhq_n_s16(diff, 10880);
+    int16x8_t delta = vqrdmulhq_s16(diff, blend_k);
     return vaddq_u16(a, vreinterpretq_u16_s16(delta));
 }
 
 /* -----------------------------------------------------------------------
  * Horizontal filter functions for 10-bit
  *
- * These are standalone row filters used by the pow2 horizontal cascade
- * and by the thirds tail handling.  The fused thirds chunk loop uses
+ * Scalar row filters for the thirds tail: the fewer than 24 columns per
+ * row that the fused NEON chunk loop does not cover.  The chunk loop uses
  * the inline h_chunk_* helpers below instead.
  * ----------------------------------------------------------------------- */
 
-/* Horizontal 1.5x filter (NEON): 3:2 bilinear reduction for 10-bit.
- * Every 3 source uint16_t -> 2 output uint16_t via weighted blend.
- * Processes 24 input elements (8 triplets) -> 16 output elements per NEON chunk.
- *
- * vld3q_u16 loads 24 uint16_t (48 bytes) and deinterleaves into three
- * 8-element vectors: A (first of triplet), B (middle), C (third). */
+/* Horizontal 1.5x filter (scalar tail helper for < 24-element thirds tail):
+ * Every 3 source uint16_t -> 2 output uint16_t via weighted blend. */
 static void h_filter_1_5x_hdr(const uint16_t *restrict src, int src_w,
                                uint16_t *restrict dst, int dst_w)
 {
-    int chunks = dst_w / 16;
-    uint16x4_t w171 = vdup_n_u16(171);
-    uint16x4_t w85  = vdup_n_u16(85);
-
-    uint32x4_t r128 = vdupq_n_u32(128);
-    for (int c = 0; c < chunks; c++) {
-        uint16x8x3_t loaded = vld3q_u16(src + c * 24);
-        uint16x8_t A = loaded.val[0];
-        uint16x8_t B = loaded.val[1];
-        uint16x8_t C = loaded.val[2];
-
-        /* B*85 + 128 is shared between out0 and out1; compute once. */
-        uint32x4_t b85_lo = vmlal_u16(r128, vget_low_u16(B),  w85);
-        uint32x4_t b85_hi = vmlal_u16(r128, vget_high_u16(B), w85);
-
-        /* Output 0: (A*171 + B*85 + 128) >> 8 */
-        uint32x4_t t0_lo = vmlal_u16(b85_lo, vget_low_u16(A),  w171);
-        uint32x4_t t0_hi = vmlal_u16(b85_hi, vget_high_u16(A), w171);
-        uint16x8_t out0 = vcombine_u16(vshrn_n_u32(t0_lo, 8),
-                                        vshrn_n_u32(t0_hi, 8));
-
-        /* Output 1: (C*171 + B*85 + 128) >> 8 */
-        uint32x4_t t1_lo = vmlal_u16(b85_lo, vget_low_u16(C),  w171);
-        uint32x4_t t1_hi = vmlal_u16(b85_hi, vget_high_u16(C), w171);
-        uint16x8_t out1 = vcombine_u16(vshrn_n_u32(t1_lo, 8),
-                                        vshrn_n_u32(t1_hi, 8));
-
-        /* Interleave: [out0[0], out1[0], out0[1], out1[1], ...]
-         * vst2q_u16 interleaves in the store unit. */
-        uint16x8x2_t interleaved = { { out0, out1 } };
-        vst2q_u16(dst + c * 16, interleaved);
-    }
-
-    /* Scalar tail */
-    int x_out = chunks * 16;
-    for (int x_in = chunks * 24; x_in < src_w - 2 && x_out < dst_w - 1;
+    int x_out = 0;
+#if defined(__clang__)
+    #pragma clang loop vectorize(disable)
+#endif
+    for (int x_in = 0; x_in < src_w - 2 && x_out < dst_w - 1;
          x_in += 3, x_out += 2) {
         dst[x_out]     = blend_2_1_u16(src[x_in],     src[x_in + 1]);
         dst[x_out + 1] = blend_2_1_u16(src[x_in + 2], src[x_in + 1]);
     }
 }
 
-/* Horizontal 3x filter (NEON): box average of 3 source uint16_t -> 1 output.
- * Processes 24 input elements -> 8 output elements per NEON chunk.
- *
- * vld3q_u16 handles deinterleave.  Sum of three 10-bit values (max 3069)
- * fits in uint16_t, so we can add in 16-bit then use the div3 helper. */
+/* Horizontal 3x filter (scalar tail helper for < 24-element thirds tail):
+ * Box average of 3 source uint16_t -> 1 output. */
 static void h_filter_3x_hdr(const uint16_t *restrict src, int src_w,
                              uint16_t *restrict dst, int dst_w)
 {
     (void)src_w;
-    int chunks = dst_w / 8;
-
-    for (int c = 0; c < chunks; c++) {
-        uint16x8x3_t loaded = vld3q_u16(src + c * 24);
-
-        /* Sum A + B + C (all uint16, sum max 3069 fits in uint16) */
-        uint16x8_t sum = vaddq_u16(loaded.val[0], loaded.val[1]);
-        sum = vaddq_u16(sum, loaded.val[2]);
-
-        /* Divide by 3: (sum * 21846) >> 16 */
-        uint16x8_t result = neon_div3_u16x8_hdr(sum);
-        vst1q_u16(dst + c * 8, result);
-    }
-
-    /* Scalar tail */
-    for (int x = chunks * 8; x < dst_w; x++) {
+#if defined(__clang__)
+    #pragma clang loop vectorize(disable)
+#endif
+    for (int x = 0; x < dst_w; x++) {
         uint32_t sum = (uint32_t)src[3 * x]
                      + (uint32_t)src[3 * x + 1]
                      + (uint32_t)src[3 * x + 2];
@@ -186,30 +137,16 @@ static void h_filter_3x_hdr(const uint16_t *restrict src, int src_w,
     }
 }
 
-/* Horizontal halve filter (NEON): pairwise average for 10-bit.
- * Processes 8 input uint16_t (16 bytes) -> 4 output uint16_t per NEON chunk.
- *
- * vpaddlq_u16 sums adjacent uint16 pairs into uint32 (8 -> 4 elements).
- * vrshrn_n_u32(..., 1) narrows with rounding: (sum+1)>>1. */
-static void h_filter_halve_hdr(const uint16_t *restrict src,
-                                uint16_t *restrict dst, int dst_w)
+/* Horizontal halve filter (scalar tail helper): rounded average of each
+ * adjacent pair.  Reads exactly 2 * dst_w source elements. */
+static inline void h_filter_halve_tail_hdr(const uint16_t *restrict src,
+                                           uint16_t *restrict dst, int dst_w)
 {
-    int src_elems = dst_w * 2;
-    int n_chunks = src_elems / 8;   /* 8 uint16_t per Q register load */
-    int out_x = 0;
-
-    for (int c = 0; c < n_chunks; c++) {
-        uint16x8_t v = vld1q_u16(src + c * 8);
-        uint32x4_t pair_sum = vpaddlq_u16(v);
-        uint16x4_t result = vrshrn_n_u32(pair_sum, 1);
-        vst1_u16(dst + out_x, result);
-        out_x += 4;
-    }
-
-    /* Scalar tail */
-    int tail_in = n_chunks * 8;
-    for (int tx = tail_in; tx + 1 < src_elems; tx += 2) {
-        dst[out_x++] = avg_u16(src[tx], src[tx + 1]);
+#if defined(__clang__)
+    #pragma clang loop vectorize(disable)
+#endif
+    for (int x = 0; x < dst_w; x++) {
+        dst[x] = avg_u16(src[2 * x], src[2 * x + 1]);
     }
 }
 
@@ -416,10 +353,10 @@ typedef struct {
     uint16x8_t hi;
 } hdr_pow2_tile16_t;
 
+/* Rounded vertical average of 16 elements from row a and the row below it. */
 static inline __attribute__((always_inline)) hdr_pow2_tile16_t
-hdr_pow2_load_pair16(const uint16_t *base, int row, int src_el_stride, int x)
+hdr_pow2_load_pair16(const uint16_t *a, int src_el_stride)
 {
-    const uint16_t *a = base + (size_t)row * src_el_stride + x;
     const uint16_t *b = a + src_el_stride;
     hdr_pow2_tile16_t out;
     out.lo = vrhaddq_u16(vld1q_u16(a), vld1q_u16(b));
@@ -478,24 +415,25 @@ static void hdr_pow2_tiled_depth0(
     const uint16_t *restrict src, int src_w, int src_h, int src_el_stride,
     uint32_t active_outputs, uint16_t *restrict dst[4], int strides[4])
 {
+    uint16_t *const d0 = dst[0];
+    const int s0 = strides[0];
     int groups = src_h / 2;
     int emit0 = (active_outputs & (1u << 1)) != 0;
     for (int g = 0; g < groups; g++) {
-        const uint16_t *r0 = src + (size_t)(2 * g) * src_el_stride;
+        const uint16_t *r0 = src + (size_t)(2 * g) * (size_t)src_el_stride;
         const uint16_t *r1 = r0 + src_el_stride;
+        uint16_t *out0_row = emit0 ? (d0 + (size_t)g * (size_t)s0) : NULL;
         int x = 0;
         for (; x + 16 <= src_w; x += 16) {
-            hdr_pow2_tile16_t v0 = hdr_pow2_load_pair16(
-                r0, 0, src_el_stride, x);
-            if (emit0) hdr_pow2_store_h1_tile16(v0,
-                dst[0] + (size_t)g * strides[0] + x / 2);
+            hdr_pow2_tile16_t v0 = hdr_pow2_load_pair16(r0 + x, src_el_stride);
+            if (emit0)
+                hdr_pow2_store_h1_tile16(v0, out0_row + (x >> 1));
         }
         for (; x < src_w; x += 8) {
             uint16x8_t v0 = vrhaddq_u16(vld1q_u16(r0 + x),
                                          vld1q_u16(r1 + x));
             if (emit0)
-                hdr_pow2_store_h1(v0,
-                    dst[0] + (size_t)g * strides[0] + x / 2);
+                hdr_pow2_store_h1(v0, out0_row + (x >> 1));
         }
     }
 }
@@ -504,41 +442,47 @@ static void hdr_pow2_tiled_depth1(
     const uint16_t *restrict src, int src_w, int src_h, int src_el_stride,
     uint32_t active_outputs, uint16_t *restrict dst[4], int strides[4])
 {
+    uint16_t *const d0 = dst[0];
+    const int s0 = strides[0];
+    uint16_t *const d1 = dst[1];
+    const int s1 = strides[1];
+    const ptrdiff_t ss = src_el_stride;
+    const ptrdiff_t ss2 = 2 * ss;
     int groups = src_h / 4;
     int emit0 = (active_outputs & (1u << 1)) != 0;
     int emit1 = (active_outputs & (1u << 3)) != 0;
     for (int g = 0; g < groups; g++) {
-        const uint16_t *base = src + (size_t)(4 * g) * src_el_stride;
+        const uint16_t *base = src + (size_t)(4 * g) * (size_t)ss;
+        uint16_t *out0_row = emit0 ? (d0 + (size_t)(2 * g) * (size_t)s0) : NULL;
+        uint16_t *out1_row = emit1 ? (d1 + (size_t)g * (size_t)s1) : NULL;
         int x = 0;
         for (; x + 16 <= src_w; x += 16) {
-            hdr_pow2_tile16_t v0 = hdr_pow2_load_pair16(
-                base, 0, src_el_stride, x);
-            if (emit0) hdr_pow2_store_h1_tile16(v0,
-                dst[0] + (size_t)(2 * g) * strides[0] + x / 2);
-            hdr_pow2_tile16_t v1 = hdr_pow2_load_pair16(
-                base, 2, src_el_stride, x);
-            if (emit0) hdr_pow2_store_h1_tile16(v1,
-                dst[0] + (size_t)(2 * g + 1) * strides[0] + x / 2);
+            const uint16_t *rp = base + x;
+            hdr_pow2_tile16_t v0 = hdr_pow2_load_pair16(rp, src_el_stride);
+            rp += ss2;
+            hdr_pow2_tile16_t v1 = hdr_pow2_load_pair16(rp, src_el_stride);
+            if (emit0) {
+                uint16_t *out = out0_row + (x >> 1);
+                hdr_pow2_store_h1_tile16(v0, out);
+                hdr_pow2_store_h1_tile16(v1, out + s0);
+            }
             hdr_pow2_tile16_t w0 = hdr_pow2_avg_tile16(v0, v1);
-            if (emit1) hdr_pow2_store_h2_tile16(w0,
-                dst[1] + (size_t)g * strides[1] + x / 4);
+            if (emit1)
+                hdr_pow2_store_h2_tile16(w0, out1_row + (x >> 2));
         }
         for (; x < src_w; x += 8) {
-            uint16x8_t v0 = vrhaddq_u16(vld1q_u16(base + x),
-                                         vld1q_u16(base + src_el_stride + x));
-            uint16x8_t v1 = vrhaddq_u16(
-                vld1q_u16(base + 2 * (size_t)src_el_stride + x),
-                vld1q_u16(base + 3 * (size_t)src_el_stride + x));
+            const uint16_t *rp = base + x;
+            uint16x8_t v0 = vrhaddq_u16(vld1q_u16(rp), vld1q_u16(rp + ss));
+            rp += ss2;
+            uint16x8_t v1 = vrhaddq_u16(vld1q_u16(rp), vld1q_u16(rp + ss));
             if (emit0) {
-                hdr_pow2_store_h1(v0,
-                    dst[0] + (size_t)(2 * g) * strides[0] + x / 2);
-                hdr_pow2_store_h1(v1,
-                    dst[0] + (size_t)(2 * g + 1) * strides[0] + x / 2);
+                uint16_t *out = out0_row + (x >> 1);
+                hdr_pow2_store_h1(v0, out);
+                hdr_pow2_store_h1(v1, out + s0);
             }
             uint16x8_t v2 = vrhaddq_u16(v0, v1);
             if (emit1)
-                hdr_pow2_store_h2(v2,
-                    dst[1] + (size_t)g * strides[1] + x / 4);
+                hdr_pow2_store_h2(v2, out1_row + (x >> 2));
         }
     }
 }
@@ -547,72 +491,89 @@ static void hdr_pow2_tiled_depth2(
     const uint16_t *restrict src, int src_w, int src_h, int src_el_stride,
     uint32_t active_outputs, uint16_t *restrict dst[4], int strides[4])
 {
+    uint16_t *const d0 = dst[0];
+    const int s0 = strides[0];
+    uint16_t *const d1 = dst[1];
+    const int s1 = strides[1];
+    uint16_t *const d2 = dst[2];
+    const int s2 = strides[2];
+    const ptrdiff_t ss = src_el_stride;
+    const ptrdiff_t ss2 = 2 * ss;
     int groups = src_h / 8;
     int emit0 = (active_outputs & (1u << 1)) != 0;
     int emit1 = (active_outputs & (1u << 3)) != 0;
     int emit2 = (active_outputs & (1u << 5)) != 0;
     for (int g = 0; g < groups; g++) {
-        const uint16_t *base = src + (size_t)(8 * g) * src_el_stride;
+        const uint16_t *base = src + (size_t)(8 * g) * (size_t)ss;
+        uint16_t *out0_row = emit0 ? (d0 + (size_t)(4 * g) * (size_t)s0) : NULL;
+        uint16_t *out1_row = emit1 ? (d1 + (size_t)(2 * g) * (size_t)s1) : NULL;
+        uint16_t *out2_row = emit2 ? (d2 + (size_t)g * (size_t)s2) : NULL;
         int x = 0;
         for (; x + 16 <= src_w; x += 16) {
-            hdr_pow2_tile16_t v0 = hdr_pow2_load_pair16(
-                base, 0, src_el_stride, x);
-            if (emit0) hdr_pow2_store_h1_tile16(v0,
-                dst[0] + (size_t)(4 * g) * strides[0] + x / 2);
-            hdr_pow2_tile16_t v1 = hdr_pow2_load_pair16(
-                base, 2, src_el_stride, x);
-            if (emit0) hdr_pow2_store_h1_tile16(v1,
-                dst[0] + (size_t)(4 * g + 1) * strides[0] + x / 2);
-            hdr_pow2_tile16_t v2 = hdr_pow2_load_pair16(
-                base, 4, src_el_stride, x);
-            if (emit0) hdr_pow2_store_h1_tile16(v2,
-                dst[0] + (size_t)(4 * g + 2) * strides[0] + x / 2);
-            hdr_pow2_tile16_t v3 = hdr_pow2_load_pair16(
-                base, 6, src_el_stride, x);
-            if (emit0) hdr_pow2_store_h1_tile16(v3,
-                dst[0] + (size_t)(4 * g + 3) * strides[0] + x / 2);
+            const uint16_t *rp = base + x;
+
+            hdr_pow2_tile16_t v0 = hdr_pow2_load_pair16(rp, src_el_stride);
+            rp += ss2;
+            hdr_pow2_tile16_t v1 = hdr_pow2_load_pair16(rp, src_el_stride);
+            rp += ss2;
+            if (emit0) {
+                uint16_t *out = out0_row + (x >> 1);
+                hdr_pow2_store_h1_tile16(v0, out);
+                hdr_pow2_store_h1_tile16(v1, out + s0);
+            }
             hdr_pow2_tile16_t w0 = hdr_pow2_avg_tile16(v0, v1);
-            if (emit1) hdr_pow2_store_h2_tile16(w0,
-                dst[1] + (size_t)(2 * g) * strides[1] + x / 4);
+
+            hdr_pow2_tile16_t v2 = hdr_pow2_load_pair16(rp, src_el_stride);
+            rp += ss2;
+            hdr_pow2_tile16_t v3 = hdr_pow2_load_pair16(rp, src_el_stride);
+            if (emit0) {
+                uint16_t *out = out0_row + 2 * (size_t)s0 + (x >> 1);
+                hdr_pow2_store_h1_tile16(v2, out);
+                hdr_pow2_store_h1_tile16(v3, out + s0);
+            }
             hdr_pow2_tile16_t w1 = hdr_pow2_avg_tile16(v2, v3);
-            if (emit1) hdr_pow2_store_h2_tile16(w1,
-                dst[1] + (size_t)(2 * g + 1) * strides[1] + x / 4);
+
+            if (emit1) {
+                uint16_t *out = out1_row + (x >> 2);
+                hdr_pow2_store_h2_tile16(w0, out);
+                hdr_pow2_store_h2_tile16(w1, out + s1);
+            }
             hdr_pow2_tile16_t z0 = hdr_pow2_avg_tile16(w0, w1);
-            if (emit2) hdr_pow2_store_h3_tile16(z0,
-                dst[2] + (size_t)g * strides[2] + x / 8);
+            if (emit2)
+                hdr_pow2_store_h3_tile16(z0, out2_row + (x >> 3));
         }
         for (; x < src_w; x += 8) {
-            uint16x8_t v0 = vrhaddq_u16(vld1q_u16(base + x),
-                                         vld1q_u16(base + src_el_stride + x));
-            uint16x8_t v1 = vrhaddq_u16(
-                vld1q_u16(base + 2 * (size_t)src_el_stride + x),
-                vld1q_u16(base + 3 * (size_t)src_el_stride + x));
-            uint16x8_t v2 = vrhaddq_u16(
-                vld1q_u16(base + 4 * (size_t)src_el_stride + x),
-                vld1q_u16(base + 5 * (size_t)src_el_stride + x));
-            uint16x8_t v3 = vrhaddq_u16(
-                vld1q_u16(base + 6 * (size_t)src_el_stride + x),
-                vld1q_u16(base + 7 * (size_t)src_el_stride + x));
+            const uint16_t *rp = base + x;
+
+            uint16x8_t v0 = vrhaddq_u16(vld1q_u16(rp), vld1q_u16(rp + ss));
+            rp += ss2;
+            uint16x8_t v1 = vrhaddq_u16(vld1q_u16(rp), vld1q_u16(rp + ss));
+            rp += ss2;
             if (emit0) {
-                uint16_t *out = dst[0]
-                    + (size_t)(4 * g) * strides[0] + x / 2;
+                uint16_t *out = out0_row + (x >> 1);
                 hdr_pow2_store_h1(v0, out);
-                hdr_pow2_store_h1(v1, out + strides[0]);
-                hdr_pow2_store_h1(v2, out + 2 * (size_t)strides[0]);
-                hdr_pow2_store_h1(v3, out + 3 * (size_t)strides[0]);
+                hdr_pow2_store_h1(v1, out + s0);
             }
             uint16x8_t v4 = vrhaddq_u16(v0, v1);
+
+            uint16x8_t v2 = vrhaddq_u16(vld1q_u16(rp), vld1q_u16(rp + ss));
+            rp += ss2;
+            uint16x8_t v3 = vrhaddq_u16(vld1q_u16(rp), vld1q_u16(rp + ss));
+            if (emit0) {
+                uint16_t *out = out0_row + 2 * (size_t)s0 + (x >> 1);
+                hdr_pow2_store_h1(v2, out);
+                hdr_pow2_store_h1(v3, out + s0);
+            }
             uint16x8_t v5 = vrhaddq_u16(v2, v3);
+
             if (emit1) {
-                uint16_t *out = dst[1]
-                    + (size_t)(2 * g) * strides[1] + x / 4;
+                uint16_t *out = out1_row + (x >> 2);
                 hdr_pow2_store_h2(v4, out);
-                hdr_pow2_store_h2(v5, out + strides[1]);
+                hdr_pow2_store_h2(v5, out + s1);
             }
             uint16x8_t v6 = vrhaddq_u16(v4, v5);
             if (emit2)
-                hdr_pow2_store_h3(v6,
-                    dst[2] + (size_t)g * strides[2] + x / 8);
+                hdr_pow2_store_h3(v6, out2_row + (x >> 3));
         }
     }
 }
@@ -621,6 +582,16 @@ static void hdr_pow2_tiled_depth3(
     const uint16_t *restrict src, int src_w, int src_h, int src_el_stride,
     uint32_t active_outputs, uint16_t *restrict dst[4], int strides[4])
 {
+    uint16_t *const d0 = dst[0];
+    const int s0 = strides[0];
+    uint16_t *const d1 = dst[1];
+    const int s1 = strides[1];
+    uint16_t *const d2 = dst[2];
+    const int s2 = strides[2];
+    uint16_t *const d3 = dst[3];
+    const int s3 = strides[3];
+    const ptrdiff_t ss = src_el_stride;
+    const ptrdiff_t ss2 = 2 * ss;
     int groups = src_h / 16;
     int emit0 = (active_outputs & (1u << 1)) != 0;
     int emit1 = (active_outputs & (1u << 3)) != 0;
@@ -628,69 +599,79 @@ static void hdr_pow2_tiled_depth3(
     int emit3 = (active_outputs & (1u << 7)) != 0;
 
     for (int g = 0; g < groups; g++) {
-        const uint16_t *base = src + (size_t)(16 * g) * src_el_stride;
+        const uint16_t *base = src + (size_t)(16 * g) * (size_t)ss;
+        uint16_t *out0_row = emit0 ? (d0 + (size_t)(8 * g) * (size_t)s0) : NULL;
+        uint16_t *out1_row = emit1 ? (d1 + (size_t)(4 * g) * (size_t)s1) : NULL;
+        uint16_t *out2_row = emit2 ? (d2 + (size_t)(2 * g) * (size_t)s2) : NULL;
+        uint16_t *out3_row = emit3 ? (d3 + (size_t)g * (size_t)s3) : NULL;
         for (int x = 0; x < src_w; x += 16) {
-            uint16_t *out0 = emit0
-                ? dst[0] + (size_t)(8 * g) * strides[0] + x / 2 : NULL;
-            uint16_t *out1 = emit1
-                ? dst[1] + (size_t)(4 * g) * strides[1] + x / 4 : NULL;
-            uint16_t *out2 = emit2
-                ? dst[2] + (size_t)(2 * g) * strides[2] + x / 8 : NULL;
+            const uint16_t *rp = base + x;
 
-            hdr_pow2_tile16_t v0 = hdr_pow2_load_pair16(
-                base, 0, src_el_stride, x);
-            if (emit0) hdr_pow2_store_h1_tile16(v0, out0);
-            hdr_pow2_tile16_t v1 = hdr_pow2_load_pair16(
-                base, 2, src_el_stride, x);
-            if (emit0) hdr_pow2_store_h1_tile16(v1, out0 + strides[0]);
+            hdr_pow2_tile16_t v0 = hdr_pow2_load_pair16(rp, src_el_stride);
+            rp += ss2;
+            hdr_pow2_tile16_t v1 = hdr_pow2_load_pair16(rp, src_el_stride);
+            rp += ss2;
+            if (emit0) {
+                uint16_t *out0 = out0_row + (x >> 1);
+                hdr_pow2_store_h1_tile16(v0, out0);
+                hdr_pow2_store_h1_tile16(v1, out0 + s0);
+            }
             hdr_pow2_tile16_t w0 = hdr_pow2_avg_tile16(v0, v1);
-            if (emit1) hdr_pow2_store_h2_tile16(w0, out1);
 
-            hdr_pow2_tile16_t v2 = hdr_pow2_load_pair16(
-                base, 4, src_el_stride, x);
-            if (emit0)
-                hdr_pow2_store_h1_tile16(v2, out0 + 2 * (size_t)strides[0]);
-            hdr_pow2_tile16_t v3 = hdr_pow2_load_pair16(
-                base, 6, src_el_stride, x);
-            if (emit0)
-                hdr_pow2_store_h1_tile16(v3, out0 + 3 * (size_t)strides[0]);
+            hdr_pow2_tile16_t v2 = hdr_pow2_load_pair16(rp, src_el_stride);
+            rp += ss2;
+            hdr_pow2_tile16_t v3 = hdr_pow2_load_pair16(rp, src_el_stride);
+            rp += ss2;
+            if (emit0) {
+                uint16_t *out0 = out0_row + 2 * (size_t)s0 + (x >> 1);
+                hdr_pow2_store_h1_tile16(v2, out0);
+                hdr_pow2_store_h1_tile16(v3, out0 + s0);
+            }
             hdr_pow2_tile16_t w1 = hdr_pow2_avg_tile16(v2, v3);
-            if (emit1) hdr_pow2_store_h2_tile16(w1, out1 + strides[1]);
+            if (emit1) {
+                uint16_t *out1 = out1_row + (x >> 2);
+                hdr_pow2_store_h2_tile16(w0, out1);
+                hdr_pow2_store_h2_tile16(w1, out1 + s1);
+            }
 
             hdr_pow2_tile16_t z0 = hdr_pow2_avg_tile16(w0, w1);
-            if (emit2) hdr_pow2_store_h3_tile16(z0, out2);
 
-            hdr_pow2_tile16_t v4 = hdr_pow2_load_pair16(
-                base, 8, src_el_stride, x);
-            if (emit0)
-                hdr_pow2_store_h1_tile16(v4, out0 + 4 * (size_t)strides[0]);
-            hdr_pow2_tile16_t v5 = hdr_pow2_load_pair16(
-                base, 10, src_el_stride, x);
-            if (emit0)
-                hdr_pow2_store_h1_tile16(v5, out0 + 5 * (size_t)strides[0]);
+            hdr_pow2_tile16_t v4 = hdr_pow2_load_pair16(rp, src_el_stride);
+            rp += ss2;
+            hdr_pow2_tile16_t v5 = hdr_pow2_load_pair16(rp, src_el_stride);
+            rp += ss2;
+            if (emit0) {
+                uint16_t *out0 = out0_row + 4 * (size_t)s0 + (x >> 1);
+                hdr_pow2_store_h1_tile16(v4, out0);
+                hdr_pow2_store_h1_tile16(v5, out0 + s0);
+            }
             hdr_pow2_tile16_t w2 = hdr_pow2_avg_tile16(v4, v5);
-            if (emit1)
-                hdr_pow2_store_h2_tile16(w2, out1 + 2 * (size_t)strides[1]);
 
-            hdr_pow2_tile16_t v6 = hdr_pow2_load_pair16(
-                base, 12, src_el_stride, x);
-            if (emit0)
-                hdr_pow2_store_h1_tile16(v6, out0 + 6 * (size_t)strides[0]);
-            hdr_pow2_tile16_t v7 = hdr_pow2_load_pair16(
-                base, 14, src_el_stride, x);
-            if (emit0)
-                hdr_pow2_store_h1_tile16(v7, out0 + 7 * (size_t)strides[0]);
+            hdr_pow2_tile16_t v6 = hdr_pow2_load_pair16(rp, src_el_stride);
+            rp += ss2;
+            hdr_pow2_tile16_t v7 = hdr_pow2_load_pair16(rp, src_el_stride);
+            if (emit0) {
+                uint16_t *out0 = out0_row + 6 * (size_t)s0 + (x >> 1);
+                hdr_pow2_store_h1_tile16(v6, out0);
+                hdr_pow2_store_h1_tile16(v7, out0 + s0);
+            }
             hdr_pow2_tile16_t w3 = hdr_pow2_avg_tile16(v6, v7);
-            if (emit1)
-                hdr_pow2_store_h2_tile16(w3, out1 + 3 * (size_t)strides[1]);
+            if (emit1) {
+                uint16_t *out1 = out1_row + 2 * (size_t)s1 + (x >> 2);
+                hdr_pow2_store_h2_tile16(w2, out1);
+                hdr_pow2_store_h2_tile16(w3, out1 + s1);
+            }
 
             hdr_pow2_tile16_t z1 = hdr_pow2_avg_tile16(w2, w3);
-            if (emit2) hdr_pow2_store_h3_tile16(z1, out2 + strides[2]);
+            if (emit2) {
+                uint16_t *out2 = out2_row + (x >> 3);
+                hdr_pow2_store_h3_tile16(z0, out2);
+                hdr_pow2_store_h3_tile16(z1, out2 + s2);
+            }
 
             hdr_pow2_tile16_t q0 = hdr_pow2_avg_tile16(z0, z1);
             if (emit3)
-                hdr_pow2_store_h4_tile16(q0,
-                    dst[3] + (size_t)g * strides[3] + x / 16);
+                hdr_pow2_store_h4_tile16(q0, out3_row + (x >> 4));
         }
     }
 }
@@ -784,10 +765,11 @@ static void __attribute__((hot)) scale_plane_pow2_hdr_neon(
  * Blend weights: out0 = (A*171 + B*85 + 128) >> 8
  *                out1 = (C*171 + B*85 + 128) >> 8 */
 static inline void h_chunk_1_5x_hdr(uint16x8_t A, uint16x8_t B, uint16x8_t C,
-                                     uint16_t *restrict dst)
+                                     uint16_t *restrict dst,
+                                     int16x8_t blend_k)
 {
-    uint16x8_t out0 = neon_blend_reg_hdr(A, B);
-    uint16x8_t out1 = neon_blend_reg_hdr(C, B);
+    uint16x8_t out0 = neon_blend_reg_hdr(A, B, blend_k);
+    uint16x8_t out1 = neon_blend_reg_hdr(C, B, blend_k);
 
     /* Interleave: [out0[0], out1[0], out0[1], out1[1], ...]
      * vst2q_u16 interleaves in the store unit. */
@@ -799,21 +781,22 @@ static inline void h_chunk_1_5x_hdr(uint16x8_t A, uint16x8_t B, uint16x8_t C,
  * Produces 8 output uint16_t stored at dst.  Returns the result register.
  * Sum of three 10-bit values (max 3069) fits in uint16_t. */
 static inline uint16x8_t h_chunk_3x_hdr(uint16x8_t A, uint16x8_t B, uint16x8_t C,
-                                          uint16_t *restrict dst)
+                                          uint16_t *restrict dst,
+                                          int16x8_t div3_k)
 {
     uint16x8_t sum = vaddq_u16(A, B);
     sum = vaddq_u16(sum, C);
-    uint16x8_t result = neon_div3_u16x8_hdr(sum);
+    uint16x8_t result = neon_div3_u16x8_hdr(sum, div3_k);
     vst1q_u16(dst, result);
     return result;
 }
 
 static inline uint16x8_t h_chunk_3x_hdr_reg(uint16x8_t A, uint16x8_t B,
-                                             uint16x8_t C)
+                                             uint16x8_t C, int16x8_t div3_k)
 {
     uint16x8_t sum = vaddq_u16(A, B);
     sum = vaddq_u16(sum, C);
-    return neon_div3_u16x8_hdr(sum);
+    return neon_div3_u16x8_hdr(sum, div3_k);
 }
 
 /* Horizontal 6x cascaded from a 3x result (8 elements -> 4 elements).
@@ -839,6 +822,151 @@ static inline void h_chunk_12x_hdr(uint16x8_t result_3x, uint16_t *restrict dst)
     uint16x4_t v12 = vrshrn_n_u32(vcombine_u32(s12, s12), 1);  /* 12x */
     vst1_lane_u16(dst,     v12, 0);
     vst1_lane_u16(dst + 1, v12, 1);
+}
+
+/* Thirds tail: the tail_cols (< 24) source columns right of the last full
+ * NEON chunk, for every 6-row group, in scalar code.  Because 24 is a
+ * multiple of 3, 6 and 12, no horizontal window straddles tail_start, so the
+ * tail is independent of the chunk loop and runs once after it.  It writes
+ * the same output rows per group as the chunk loop: 4 at 1.5x, 2 at 3x,
+ * 1 at 6x, and 1 at 12x on each odd group, which pairs its 6x intermediate
+ * with the previous even group's.  Kept out of line so its small arrays and
+ * loops stay out of the hot function's frame and register allocation. */
+static void __attribute__((noinline)) scale_plane_thirds_hdr_tail(
+    const uint16_t *restrict src,
+    int src_w, int base6_groups, int src_el_stride,
+    int full_chunks, int tail_start, int tail_cols,
+    uint32_t active_outputs, int deepest,
+    uint16_t *restrict dst_planes[4],
+    int dst_widths[4],
+    int ds0_el, int ds1_el, int ds2_el, int ds3_el)
+{
+    int need_1_5x = (active_outputs & (1u << 0)) != 0;
+    int need_3x   = (deepest >= 1);
+    int need_6x   = (deepest >= 2);
+    int need_12x  = (deepest >= 3);
+    int w_3x      = src_w / 3;
+
+    int tail_out_1_5x = full_chunks * 16;
+    int tail_out_3x   = full_chunks * 8;
+    int tail_out_6x   = full_chunks * 4;
+    int tail_out_12x  = full_chunks * 2;
+
+    uint16_t tail_v6x_prev[24];
+
+    for (int g6 = 0; g6 < base6_groups; g6++) {
+        const uint16_t *grp = src + (size_t)g6 * 6 * (size_t)src_el_stride + tail_start;
+        const uint16_t *restrict row0 = grp;
+        const uint16_t *restrict row1 = grp + (size_t)src_el_stride;
+        const uint16_t *restrict row2 = grp + (size_t)2 * (size_t)src_el_stride;
+        const uint16_t *restrict row3 = grp + (size_t)3 * (size_t)src_el_stride;
+        const uint16_t *restrict row4 = grp + (size_t)4 * (size_t)src_el_stride;
+        const uint16_t *restrict row5 = grp + (size_t)5 * (size_t)src_el_stride;
+
+        uint16_t tail_v01[24], tail_v23[24], tail_v45[24];
+#if defined(__clang__)
+        #pragma clang loop vectorize(disable)
+#endif
+        for (int x = 0; x < tail_cols; x++) {
+            tail_v01[x] = avg_u16(row0[x], row1[x]);
+            tail_v23[x] = avg_u16(row2[x], row3[x]);
+            tail_v45[x] = avg_u16(row4[x], row5[x]);
+        }
+
+        uint16_t tail_v3x0[24], tail_v3x1[24];
+        if (need_3x) {
+#if defined(__clang__)
+            #pragma clang loop vectorize(disable)
+#endif
+            for (int x = 0; x < tail_cols; x++) {
+                tail_v3x0[x] = avg_u16(tail_v01[x], tail_v23[x]);
+                tail_v3x1[x] = avg_u16(tail_v23[x], tail_v45[x]);
+            }
+        }
+
+        uint16_t tail_v6x[24];
+        if (need_6x) {
+#if defined(__clang__)
+            #pragma clang loop vectorize(disable)
+#endif
+            for (int x = 0; x < tail_cols; x++) {
+                tail_v6x[x] = avg_u16(tail_v3x0[x], tail_v3x1[x]);
+            }
+        }
+
+        if (need_1_5x) {
+            int dw_rem = dst_widths[0] - tail_out_1_5x;
+            uint16_t *base_1_5x = dst_planes[0]
+                + (size_t)(4 * g6) * (size_t)ds0_el + tail_out_1_5x;
+            h_filter_1_5x_hdr(tail_v01, tail_cols, base_1_5x, dw_rem);
+
+            uint16_t tail_blend[24];
+#if defined(__clang__)
+            #pragma clang loop vectorize(disable)
+#endif
+            for (int x = 0; x < tail_cols; x++)
+                tail_blend[x] = blend_2_1_u16(tail_v01[x], tail_v23[x]);
+            h_filter_1_5x_hdr(tail_blend, tail_cols,
+                               base_1_5x + ds0_el, dw_rem);
+
+#if defined(__clang__)
+            #pragma clang loop vectorize(disable)
+#endif
+            for (int x = 0; x < tail_cols; x++)
+                tail_blend[x] = blend_2_1_u16(tail_v23[x], tail_v45[x]);
+            h_filter_1_5x_hdr(tail_blend, tail_cols,
+                               base_1_5x + 2 * (size_t)ds0_el, dw_rem);
+
+            h_filter_1_5x_hdr(tail_v45, tail_cols,
+                               base_1_5x + 3 * (size_t)ds0_el, dw_rem);
+        }
+
+        if (active_outputs & (1u << 2)) {
+            int dw_rem = dst_widths[1] - tail_out_3x;
+            uint16_t *base_3x = dst_planes[1]
+                + (size_t)(2 * g6) * (size_t)ds1_el + tail_out_3x;
+            h_filter_3x_hdr(tail_v3x0, tail_cols, base_3x, dw_rem);
+            h_filter_3x_hdr(tail_v3x1, tail_cols, base_3x + ds1_el, dw_rem);
+        }
+
+        if (active_outputs & (1u << 4)) {
+            int dw_rem = dst_widths[2] - tail_out_6x;
+            int w3_tail = tail_cols / 3;
+            uint16_t tail_h3x[8];
+            h_filter_3x_hdr(tail_v6x, tail_cols, tail_h3x, w3_tail);
+            h_filter_halve_tail_hdr(
+                tail_h3x,
+                dst_planes[2] + (size_t)g6 * (size_t)ds2_el + tail_out_6x,
+                dw_rem);
+        }
+
+        if (need_12x) {
+            if ((g6 & 1) == 0) {
+#if defined(__clang__)
+                #pragma clang loop vectorize(disable)
+#endif
+                for (int x = 0; x < tail_cols; x++)
+                    tail_v6x_prev[x] = tail_v6x[x];
+            } else {
+                uint16_t tail_v12x[24];
+#if defined(__clang__)
+                #pragma clang loop vectorize(disable)
+#endif
+                for (int x = 0; x < tail_cols; x++)
+                    tail_v12x[x] = avg_u16(tail_v6x_prev[x], tail_v6x[x]);
+
+                int tail_w3 = w_3x - full_chunks * 8;
+                uint16_t h3_tail[8];
+                uint16_t h6_tail[4];
+                h_filter_3x_hdr(tail_v12x, tail_cols, h3_tail, tail_w3);
+                h_filter_halve_tail_hdr(h3_tail, h6_tail, tail_w3 / 2);
+                h_filter_halve_tail_hdr(
+                    h6_tail,
+                    dst_planes[3] + (size_t)(g6 >> 1) * (size_t)ds3_el + tail_out_12x,
+                    dst_widths[3] - tail_out_12x);
+            }
+        }
+    }
 }
 
 static void __attribute__((hot)) scale_plane_thirds_hdr_neon(
@@ -895,327 +1023,222 @@ static void __attribute__((hot)) scale_plane_thirds_hdr_neon(
         v6x_prev = v6x_buf_b;
     }
 
-    /* 12x tail width (3x -> halve -> halve) for the columns outside the
-     * 24-wide NEON chunks. */
-    int w_3x = src_w / 3;
-
     /* Chunk geometry: 48 bytes = 24 uint16_t = 8 triplets per chunk.
      * Each chunk of 24 elements covers 3 Q registers (3 x 8 elements). */
     int full_chunks = src_w / 24;
     int tail_start  = full_chunks * 24;
     int tail_cols   = src_w - tail_start;
 
-    /* Output row cursors */
-    int out_row[4] = { 0, 0, 0, 0 };
+    uint16_t *const d0 = dst_planes[0];
+    uint16_t *const d1 = dst_planes[1];
+    uint16_t *const d2 = dst_planes[2];
+    uint16_t *const d3 = dst_planes[3];
+    const int ds0_el = dst_strides[0] / (int)sizeof(uint16_t);
+    const int ds1_el = dst_strides[1] / (int)sizeof(uint16_t);
+    const int ds2_el = dst_strides[2] / (int)sizeof(uint16_t);
+    const int ds3_el = dst_strides[3] / (int)sizeof(uint16_t);
 
-    for (int g6 = 0; g6 < base6_groups; g6++) {
-        const uint16_t *grp = src + (size_t)g6 * 6 * (size_t)src_el_stride;
+    int16x8_t blend_k = vdupq_n_s16(10880);
+    int16x8_t div3_k  = vdupq_n_s16(10923);
 
-        const uint16_t *restrict row0 = grp;
-        const uint16_t *restrict row1 = grp + (size_t)src_el_stride;
-        const uint16_t *restrict row2 = grp + (size_t)2 * (size_t)src_el_stride;
-        const uint16_t *restrict row3 = grp + (size_t)3 * (size_t)src_el_stride;
-        const uint16_t *restrict row4 = grp + (size_t)4 * (size_t)src_el_stride;
-        const uint16_t *restrict row5 = grp + (size_t)5 * (size_t)src_el_stride;
+    if (full_chunks > 0) {
+        for (int g6 = 0; g6 < base6_groups; g6++) {
+            const uint16_t *grp = src + (size_t)g6 * 6 * (size_t)src_el_stride;
 
-        /* Prefetch the first cache line of each of the next group's 6 source
-         * rows.  The HW prefetcher picks up the sequential access within each
-         * row; this bridges the per-row stream restart at the group boundary. */
-        if (g6 + 1 < base6_groups) {
-            const uint16_t *nxt = grp + (size_t)6 * (size_t)src_el_stride;
-            __builtin_prefetch(nxt);
-            __builtin_prefetch(nxt + src_el_stride);
-            __builtin_prefetch(nxt + 2 * src_el_stride);
-            __builtin_prefetch(nxt + 3 * src_el_stride);
-            __builtin_prefetch(nxt + 4 * src_el_stride);
-            __builtin_prefetch(nxt + 5 * src_el_stride);
-        }
+            const uint16_t *restrict row0 = grp;
+            const uint16_t *restrict row1 = grp + (size_t)src_el_stride;
+            const uint16_t *restrict row2 = grp + (size_t)2 * (size_t)src_el_stride;
+            const uint16_t *restrict row3 = grp + (size_t)3 * (size_t)src_el_stride;
+            const uint16_t *restrict row4 = grp + (size_t)4 * (size_t)src_el_stride;
+            const uint16_t *restrict row5 = grp + (size_t)5 * (size_t)src_el_stride;
 
-        /* Compute output row base pointers (element pointers, not byte) */
-        uint16_t *dst_1_5x_r0 = NULL, *dst_1_5x_r1 = NULL;
-        uint16_t *dst_1_5x_r2 = NULL, *dst_1_5x_r3 = NULL;
-        if (need_1_5x) {
-            int ds_el = dst_strides[0] / (int)sizeof(uint16_t);
-            dst_1_5x_r0 = dst_planes[0] + (size_t)out_row[0]       * (size_t)ds_el;
-            dst_1_5x_r1 = dst_planes[0] + (size_t)(out_row[0] + 1) * (size_t)ds_el;
-            dst_1_5x_r2 = dst_planes[0] + (size_t)(out_row[0] + 2) * (size_t)ds_el;
-            dst_1_5x_r3 = dst_planes[0] + (size_t)(out_row[0] + 3) * (size_t)ds_el;
-        }
+            /* Prefetch the first cache line of each of the next group's 6 source
+             * rows.  The HW prefetcher picks up the sequential access within each
+             * row; this bridges the per-row stream restart at the group boundary. */
+            if (g6 + 1 < base6_groups) {
+                const uint16_t *nxt = grp + (size_t)6 * (size_t)src_el_stride;
+                __builtin_prefetch(nxt);
+                __builtin_prefetch(nxt + src_el_stride);
+                __builtin_prefetch(nxt + 2 * src_el_stride);
+                __builtin_prefetch(nxt + 3 * src_el_stride);
+                __builtin_prefetch(nxt + 4 * src_el_stride);
+                __builtin_prefetch(nxt + 5 * src_el_stride);
+            }
 
-        uint16_t *dst_3x_r0 = NULL, *dst_3x_r1 = NULL;
-        if (active_outputs & (1u << 2)) {
-            int ds_el = dst_strides[1] / (int)sizeof(uint16_t);
-            dst_3x_r0 = dst_planes[1] + (size_t)out_row[1]       * (size_t)ds_el;
-            dst_3x_r1 = dst_planes[1] + (size_t)(out_row[1] + 1) * (size_t)ds_el;
-        }
-
-        uint16_t *dst_6x_r0 = NULL;
-        if (active_outputs & (1u << 4)) {
-            int ds_el = dst_strides[2] / (int)sizeof(uint16_t);
-            dst_6x_r0 = dst_planes[2] + (size_t)out_row[2] * (size_t)ds_el;
-        }
-
-        /* 12x output row, needed on odd groups where the chunk loop emits
-         * the fused 12x output directly from registers. */
-        uint16_t *dst_12x_r0 = NULL;
-        if (need_12x && (g6 & 1)) {
-            int ds_el = dst_strides[3] / (int)sizeof(uint16_t);
-            dst_12x_r0 = dst_planes[3] + (size_t)out_row[3] * (size_t)ds_el;
-        }
-
-        /* ============================================================
-         * MAIN CHUNK LOOP: process 24 source elements (8 triplets) at
-         * a time.  Each chunk is 3 Q registers of uint16x8_t.
-         *
-         * Vertical intermediates stay in NEON registers; horizontal
-         * filtering is applied immediately per chunk.  A 6-source-row
-         * group produces 4 output rows at 1.5x, 2 at 3x, and 1 at 6x.
-         * ============================================================ */
-        for (int ci = 0; ci < full_chunks; ci++) {
-            int cx = ci * 24;           /* element offset into source row */
-            int out_off_1_5x = ci * 16; /* 24 -> 16 output elements */
-            int out_off_3x   = ci * 8;  /* 24 ->  8 output elements */
-            int out_off_6x   = ci * 4;  /* 24 ->  4 output elements */
-
-            /* Deinterleave at the source load.  All vertical operations are
-             * lane-wise, so the permutation commutes exactly with the
-             * vertical cascade and removes every register -> stack -> ld3
-             * round trip from the output paths. */
-            uint16x8x3_t r0 = vld3q_u16(row0 + cx);
-            uint16x8x3_t r1 = vld3q_u16(row1 + cx);
-            uint16x8x3_t r2 = vld3q_u16(row2 + cx);
-            uint16x8x3_t r3 = vld3q_u16(row3 + cx);
-            uint16x8x3_t r4 = vld3q_u16(row4 + cx);
-            uint16x8x3_t r5 = vld3q_u16(row5 + cx);
-
-            /* --- VERTICAL PAIRWISE AVERAGES (in registers) ---
-             * Average adjacent row pairs using vrhaddq_u16 (rounded). */
-            uint16x8_t v01a = vrhaddq_u16(r0.val[0], r1.val[0]);
-            uint16x8_t v01b = vrhaddq_u16(r0.val[1], r1.val[1]);
-            uint16x8_t v01c = vrhaddq_u16(r0.val[2], r1.val[2]);
-            uint16x8_t v23a = vrhaddq_u16(r2.val[0], r3.val[0]);
-            uint16x8_t v23b = vrhaddq_u16(r2.val[1], r3.val[1]);
-            uint16x8_t v23c = vrhaddq_u16(r2.val[2], r3.val[2]);
-            uint16x8_t v45a = vrhaddq_u16(r4.val[0], r5.val[0]);
-            uint16x8_t v45b = vrhaddq_u16(r4.val[1], r5.val[1]);
-            uint16x8_t v45c = vrhaddq_u16(r4.val[2], r5.val[2]);
-
-            /* --- 1.5x OUTPUT (4 rows) ---
-             * Rows 0 and 3 come from v01 and v45 directly.
-             * Rows 1 and 2 are bilinear blends between adjacent pair
-             * averages: blend(v01,v23) and blend(v23,v45).
-             * Blend uses neon_blend_reg_hdr which widens to uint32_t. */
+            /* Compute output row base pointers (element pointers, not byte) */
+            uint16_t *dst_1_5x_r0 = NULL, *dst_1_5x_r1 = NULL;
+            uint16_t *dst_1_5x_r2 = NULL, *dst_1_5x_r3 = NULL;
             if (need_1_5x) {
-                /* Row 0: v01 */
-                h_chunk_1_5x_hdr(v01a, v01b, v01c,
-                                  dst_1_5x_r0 + out_off_1_5x);
-
-                /* Row 1: blend(v01, v23) */
-                {
-                    uint16x8_t ba = neon_blend_reg_hdr(v01a, v23a);
-                    uint16x8_t bb = neon_blend_reg_hdr(v01b, v23b);
-                    uint16x8_t bc = neon_blend_reg_hdr(v01c, v23c);
-                    h_chunk_1_5x_hdr(ba, bb, bc,
-                                      dst_1_5x_r1 + out_off_1_5x);
-                }
-
-                /* Row 2: blend(v23, v45) */
-                {
-                    uint16x8_t ba = neon_blend_reg_hdr(v23a, v45a);
-                    uint16x8_t bb = neon_blend_reg_hdr(v23b, v45b);
-                    uint16x8_t bc = neon_blend_reg_hdr(v23c, v45c);
-                    h_chunk_1_5x_hdr(ba, bb, bc,
-                                      dst_1_5x_r2 + out_off_1_5x);
-                }
-
-                /* Row 3: v45 */
-                h_chunk_1_5x_hdr(v45a, v45b, v45c,
-                                  dst_1_5x_r3 + out_off_1_5x);
+                size_t r0_idx = (size_t)(4 * g6);
+                dst_1_5x_r0 = d0 + r0_idx       * (size_t)ds0_el;
+                dst_1_5x_r1 = d0 + (r0_idx + 1) * (size_t)ds0_el;
+                dst_1_5x_r2 = d0 + (r0_idx + 2) * (size_t)ds0_el;
+                dst_1_5x_r3 = d0 + (r0_idx + 3) * (size_t)ds0_el;
             }
 
-            /* --- 3x VERTICAL + HORIZONTAL (2 rows) ---
-             * avg(v01,v23) and avg(v23,v45), then 3:1 box average. */
-            uint16x8_t v3x0a = vdupq_n_u16(0), v3x0b = vdupq_n_u16(0), v3x0c = vdupq_n_u16(0);
-            uint16x8_t v3x1a = vdupq_n_u16(0), v3x1b = vdupq_n_u16(0), v3x1c = vdupq_n_u16(0);
-            if (need_3x) {
-                v3x0a = vrhaddq_u16(v01a, v23a);
-                v3x0b = vrhaddq_u16(v01b, v23b);
-                v3x0c = vrhaddq_u16(v01c, v23c);
-                v3x1a = vrhaddq_u16(v23a, v45a);
-                v3x1b = vrhaddq_u16(v23b, v45b);
-                v3x1c = vrhaddq_u16(v23c, v45c);
-
-                if (active_outputs & (1u << 2)) {
-                    h_chunk_3x_hdr(v3x0a, v3x0b, v3x0c,
-                                    dst_3x_r0 + out_off_3x);
-
-                    h_chunk_3x_hdr(v3x1a, v3x1b, v3x1c,
-                                    dst_3x_r1 + out_off_3x);
-                }
+            uint16_t *dst_3x_r0 = NULL, *dst_3x_r1 = NULL;
+            if (active_outputs & (1u << 2)) {
+                size_t r0_idx = (size_t)(2 * g6);
+                dst_3x_r0 = d1 + r0_idx       * (size_t)ds1_el;
+                dst_3x_r1 = d1 + (r0_idx + 1) * (size_t)ds1_el;
             }
 
-            /* --- 6x VERTICAL (1 row) + save for 12x + 6x horizontal ---
-             * Average the two 3x intermediates to get one 6x row. */
-            if (need_6x) {
-                uint16x8_t v6xa = vrhaddq_u16(v3x0a, v3x1a);
-                uint16x8_t v6xb = vrhaddq_u16(v3x0b, v3x1b);
-                uint16x8_t v6xc = vrhaddq_u16(v3x0c, v3x1c);
+            uint16_t *dst_6x_r0 = NULL;
+            if (active_outputs & (1u << 4)) {
+                dst_6x_r0 = d2 + (size_t)g6 * (size_t)ds2_el;
+            }
 
-                /* 12x pairing.  On even groups: save the 6x vertical
-                 * intermediate; it becomes v6x_prev for the next group.
-                 * On odd groups: average with v6x_prev in registers and emit
-                 * the 12x output immediately (3x box filter followed by two
-                 * in-register rounded halvings), avoiding both the odd group's
-                 * intermediate store and the separate averaging + horizontal
-                 * scratch passes. */
-                if (need_12x) {
-                    if ((g6 & 1) == 0) {
-                        vst1q_u16(v6x_cur + cx,      v6xa);
-                        vst1q_u16(v6x_cur + cx + 8,  v6xb);
-                        vst1q_u16(v6x_cur + cx + 16, v6xc);
-                    } else {
-                        uint16x8_t p6a = vld1q_u16(v6x_prev + cx);
-                        uint16x8_t p6b = vld1q_u16(v6x_prev + cx + 8);
-                        uint16x8_t p6c = vld1q_u16(v6x_prev + cx + 16);
-                        uint16x8_t r3x = h_chunk_3x_hdr_reg(
-                            vrhaddq_u16(p6a, v6xa),
-                            vrhaddq_u16(p6b, v6xb),
-                            vrhaddq_u16(p6c, v6xc));
-                        h_chunk_12x_hdr(r3x, dst_12x_r0 + ci * 2);
+            /* 12x output row, needed on odd groups where the chunk loop emits
+             * the fused 12x output directly from registers. */
+            uint16_t *dst_12x_r0 = NULL;
+            if (need_12x && (g6 & 1)) {
+                dst_12x_r0 = d3 + (size_t)(g6 >> 1) * (size_t)ds3_el;
+            }
+
+#if defined(__clang__)
+            /* Keep both multiplier constants live in registers across the
+             * chunk loop; clang otherwise rematerializes them (mov + dup)
+             * inside it. */
+            __asm__ volatile("" : "+w"(blend_k), "+w"(div3_k));
+#endif
+
+            /* ============================================================
+             * MAIN CHUNK LOOP: process 24 source elements (8 triplets) at
+             * a time.  Each chunk is 3 Q registers of uint16x8_t.
+             *
+             * Vertical intermediates stay in NEON registers; horizontal
+             * filtering is applied immediately per chunk.  A 6-source-row
+             * group produces 4 output rows at 1.5x, 2 at 3x, and 1 at 6x;
+             * each odd group also produces 1 row at 12x.
+             * ============================================================ */
+            for (int ci = 0; ci < full_chunks; ci++) {
+                int cx = ci * 24;           /* element offset into source row */
+                int out_off_1_5x = ci * 16; /* 24 -> 16 output elements */
+                int out_off_3x   = ci * 8;  /* 24 ->  8 output elements */
+                int out_off_6x   = ci * 4;  /* 24 ->  4 output elements */
+
+                /* Deinterleave at the source load.  All vertical operations
+                 * are lane-wise, so the permutation commutes exactly with
+                 * the vertical cascade and every horizontal filter sees its
+                 * triplets already split across .val[0..2]. */
+                uint16x8x3_t r0 = vld3q_u16(row0 + cx);
+                uint16x8x3_t r1 = vld3q_u16(row1 + cx);
+                uint16x8x3_t r2 = vld3q_u16(row2 + cx);
+                uint16x8x3_t r3 = vld3q_u16(row3 + cx);
+                uint16x8x3_t r4 = vld3q_u16(row4 + cx);
+                uint16x8x3_t r5 = vld3q_u16(row5 + cx);
+
+                /* Vertical pairwise averages (rounded), in registers. */
+                uint16x8_t v01a = vrhaddq_u16(r0.val[0], r1.val[0]);
+                uint16x8_t v01b = vrhaddq_u16(r0.val[1], r1.val[1]);
+                uint16x8_t v01c = vrhaddq_u16(r0.val[2], r1.val[2]);
+
+                uint16x8_t v23a = vrhaddq_u16(r2.val[0], r3.val[0]);
+                uint16x8_t v23b = vrhaddq_u16(r2.val[1], r3.val[1]);
+                uint16x8_t v23c = vrhaddq_u16(r2.val[2], r3.val[2]);
+
+                uint16x8_t v45a = vrhaddq_u16(r4.val[0], r5.val[0]);
+                uint16x8_t v45b = vrhaddq_u16(r4.val[1], r5.val[1]);
+                uint16x8_t v45c = vrhaddq_u16(r4.val[2], r5.val[2]);
+
+                /* --- 1.5x VERTICAL (4 rows) + HORIZONTAL ---
+                 * Rows 0 and 3 come from v01 and v45 directly.  Rows 1 and
+                 * 2 are bilinear blends between adjacent pair averages:
+                 * blend(v01,v23) and blend(v23,v45). */
+                if (need_1_5x) {
+                    /* Row 0: v01 */
+                    h_chunk_1_5x_hdr(v01a, v01b, v01c,
+                                      dst_1_5x_r0 + out_off_1_5x, blend_k);
+
+                    /* Row 1: blend(v01, v23) */
+                    {
+                        uint16x8_t ba = neon_blend_reg_hdr(v01a, v23a, blend_k);
+                        uint16x8_t bb = neon_blend_reg_hdr(v01b, v23b, blend_k);
+                        uint16x8_t bc = neon_blend_reg_hdr(v01c, v23c, blend_k);
+                        h_chunk_1_5x_hdr(ba, bb, bc,
+                                          dst_1_5x_r1 + out_off_1_5x, blend_k);
+                    }
+
+                    /* Row 2: blend(v23, v45) */
+                    {
+                        uint16x8_t ba = neon_blend_reg_hdr(v23a, v45a, blend_k);
+                        uint16x8_t bb = neon_blend_reg_hdr(v23b, v45b, blend_k);
+                        uint16x8_t bc = neon_blend_reg_hdr(v23c, v45c, blend_k);
+                        h_chunk_1_5x_hdr(ba, bb, bc,
+                                          dst_1_5x_r2 + out_off_1_5x, blend_k);
+                    }
+
+                    /* Row 3: v45 */
+                    h_chunk_1_5x_hdr(v45a, v45b, v45c,
+                                      dst_1_5x_r3 + out_off_1_5x, blend_k);
+                }
+
+                /* --- 3x VERTICAL (2 rows) + HORIZONTAL --- */
+                uint16x8_t v3x0a = vdupq_n_u16(0), v3x0b = vdupq_n_u16(0), v3x0c = vdupq_n_u16(0);
+                uint16x8_t v3x1a = vdupq_n_u16(0), v3x1b = vdupq_n_u16(0), v3x1c = vdupq_n_u16(0);
+
+                if (need_3x) {
+                    v3x0a = vrhaddq_u16(v01a, v23a);
+                    v3x0b = vrhaddq_u16(v01b, v23b);
+                    v3x0c = vrhaddq_u16(v01c, v23c);
+
+                    v3x1a = vrhaddq_u16(v23a, v45a);
+                    v3x1b = vrhaddq_u16(v23b, v45b);
+                    v3x1c = vrhaddq_u16(v23c, v45c);
+
+                    if (active_outputs & (1u << 2)) {
+                        h_chunk_3x_hdr(v3x0a, v3x0b, v3x0c,
+                                        dst_3x_r0 + out_off_3x, div3_k);
+                        h_chunk_3x_hdr(v3x1a, v3x1b, v3x1c,
+                                        dst_3x_r1 + out_off_3x, div3_k);
                     }
                 }
 
-                if (active_outputs & (1u << 4)) {
-                    uint16x8_t r3x = h_chunk_3x_hdr_reg(v6xa, v6xb, v6xc);
-                    h_chunk_6x_hdr(r3x, dst_6x_r0 + out_off_6x);
+                /* --- 6x VERTICAL (1 row) + save for 12x + 6x horizontal --- */
+                if (need_6x) {
+                    uint16x8_t v6xa = vrhaddq_u16(v3x0a, v3x1a);
+                    uint16x8_t v6xb = vrhaddq_u16(v3x0b, v3x1b);
+                    uint16x8_t v6xc = vrhaddq_u16(v3x0c, v3x1c);
+
+                    if (need_12x) {
+                        if ((g6 & 1) == 0) {
+                            vst1q_u16(v6x_cur + cx,      v6xa);
+                            vst1q_u16(v6x_cur + cx + 8,  v6xb);
+                            vst1q_u16(v6x_cur + cx + 16, v6xc);
+                        } else {
+                            uint16x8_t p6a = vld1q_u16(v6x_prev + cx);
+                            uint16x8_t p6b = vld1q_u16(v6x_prev + cx + 8);
+                            uint16x8_t p6c = vld1q_u16(v6x_prev + cx + 16);
+                            uint16x8_t r3x = h_chunk_3x_hdr_reg(
+                                vrhaddq_u16(p6a, v6xa),
+                                vrhaddq_u16(p6b, v6xb),
+                                vrhaddq_u16(p6c, v6xc), div3_k);
+                            h_chunk_12x_hdr(r3x, dst_12x_r0 + ci * 2);
+                        }
+                    }
+
+                    if (active_outputs & (1u << 4)) {
+                        uint16x8_t r3x = h_chunk_3x_hdr_reg(v6xa, v6xb, v6xc, div3_k);
+                        h_chunk_6x_hdr(r3x, dst_6x_r0 + out_off_6x);
+                    }
                 }
-            }
-        } /* end chunk loop */
+            } /* end chunk loop */
 
-        /* ============================================================
-         * TAIL: handle remaining columns with scalar h_filter functions
-         * ============================================================ */
-        if (tail_cols > 0) {
-            /* Tail buffers: max tail_cols < 24 elements */
-            uint16_t tail_v01[24], tail_v23[24], tail_v45[24];
-
-            /* Compute vertical intermediates for tail */
-            for (int x = 0; x < tail_cols; x++) {
-                int sx = tail_start + x;
-                tail_v01[x] = avg_u16(row0[sx], row1[sx]);
-                tail_v23[x] = avg_u16(row2[sx], row3[sx]);
-                tail_v45[x] = avg_u16(row4[sx], row5[sx]);
-            }
-
-            uint16_t tail_v3x0[24], tail_v3x1[24];
-            if (need_3x) {
-                for (int x = 0; x < tail_cols; x++) {
-                    tail_v3x0[x] = avg_u16(tail_v01[x], tail_v23[x]);
-                    tail_v3x1[x] = avg_u16(tail_v23[x], tail_v45[x]);
-                }
-            }
-
-            uint16_t tail_v6x[24];
-            if (need_6x) {
-                for (int x = 0; x < tail_cols; x++) {
-                    tail_v6x[x] = avg_u16(tail_v3x0[x], tail_v3x1[x]);
-                }
-                if (need_12x) {
-                    memcpy(v6x_cur + tail_start, tail_v6x,
-                           (size_t)tail_cols * sizeof(uint16_t));
-                }
-            }
-
-            /* How many output elements the NEON chunks already produced */
-            int tail_out_1_5x = full_chunks * 16;
-            int tail_out_3x   = full_chunks * 8;
-            int tail_out_6x   = full_chunks * 4;
-
-            /* 1.5x tail */
-            if (need_1_5x) {
-                int dw_rem = dst_widths[0] - tail_out_1_5x;
-                h_filter_1_5x_hdr(tail_v01, tail_cols,
-                                   dst_1_5x_r0 + tail_out_1_5x, dw_rem);
-
-                uint16_t tail_blend[24];
-                for (int x = 0; x < tail_cols; x++)
-                    tail_blend[x] = blend_2_1_u16(tail_v01[x], tail_v23[x]);
-                h_filter_1_5x_hdr(tail_blend, tail_cols,
-                                   dst_1_5x_r1 + tail_out_1_5x, dw_rem);
-
-                for (int x = 0; x < tail_cols; x++)
-                    tail_blend[x] = blend_2_1_u16(tail_v23[x], tail_v45[x]);
-                h_filter_1_5x_hdr(tail_blend, tail_cols,
-                                   dst_1_5x_r2 + tail_out_1_5x, dw_rem);
-
-                h_filter_1_5x_hdr(tail_v45, tail_cols,
-                                   dst_1_5x_r3 + tail_out_1_5x, dw_rem);
-            }
-
-            /* 3x tail */
-            if (active_outputs & (1u << 2)) {
-                int dw_rem = dst_widths[1] - tail_out_3x;
-                h_filter_3x_hdr(tail_v3x0, tail_cols,
-                                 dst_3x_r0 + tail_out_3x, dw_rem);
-                h_filter_3x_hdr(tail_v3x1, tail_cols,
-                                 dst_3x_r1 + tail_out_3x, dw_rem);
-            }
-
-            /* 6x tail */
-            if (active_outputs & (1u << 4)) {
-                int dw_rem = dst_widths[2] - tail_out_6x;
-                int w3_tail = tail_cols / 3;
-                uint16_t tail_h3x[8];
-                h_filter_3x_hdr(tail_v6x, tail_cols, tail_h3x, w3_tail);
-                h_filter_halve_hdr(tail_h3x, dst_6x_r0 + tail_out_6x, dw_rem);
-            }
-        }
-
-        /* Update output row cursors */
-        if (need_1_5x) out_row[0] += 4;
-        if (active_outputs & (1u << 2)) out_row[1] += 2;
-        if (active_outputs & (1u << 4)) out_row[2] += 1;
-
-        /* ============================================================
-         * 12x handling: pair two consecutive 6-row groups.
-         * v6x_cur holds this group's 6x vertical intermediate (src_w
-         * uint16_t elements).
-         * On even groups: swap pointers so current becomes previous.
-         * On odd groups: average prev with current, apply horizontal, output.
-         *
-         * 12x requires averaging two consecutive 6x rows, each derived
-         * from a different 6-row source group.  The ping-pong swap
-         * avoids copying.
-         * ============================================================ */
-        if (need_12x) {
-            if ((g6 & 1) == 0) {
-                /* Swap so v6x_cur data becomes v6x_prev for the next group */
+            if (need_12x && (g6 & 1) == 0) {
                 uint16_t *tmp = v6x_prev;
                 v6x_prev = v6x_cur;
                 v6x_cur  = tmp;
-            } else {
-                if (tail_cols > 0) {
-                    /* Average the two groups' 6x intermediates over the tail
-                     * columns only (full chunks were fused in the chunk loop),
-                     * then 3x -> halve -> halve. */
-                    for (int x = tail_start; x < src_w; x++)
-                        v6x_prev[x] = avg_u16(v6x_prev[x], v6x_cur[x]);
-
-                    int tail_w3 = w_3x - full_chunks * 8;
-                    uint16_t h3_tail[8];
-                    uint16_t h6_tail[4];
-                    h_filter_3x_hdr(v6x_prev + tail_start, tail_cols,
-                                    h3_tail, tail_w3);
-                    h_filter_halve_hdr(h3_tail, h6_tail, tail_w3 / 2);
-                    h_filter_halve_hdr(h6_tail, dst_12x_r0 + full_chunks * 2,
-                                       dst_widths[3] - full_chunks * 2);
-                }
-                out_row[3]++;
             }
-        }
-    } /* end g6 loop */
+        } /* end g6 loop */
+    }
 
-    /* Scratch buffers are carved from the persistent pool - nothing to free. */
+    if (__builtin_expect(tail_cols > 0, 0)) {
+        scale_plane_thirds_hdr_tail(
+            src, src_w, base6_groups, src_el_stride,
+            full_chunks, tail_start, tail_cols,
+            active_outputs, deepest, dst_planes, dst_widths,
+            ds0_el, ds1_el, ds2_el, ds3_el);
+    }
 }
 
 
@@ -1276,29 +1299,7 @@ void __attribute__((hot)) fused_kernel_pow2_hdr_neon(
         /* P010: src_u points to interleaved UV plane (UVUV...).
          * Deinterleave using NEON vld2q_u16 into pre-allocated buffers,
          * then process each plane normally. */
-        int uv_el_stride = p->src_uv_el_stride;
-        int planar_el_stride = p->p010_tmp_stride / (int)sizeof(uint16_t);
-
-        /* NEON deinterleave: vld2q_u16 loads 16 uint16_t and separates
-         * into even (U) and odd (V) elements. */
-        for (int y = 0; y < chroma_h; y++) {
-            const uint16_t *row = src_u + (size_t)y * (size_t)uv_el_stride;
-            uint16_t *u_row = p->p010_tmp_u + (size_t)y * (size_t)planar_el_stride;
-            uint16_t *v_row = p->p010_tmp_v + (size_t)y * (size_t)planar_el_stride;
-
-            int neon_pairs = chroma_w / 8;
-            int x = 0;
-            for (int c = 0; c < neon_pairs; c++, x += 8) {
-                uint16x8x2_t uv = vld2q_u16(row + 2 * x);
-                vst1q_u16(u_row + x, uv.val[0]);
-                vst1q_u16(v_row + x, uv.val[1]);
-            }
-            /* Scalar tail */
-            for (; x < chroma_w; x++) {
-                u_row[x] = row[2 * x];
-                v_row[x] = row[2 * x + 1];
-            }
-        }
+        fused_hdr_deinterleave_p010(p, src_u);
 
         scale_plane_pow2_hdr_neon(p->p010_tmp_u,
                                    chroma_w, chroma_h, p->p010_tmp_stride,
@@ -1374,27 +1375,7 @@ void __attribute__((hot)) fused_kernel_thirds_hdr_neon(
 
     if (p->is_p010 && p->p010_tmp_u) {
         /* P010: deinterleave UV plane into pre-allocated planar buffers */
-        int uv_el_stride = p->src_uv_el_stride;
-        int planar_el_stride = p->p010_tmp_stride / (int)sizeof(uint16_t);
-
-        /* NEON deinterleave: vld2q_u16 */
-        for (int y = 0; y < chroma_h; y++) {
-            const uint16_t *row = src_u + (size_t)y * (size_t)uv_el_stride;
-            uint16_t *u_row = p->p010_tmp_u + (size_t)y * (size_t)planar_el_stride;
-            uint16_t *v_row = p->p010_tmp_v + (size_t)y * (size_t)planar_el_stride;
-
-            int neon_pairs = chroma_w / 8;
-            int x = 0;
-            for (int c = 0; c < neon_pairs; c++, x += 8) {
-                uint16x8x2_t uv = vld2q_u16(row + 2 * x);
-                vst1q_u16(u_row + x, uv.val[0]);
-                vst1q_u16(v_row + x, uv.val[1]);
-            }
-            for (; x < chroma_w; x++) {
-                u_row[x] = row[2 * x];
-                v_row[x] = row[2 * x + 1];
-            }
-        }
+        fused_hdr_deinterleave_p010(p, src_u);
 
         scale_plane_thirds_hdr_neon(p->p010_tmp_u,
                                      chroma_w, chroma_h, p->p010_tmp_stride,

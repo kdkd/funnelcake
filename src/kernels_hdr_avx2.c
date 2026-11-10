@@ -354,6 +354,14 @@ static inline __attribute__((always_inline)) void avg_nodes_32w_avx2(
     *hi = _mm256_avg_epu16(a_hi, b_hi);
 }
 
+static inline __attribute__((always_inline)) __m256i avg_rows_16w_avx2(
+    const uint16_t *restrict a, const uint16_t *restrict b, int x)
+{
+    return _mm256_avg_epu16(
+        _mm256_loadu_si256((const __m256i *)(a + x)),
+        _mm256_loadu_si256((const __m256i *)(b + x)));
+}
+
 /* Scratch-free 32-element column tiles for regular HDR widths.  Small
  * bottom-up subtrees preserve every rounded average while keeping the peak
  * YMM live set below the AVX2 register budget. */
@@ -363,135 +371,261 @@ static void __attribute__((hot)) scale_plane_pow2_tree_32w_avx2(
     uint32_t active_outputs, int deepest,
     uint16_t *restrict dst_planes[4], int dst_strides[4])
 {
-    const int group_rows = 2 << deepest;
-    const int num_groups = src_h / group_rows;
+    const int emit0 = (active_outputs & (1u << 1)) != 0;
+    const int emit1 = (active_outputs & (1u << 3)) != 0;
+    const int emit2 = (active_outputs & (1u << 5)) != 0;
+    const int dense = (deepest == 0)
+                   || (deepest == 1 && emit0)
+                   || (deepest == 2 && emit0 && emit1)
+                   || (deepest == 3 && emit0 && emit1 && emit2);
+
+#define STEP_PTR_HDR_AVX2(p, step) do { (p) += (step); __asm__("" : "+r"(p)); } while (0)
+
+#define POW2_TREE_32W_AVX2_LOOP(D, DENSE) do {                                 \
+    const int group_rows_ = 2 << (D);                                          \
+    const int num_groups_ = src_h / group_rows_;                               \
+    const ptrdiff_t ss_    = (ptrdiff_t)src_el_stride;                         \
+    const ptrdiff_t ss2_   = ss_ * 2;                                          \
+    const ptrdiff_t ds0_   = (ptrdiff_t)(dst_strides[0] / (int)sizeof(uint16_t)); \
+    const ptrdiff_t ds1_   = (ptrdiff_t)(dst_strides[1] / (int)sizeof(uint16_t)); \
+    const ptrdiff_t ds2_   = (ptrdiff_t)(dst_strides[2] / (int)sizeof(uint16_t)); \
+    const ptrdiff_t ds3_   = (ptrdiff_t)(dst_strides[3] / (int)sizeof(uint16_t)); \
+    const int e0_ = ((D) == 0 || (DENSE)) ? 1 : emit0;                         \
+    const int e1_ = ((D) == 1 || (DENSE)) ? 1 : emit1;                         \
+    const int e2_ = ((D) == 2 || (DENSE)) ? 1 : emit2;                         \
+    const uint16_t *grp_ = src;                                                \
+    uint16_t *out0_ = e0_ ? dst_planes[0] : NULL;                              \
+    uint16_t *out1_ = ((D) >= 1 && e1_) ? dst_planes[1] : NULL;                \
+    uint16_t *out2_ = ((D) >= 2 && e2_) ? dst_planes[2] : NULL;                \
+    uint16_t *out3_ = ((D) >= 3) ? dst_planes[3] : NULL;                       \
+    (void)ss2_; (void)ds1_; (void)ds2_; (void)ds3_;                            \
+    (void)out1_; (void)out2_; (void)out3_;                                     \
+                                                                               \
+    for (int g_ = 0; g_ < num_groups_; g_++) {                                 \
+        for (int x_ = 0; x_ < src_w; x_ += 32) {                               \
+            const uint16_t *sr_ = grp_ + x_;                                   \
+            uint16_t *o0_ = e0_ ? (out0_ + ((size_t)x_ >> 1)) : NULL;          \
+            if ((D) >= 2) {                                                    \
+                __asm__("" : "+r"(sr_));                                       \
+                if (e0_) __asm__("" : "+r"(o0_));                              \
+            }                                                                  \
+            __m256i n0_lo_, n0_hi_;                                            \
+                                                                               \
+            avg_rows_32w_avx2(sr_, sr_ + ss_, 0, &n0_lo_, &n0_hi_);            \
+            if (e0_)                                                           \
+                store_pow2_32_hdr(n0_lo_, n0_hi_, 0, o0_);                     \
+                                                                               \
+            if ((D) >= 1) {                                                    \
+                __m256i n1_lo_, n1_hi_, p0_lo_, p0_hi_;                        \
+                uint16_t *o1_ = e1_ ? (out1_ + ((size_t)x_ >> 2)) : NULL;      \
+                if ((D) >= 3 && e1_) __asm__("" : "+r"(o1_));                  \
+                if ((D) >= 2) {                                                \
+                    STEP_PTR_HDR_AVX2(sr_, ss2_);                              \
+                    if (e0_) STEP_PTR_HDR_AVX2(o0_, ds0_);                     \
+                    avg_rows_32w_avx2(sr_, sr_ + ss_, 0, &n1_lo_, &n1_hi_);    \
+                    if (e0_) store_pow2_32_hdr(n1_lo_, n1_hi_, 0, o0_);        \
+                } else {                                                       \
+                    avg_rows_32w_avx2(sr_ + ss2_, sr_ + ss_ * 3, 0,            \
+                                      &n1_lo_, &n1_hi_);                       \
+                    if (e0_) store_pow2_32_hdr(n1_lo_, n1_hi_, 0, o0_ + ds0_); \
+                }                                                              \
+                avg_nodes_32w_avx2(n0_lo_, n0_hi_, n1_lo_, n1_hi_,             \
+                                   &p0_lo_, &p0_hi_);                          \
+                if (e1_)                                                       \
+                    store_pow2_32_hdr(p0_lo_, p0_hi_, 1, o1_);                 \
+                                                                               \
+                if ((D) >= 2) {                                                \
+                    __m256i n2_lo_, n2_hi_, n3_lo_, n3_hi_;                    \
+                    __m256i p1_lo_, p1_hi_, q0_lo_, q0_hi_;                    \
+                    STEP_PTR_HDR_AVX2(sr_, ss2_);                              \
+                    if (e0_) STEP_PTR_HDR_AVX2(o0_, ds0_);                     \
+                    avg_rows_32w_avx2(sr_, sr_ + ss_, 0, &n2_lo_, &n2_hi_);    \
+                    if (e0_) store_pow2_32_hdr(n2_lo_, n2_hi_, 0, o0_);        \
+                                                                               \
+                    STEP_PTR_HDR_AVX2(sr_, ss2_);                              \
+                    if (e0_) STEP_PTR_HDR_AVX2(o0_, ds0_);                     \
+                    avg_rows_32w_avx2(sr_, sr_ + ss_, 0, &n3_lo_, &n3_hi_);    \
+                    if (e0_) store_pow2_32_hdr(n3_lo_, n3_hi_, 0, o0_);        \
+                                                                               \
+                    avg_nodes_32w_avx2(n2_lo_, n2_hi_, n3_lo_, n3_hi_,         \
+                                       &p1_lo_, &p1_hi_);                      \
+                    if (e1_) {                                                 \
+                        if ((D) >= 3) STEP_PTR_HDR_AVX2(o1_, ds1_);            \
+                        else o1_ += ds1_;                                      \
+                        store_pow2_32_hdr(p1_lo_, p1_hi_, 1, o1_);             \
+                    }                                                          \
+                    avg_nodes_32w_avx2(p0_lo_, p0_hi_, p1_lo_, p1_hi_,         \
+                                       &q0_lo_, &q0_hi_);                      \
+                    if (e2_)                                                   \
+                        store_pow2_32_hdr(q0_lo_, q0_hi_, 2,                   \
+                                          out2_ + ((size_t)x_ >> 3));          \
+                                                                               \
+                    if ((D) >= 3) {                                            \
+                        __m256i n4_lo_, n4_hi_, n5_lo_, n5_hi_;                \
+                        __m256i n6_lo_, n6_hi_, n7_lo_, n7_hi_;                \
+                        __m256i p2_lo_, p2_hi_, p3_lo_, p3_hi_;                \
+                        __m256i q1_lo_, q1_hi_, root_lo_, root_hi_;            \
+                        STEP_PTR_HDR_AVX2(sr_, ss2_);                          \
+                        if (e0_) STEP_PTR_HDR_AVX2(o0_, ds0_);                 \
+                        avg_rows_32w_avx2(sr_, sr_ + ss_, 0,                   \
+                                          &n4_lo_, &n4_hi_);                   \
+                        if (e0_) store_pow2_32_hdr(n4_lo_, n4_hi_, 0, o0_);    \
+                                                                               \
+                        STEP_PTR_HDR_AVX2(sr_, ss2_);                          \
+                        if (e0_) STEP_PTR_HDR_AVX2(o0_, ds0_);                 \
+                        avg_rows_32w_avx2(sr_, sr_ + ss_, 0,                   \
+                                          &n5_lo_, &n5_hi_);                   \
+                        if (e0_) store_pow2_32_hdr(n5_lo_, n5_hi_, 0, o0_);    \
+                                                                               \
+                        avg_nodes_32w_avx2(n4_lo_, n4_hi_, n5_lo_, n5_hi_,     \
+                                           &p2_lo_, &p2_hi_);                  \
+                        if (e1_) {                                             \
+                            STEP_PTR_HDR_AVX2(o1_, ds1_);                      \
+                            store_pow2_32_hdr(p2_lo_, p2_hi_, 1, o1_);         \
+                        }                                                      \
+                                                                               \
+                        STEP_PTR_HDR_AVX2(sr_, ss2_);                          \
+                        if (e0_) STEP_PTR_HDR_AVX2(o0_, ds0_);                 \
+                        avg_rows_32w_avx2(sr_, sr_ + ss_, 0,                   \
+                                          &n6_lo_, &n6_hi_);                   \
+                        if (e0_) store_pow2_32_hdr(n6_lo_, n6_hi_, 0, o0_);    \
+                                                                               \
+                        STEP_PTR_HDR_AVX2(sr_, ss2_);                          \
+                        if (e0_) STEP_PTR_HDR_AVX2(o0_, ds0_);                 \
+                        avg_rows_32w_avx2(sr_, sr_ + ss_, 0,                   \
+                                          &n7_lo_, &n7_hi_);                   \
+                        if (e0_) store_pow2_32_hdr(n7_lo_, n7_hi_, 0, o0_);    \
+                                                                               \
+                        avg_nodes_32w_avx2(n6_lo_, n6_hi_, n7_lo_, n7_hi_,     \
+                                           &p3_lo_, &p3_hi_);                  \
+                        if (e1_) {                                             \
+                            STEP_PTR_HDR_AVX2(o1_, ds1_);                      \
+                            store_pow2_32_hdr(p3_lo_, p3_hi_, 1, o1_);         \
+                        }                                                      \
+                        avg_nodes_32w_avx2(p2_lo_, p2_hi_, p3_lo_, p3_hi_,     \
+                                           &q1_lo_, &q1_hi_);                  \
+                        if (e2_)                                               \
+                            store_pow2_32_hdr(q1_lo_, q1_hi_, 2,               \
+                                              out2_ + ds2_                     \
+                                              + ((size_t)x_ >> 3));            \
+                        avg_nodes_32w_avx2(q0_lo_, q0_hi_, q1_lo_, q1_hi_,     \
+                                           &root_lo_, &root_hi_);              \
+                        store_pow2_32_hdr(root_lo_, root_hi_, 3,               \
+                                          out3_ + ((size_t)x_ >> 4));          \
+                    }                                                          \
+                }                                                              \
+            }                                                                  \
+        }                                                                      \
+        grp_ += ss_ * group_rows_;                                             \
+        if (e0_) out0_ += ds0_ * (group_rows_ >> 1);                           \
+        if ((D) >= 1 && e1_) out1_ += ds1_ * (group_rows_ >> 2);               \
+        if ((D) >= 2 && e2_) out2_ += ds2_ * (group_rows_ >> 3);               \
+        if ((D) >= 3) out3_ += ds3_;                                           \
+    }                                                                          \
+} while (0)
+
+    switch (deepest) {
+    case 0:
+        POW2_TREE_32W_AVX2_LOOP(0, 1);
+        break;
+    case 1:
+        if (dense) POW2_TREE_32W_AVX2_LOOP(1, 1);
+        else       POW2_TREE_32W_AVX2_LOOP(1, 0);
+        break;
+    case 2:
+        if (dense) POW2_TREE_32W_AVX2_LOOP(2, 1);
+        else       POW2_TREE_32W_AVX2_LOOP(2, 0);
+        break;
+    default:
+        if (dense) POW2_TREE_32W_AVX2_LOOP(3, 1);
+        else       POW2_TREE_32W_AVX2_LOOP(3, 0);
+        break;
+    }
+
+#undef POW2_TREE_32W_AVX2_LOOP
+#undef STEP_PTR_HDR_AVX2
+}
+
+static void __attribute__((noinline, hot)) scale_plane_pow2_tree_tail_16w_avx2(
+    const uint16_t *restrict src,
+    int x, int src_h, int src_el_stride,
+    uint32_t active_outputs, int deepest,
+    uint16_t *restrict dst_planes[4], int dst_strides[4])
+{
     const int emit0 = (active_outputs & (1u << 1)) != 0;
     const int emit1 = (active_outputs & (1u << 3)) != 0;
     const int emit2 = (active_outputs & (1u << 5)) != 0;
     const int emit3 = (active_outputs & (1u << 7)) != 0;
-    const int ds0 = dst_strides[0] / (int)sizeof(uint16_t);
-    const int ds1 = dst_strides[1] / (int)sizeof(uint16_t);
-    const int ds2 = dst_strides[2] / (int)sizeof(uint16_t);
-    const int ds3 = dst_strides[3] / (int)sizeof(uint16_t);
+    const int group_rows = 2 << deepest;
+    const int num_groups = src_h / group_rows;
+    const ptrdiff_t ss    = (ptrdiff_t)src_el_stride;
+    const ptrdiff_t ss3   = ss * 3;
+    const ptrdiff_t ds0   = (ptrdiff_t)(dst_strides[0] / (int)sizeof(uint16_t));
+    const ptrdiff_t ds0_3 = ds0 * 3;
+    const ptrdiff_t ds1   = (ptrdiff_t)(dst_strides[1] / (int)sizeof(uint16_t));
+    const ptrdiff_t ds1_3 = ds1 * 3;
+    const ptrdiff_t ds2   = (ptrdiff_t)(dst_strides[2] / (int)sizeof(uint16_t));
+    const ptrdiff_t ds3   = (ptrdiff_t)(dst_strides[3] / (int)sizeof(uint16_t));
+    const uint16_t *grp = src + x;
+    uint16_t *out0 = emit0 ? (dst_planes[0] + ((size_t)x >> 1)) : NULL;
+    uint16_t *out1 = emit1 ? (dst_planes[1] + ((size_t)x >> 2)) : NULL;
+    uint16_t *out2 = emit2 ? (dst_planes[2] + ((size_t)x >> 3)) : NULL;
+    uint16_t *out3 = emit3 ? (dst_planes[3] + ((size_t)x >> 4)) : NULL;
 
     for (int g = 0; g < num_groups; g++) {
-        const uint16_t *grp = src
-            + (size_t)g * (size_t)group_rows * (size_t)src_el_stride;
-        uint16_t *out0 = emit0 ? dst_planes[0]
-            + (size_t)g * (size_t)(group_rows >> 1) * (size_t)ds0 : NULL;
-        uint16_t *out1 = emit1 ? dst_planes[1]
-            + (size_t)g * (size_t)(group_rows >> 2) * (size_t)ds1 : NULL;
-        uint16_t *out2 = emit2 ? dst_planes[2]
-            + (size_t)g * (size_t)(group_rows >> 3) * (size_t)ds2 : NULL;
-        uint16_t *out3 = emit3 ? dst_planes[3]
-            + (size_t)g * (size_t)(group_rows >> 4) * (size_t)ds3 : NULL;
+        const uint16_t *sr = grp;
+        uint16_t *o0 = out0;
+        __m256i n0 = avg_rows_16w_avx2(sr, sr + ss, 0);
+        if (emit0) store_pow2_16_hdr(n0, 0, o0);
+        if (deepest >= 1) {
+            __m256i n1 = avg_rows_16w_avx2(sr + ss * 2, sr + ss3, 0);
+            if (emit0) store_pow2_16_hdr(n1, 0, o0 + ds0);
+            __m256i p0 = _mm256_avg_epu16(n0, n1);
+            if (emit1) store_pow2_16_hdr(p0, 1, out1);
+            if (deepest >= 2) {
+                sr += ss * 4;
+                __asm__("" : "+r"(sr));
+                __m256i n2 = avg_rows_16w_avx2(sr, sr + ss, 0);
+                if (emit0) store_pow2_16_hdr(n2, 0, o0 + ds0 * 2);
+                __m256i n3 = avg_rows_16w_avx2(sr + ss * 2, sr + ss3, 0);
+                if (emit0) store_pow2_16_hdr(n3, 0, o0 + ds0_3);
+                __m256i p1 = _mm256_avg_epu16(n2, n3);
+                if (emit1) store_pow2_16_hdr(p1, 1, out1 + ds1);
+                __m256i q0 = _mm256_avg_epu16(p0, p1);
+                if (emit2) store_pow2_16_hdr(q0, 2, out2);
+                if (deepest >= 3) {
+                    sr += ss * 4;
+                    __asm__("" : "+r"(sr));
+                    if (emit0) {
+                        o0 += ds0 * 4;
+                        __asm__("" : "+r"(o0));
+                    }
+                    __m256i n4 = avg_rows_16w_avx2(sr, sr + ss, 0);
+                    if (emit0) store_pow2_16_hdr(n4, 0, o0);
+                    __m256i n5 = avg_rows_16w_avx2(sr + ss * 2, sr + ss3, 0);
+                    if (emit0) store_pow2_16_hdr(n5, 0, o0 + ds0);
+                    __m256i p2 = _mm256_avg_epu16(n4, n5);
+                    if (emit1) store_pow2_16_hdr(p2, 1, out1 + ds1 * 2);
 
-        for (int x = 0; x < src_w; x += 32) {
-            __m256i n0_lo, n0_hi, n1_lo, n1_hi;
-            __m256i p0_lo, p0_hi;
-
-            avg_rows_32w_avx2(grp,
-                grp + (size_t)src_el_stride, x, &n0_lo, &n0_hi);
-            if (emit0)
-                store_pow2_32_hdr(n0_lo, n0_hi, 0, out0 + (size_t)x / 2);
-            if (deepest == 0)
-                continue;
-
-            avg_rows_32w_avx2(
-                grp + (size_t)2 * (size_t)src_el_stride,
-                grp + (size_t)3 * (size_t)src_el_stride,
-                x, &n1_lo, &n1_hi);
-            if (emit0)
-                store_pow2_32_hdr(n1_lo, n1_hi, 0,
-                    out0 + (size_t)ds0 + (size_t)x / 2);
-            avg_nodes_32w_avx2(n0_lo, n0_hi, n1_lo, n1_hi,
-                               &p0_lo, &p0_hi);
-            if (emit1)
-                store_pow2_32_hdr(p0_lo, p0_hi, 1, out1 + (size_t)x / 4);
-            if (deepest == 1)
-                continue;
-
-            __m256i n2_lo, n2_hi, n3_lo, n3_hi;
-            __m256i p1_lo, p1_hi, q0_lo, q0_hi;
-            avg_rows_32w_avx2(
-                grp + (size_t)4 * (size_t)src_el_stride,
-                grp + (size_t)5 * (size_t)src_el_stride,
-                x, &n2_lo, &n2_hi);
-            if (emit0)
-                store_pow2_32_hdr(n2_lo, n2_hi, 0,
-                    out0 + (size_t)2 * (size_t)ds0 + (size_t)x / 2);
-            avg_rows_32w_avx2(
-                grp + (size_t)6 * (size_t)src_el_stride,
-                grp + (size_t)7 * (size_t)src_el_stride,
-                x, &n3_lo, &n3_hi);
-            if (emit0)
-                store_pow2_32_hdr(n3_lo, n3_hi, 0,
-                    out0 + (size_t)3 * (size_t)ds0 + (size_t)x / 2);
-            avg_nodes_32w_avx2(n2_lo, n2_hi, n3_lo, n3_hi,
-                               &p1_lo, &p1_hi);
-            if (emit1)
-                store_pow2_32_hdr(p1_lo, p1_hi, 1,
-                    out1 + (size_t)ds1 + (size_t)x / 4);
-            avg_nodes_32w_avx2(p0_lo, p0_hi, p1_lo, p1_hi,
-                               &q0_lo, &q0_hi);
-            if (emit2)
-                store_pow2_32_hdr(q0_lo, q0_hi, 2, out2 + (size_t)x / 8);
-            if (deepest == 2)
-                continue;
-
-            __m256i n4_lo, n4_hi, n5_lo, n5_hi;
-            __m256i n6_lo, n6_hi, n7_lo, n7_hi;
-            __m256i p2_lo, p2_hi, p3_lo, p3_hi;
-            __m256i q1_lo, q1_hi, root_lo, root_hi;
-            avg_rows_32w_avx2(
-                grp + (size_t)8 * (size_t)src_el_stride,
-                grp + (size_t)9 * (size_t)src_el_stride,
-                x, &n4_lo, &n4_hi);
-            if (emit0)
-                store_pow2_32_hdr(n4_lo, n4_hi, 0,
-                    out0 + (size_t)4 * (size_t)ds0 + (size_t)x / 2);
-            avg_rows_32w_avx2(
-                grp + (size_t)10 * (size_t)src_el_stride,
-                grp + (size_t)11 * (size_t)src_el_stride,
-                x, &n5_lo, &n5_hi);
-            if (emit0)
-                store_pow2_32_hdr(n5_lo, n5_hi, 0,
-                    out0 + (size_t)5 * (size_t)ds0 + (size_t)x / 2);
-            avg_nodes_32w_avx2(n4_lo, n4_hi, n5_lo, n5_hi,
-                               &p2_lo, &p2_hi);
-            if (emit1)
-                store_pow2_32_hdr(p2_lo, p2_hi, 1,
-                    out1 + (size_t)2 * (size_t)ds1 + (size_t)x / 4);
-
-            avg_rows_32w_avx2(
-                grp + (size_t)12 * (size_t)src_el_stride,
-                grp + (size_t)13 * (size_t)src_el_stride,
-                x, &n6_lo, &n6_hi);
-            if (emit0)
-                store_pow2_32_hdr(n6_lo, n6_hi, 0,
-                    out0 + (size_t)6 * (size_t)ds0 + (size_t)x / 2);
-            avg_rows_32w_avx2(
-                grp + (size_t)14 * (size_t)src_el_stride,
-                grp + (size_t)15 * (size_t)src_el_stride,
-                x, &n7_lo, &n7_hi);
-            if (emit0)
-                store_pow2_32_hdr(n7_lo, n7_hi, 0,
-                    out0 + (size_t)7 * (size_t)ds0 + (size_t)x / 2);
-            avg_nodes_32w_avx2(n6_lo, n6_hi, n7_lo, n7_hi,
-                               &p3_lo, &p3_hi);
-            if (emit1)
-                store_pow2_32_hdr(p3_lo, p3_hi, 1,
-                    out1 + (size_t)3 * (size_t)ds1 + (size_t)x / 4);
-            avg_nodes_32w_avx2(p2_lo, p2_hi, p3_lo, p3_hi,
-                               &q1_lo, &q1_hi);
-            if (emit2)
-                store_pow2_32_hdr(q1_lo, q1_hi, 2,
-                    out2 + (size_t)ds2 + (size_t)x / 8);
-            avg_nodes_32w_avx2(q0_lo, q0_hi, q1_lo, q1_hi,
-                               &root_lo, &root_hi);
-            if (emit3)
-                store_pow2_32_hdr(root_lo, root_hi, 3, out3 + (size_t)x / 16);
+                    sr += ss * 4;
+                    __asm__("" : "+r"(sr));
+                    __m256i n6 = avg_rows_16w_avx2(sr, sr + ss, 0);
+                    if (emit0) store_pow2_16_hdr(n6, 0, o0 + ds0 * 2);
+                    __m256i n7 = avg_rows_16w_avx2(sr + ss * 2, sr + ss3, 0);
+                    if (emit0) store_pow2_16_hdr(n7, 0, o0 + ds0_3);
+                    __m256i p3 = _mm256_avg_epu16(n6, n7);
+                    if (emit1) store_pow2_16_hdr(p3, 1, out1 + ds1_3);
+                    __m256i q1 = _mm256_avg_epu16(p2, p3);
+                    if (emit2) store_pow2_16_hdr(q1, 2, out2 + ds2);
+                    if (emit3) store_pow2_16_hdr(_mm256_avg_epu16(q0, q1), 3, out3);
+                }
+            }
         }
+        grp += ss * group_rows;
+        if (emit0) out0 += ds0 * (group_rows >> 1);
+        if (emit1) out1 += ds1 * (group_rows >> 2);
+        if (emit2) out2 += ds2 * (group_rows >> 3);
+        if (emit3) out3 += ds3;
     }
 }
 
@@ -765,44 +899,18 @@ static inline void h_chunk_6x_hdr_avx2(__m256i result_3x, uint16_t *restrict dst
  * the completed-row reloads and the full-width horizontal scratch passes.
  * ----------------------------------------------------------------------- */
 
-static void __attribute__((hot)) scale_plane_pow2_hdr_avx2(
+static void __attribute__((noinline)) scale_plane_pow2_scratch_hdr_avx2(
     const uint16_t *restrict src,
-    int src_w, int src_h, int src_stride,
-    uint32_t active_outputs,
+    int src_w, int src_h, int src_el_stride,
+    uint32_t active_outputs, int deepest,
     uint16_t *restrict dst_planes[4],
-    int dst_widths[4],
     int dst_strides[4],
-    int dst_heights[4],
     uint8_t *scratch_pool_base,
     size_t scratch_pool_size)
 {
-    (void)dst_heights;
-    (void)dst_widths;
-
-    /* Convert byte stride to element stride */
-    int src_el_stride = src_stride / (int)sizeof(uint16_t);
-
     static const int bit_pos[4] = { 1, 3, 5, 7 };
-
-    /* Determine deepest active level (0=2x .. 3=16x). */
-    int deepest = -1;
-    for (int k = 3; k >= 0; k--) {
-        if (active_outputs & (1u << bit_pos[k])) {
-            deepest = k;
-            break;
-        }
-    }
-    if (deepest < 0) return;
-
     int group_rows = (2 << deepest);
     int num_groups = src_h / group_rows;
-
-    if ((src_w & 31) == 0) {
-        scale_plane_pow2_tree_32w_avx2(
-            src, src_w, src_h, src_el_stride,
-            active_outputs, deepest, dst_planes, dst_strides);
-        return;
-    }
 
     /* Carve scratch buffers from the persistent pool (init-time alloc). */
     fused_scratch_t scratch;
@@ -933,6 +1041,57 @@ static void __attribute__((hot)) scale_plane_pow2_hdr_avx2(
     }
 
     /* Scratch buffers are carved from the persistent pool - nothing to free. */
+}
+
+static void __attribute__((hot)) scale_plane_pow2_hdr_avx2(
+    const uint16_t *restrict src,
+    int src_w, int src_h, int src_stride,
+    uint32_t active_outputs,
+    uint16_t *restrict dst_planes[4],
+    int dst_widths[4],
+    int dst_strides[4],
+    int dst_heights[4],
+    uint8_t *scratch_pool_base,
+    size_t scratch_pool_size)
+{
+    (void)dst_heights;
+    (void)dst_widths;
+
+    int src_el_stride = src_stride / (int)sizeof(uint16_t);
+    static const int bit_pos[4] = { 1, 3, 5, 7 };
+
+    int deepest = -1;
+    for (int k = 3; k >= 0; k--) {
+        if (active_outputs & (1u << bit_pos[k])) {
+            deepest = k;
+            break;
+        }
+    }
+    if (deepest < 0) return;
+
+    if ((src_w & 31) == 0) {
+        scale_plane_pow2_tree_32w_avx2(
+            src, src_w, src_h, src_el_stride,
+            active_outputs, deepest, dst_planes, dst_strides);
+        return;
+    }
+    if ((src_w & 15) == 0) {
+        int paired_w = src_w & ~31;
+        if (paired_w > 0) {
+            scale_plane_pow2_tree_32w_avx2(
+                src, paired_w, src_h, src_el_stride,
+                active_outputs, deepest, dst_planes, dst_strides);
+        }
+        scale_plane_pow2_tree_tail_16w_avx2(
+            src, paired_w, src_h, src_el_stride,
+            active_outputs, deepest, dst_planes, dst_strides);
+        return;
+    }
+
+    scale_plane_pow2_scratch_hdr_avx2(
+        src, src_w, src_h, src_el_stride,
+        active_outputs, deepest, dst_planes, dst_strides,
+        scratch_pool_base, scratch_pool_size);
 }
 
 
@@ -1540,8 +1699,8 @@ static void deinterleave_p010_chroma_avx2(
         int x = 0;
         int avx2_pairs_16 = chroma_w / 16;
         for (int c = 0; c < avx2_pairs_16; c++, x += 16) {
-            __m256i uv0 = _mm256_load_si256((const __m256i *)(row + 2 * x));
-            __m256i uv1 = _mm256_load_si256((const __m256i *)(row + 2 * x + 16));
+            __m256i uv0 = _mm256_loadu_si256((const __m256i *)(row + 2 * x));
+            __m256i uv1 = _mm256_loadu_si256((const __m256i *)(row + 2 * x + 16));
 
             __m256i de0 = _mm256_permute4x64_epi64(
                 _mm256_shuffle_epi8(uv0, shuf_mask), 0xD8);
@@ -1555,20 +1714,20 @@ static void deinterleave_p010_chroma_avx2(
                 _mm256_castsi128_si256(_mm256_extracti128_si256(de0, 1)),
                 _mm256_extracti128_si256(de1, 1), 1);
 
-            _mm256_store_si256((__m256i *)(u_row + x), u);
-            _mm256_store_si256((__m256i *)(v_row + x), v);
+            _mm256_storeu_si256((__m256i *)(u_row + x), u);
+            _mm256_storeu_si256((__m256i *)(v_row + x), v);
         }
 
         int avx2_pairs_8 = (chroma_w - x) / 8;
         for (int c = 0; c < avx2_pairs_8; c++, x += 8) {
-            __m256i interleaved = _mm256_load_si256(
+            __m256i interleaved = _mm256_loadu_si256(
                 (const __m256i *)(row + 2 * x));
             __m256i shuffled = _mm256_shuffle_epi8(interleaved, shuf_mask);
             __m256i permuted = _mm256_permute4x64_epi64(shuffled, 0xD8);
-            _mm_store_si128((__m128i *)(u_row + x),
-                            _mm256_castsi256_si128(permuted));
-            _mm_store_si128((__m128i *)(v_row + x),
-                            _mm256_extracti128_si256(permuted, 1));
+            _mm_storeu_si128((__m128i *)(u_row + x),
+                             _mm256_castsi256_si128(permuted));
+            _mm_storeu_si128((__m128i *)(v_row + x),
+                             _mm256_extracti128_si256(permuted, 1));
         }
 
         for (; x < chroma_w; x++) {
@@ -1576,6 +1735,21 @@ static void deinterleave_p010_chroma_avx2(
             v_row[x] = row[2 * x + 1];
         }
     }
+}
+
+int fused_deinterleave_p010_avx2(const fused_hdr_kernel_params_t *p,
+                                 const uint16_t *src_uv)
+{
+    if (!p->is_p010) return 0;
+    if (!src_uv || !p->p010_tmp_u || !p->p010_tmp_v) return -1;
+
+    deinterleave_p010_chroma_avx2(
+        src_uv, p->src_width / 2, p->src_height / 2,
+        p->src_uv_el_stride,
+        p->p010_tmp_u, p->p010_tmp_v,
+        p->p010_tmp_stride / (int)sizeof(uint16_t));
+    _mm256_zeroupper();
+    return 0;
 }
 
 

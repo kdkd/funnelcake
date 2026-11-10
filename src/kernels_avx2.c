@@ -550,6 +550,14 @@ static inline __attribute__((always_inline)) void avg_nodes_64_avx2(
     *hi = _mm256_avg_epu8(a_hi, b_hi);
 }
 
+static inline __attribute__((always_inline)) __m256i avg_rows_32_avx2(
+    const uint8_t *restrict a, const uint8_t *restrict b, int x)
+{
+    return _mm256_avg_epu8(
+        _mm256_loadu_si256((const __m256i *)(a + x)),
+        _mm256_loadu_si256((const __m256i *)(b + x)));
+}
+
 /* Build regular 64-byte column tiles as low-pressure binary subtrees.  This
  * preserves the exact rounded-average order while eliminating the vertical
  * scratch ladder for the common aligned video widths. */
@@ -559,143 +567,256 @@ static void __attribute__((hot)) scale_plane_pow2_tree_64_avx2(
     uint32_t active_outputs, int deepest,
     uint8_t *restrict dst_planes[4], int dst_strides[4])
 {
-    const int group_rows = 2 << deepest;
-    const int num_groups = src_h / group_rows;
+    const int emit0 = (active_outputs & (1u << 1)) != 0;
+    const int emit1 = (active_outputs & (1u << 3)) != 0;
+    const int emit2 = (active_outputs & (1u << 5)) != 0;
+    const int dense = (deepest == 0)
+                   || (deepest == 1 && emit0)
+                   || (deepest == 2 && emit0 && emit1)
+                   || (deepest == 3 && emit0 && emit1 && emit2);
+
+#define STEP_PTR_AVX2(p, step) do { (p) += (step); __asm__("" : "+r"(p)); } while (0)
+
+#define POW2_TREE_64_AVX2_LOOP(D, DENSE) do {                                  \
+    const int group_rows_ = 2 << (D);                                          \
+    const int num_groups_ = src_h / group_rows_;                               \
+    const ptrdiff_t ss_    = (ptrdiff_t)src_stride;                            \
+    const ptrdiff_t ss2_   = ss_ * 2;                                          \
+    const ptrdiff_t ds0_   = (ptrdiff_t)dst_strides[0];                        \
+    const ptrdiff_t ds1_   = (ptrdiff_t)dst_strides[1];                        \
+    const ptrdiff_t ds2_   = (ptrdiff_t)dst_strides[2];                        \
+    const ptrdiff_t ds3_   = (ptrdiff_t)dst_strides[3];                        \
+    const int e0_ = ((D) == 0 || (DENSE)) ? 1 : emit0;                         \
+    const int e1_ = ((D) == 1 || (DENSE)) ? 1 : emit1;                         \
+    const int e2_ = ((D) == 2 || (DENSE)) ? 1 : emit2;                         \
+    const uint8_t *grp_ = src;                                                 \
+    uint8_t *out0_ = e0_ ? dst_planes[0] : NULL;                               \
+    uint8_t *out1_ = ((D) >= 1 && e1_) ? dst_planes[1] : NULL;                 \
+    uint8_t *out2_ = ((D) >= 2 && e2_) ? dst_planes[2] : NULL;                 \
+    uint8_t *out3_ = ((D) >= 3) ? dst_planes[3] : NULL;                        \
+    (void)ss2_; (void)ds1_; (void)ds2_; (void)ds3_;                            \
+    (void)out1_; (void)out2_; (void)out3_;                                     \
+                                                                               \
+    for (int g_ = 0; g_ < num_groups_; g_++) {                                 \
+        for (int x_ = 0; x_ < src_w; x_ += 64) {                               \
+            const uint8_t *sr_ = grp_ + x_;                                    \
+            uint8_t *o0_ = e0_ ? (out0_ + ((size_t)x_ >> 1)) : NULL;           \
+            if ((D) >= 2) {                                                    \
+                __asm__("" : "+r"(sr_));                                       \
+                if (e0_) __asm__("" : "+r"(o0_));                              \
+            }                                                                  \
+            __m256i n0_lo_, n0_hi_;                                            \
+                                                                               \
+            avg_rows_64_avx2(sr_, sr_ + ss_, 0, &n0_lo_, &n0_hi_);             \
+            if (e0_)                                                           \
+                store_pow2_64(n0_lo_, n0_hi_, 0, o0_);                         \
+                                                                               \
+            if ((D) >= 1) {                                                    \
+                __m256i n1_lo_, n1_hi_, p0_lo_, p0_hi_;                        \
+                uint8_t *o1_ = e1_ ? (out1_ + ((size_t)x_ >> 2)) : NULL;       \
+                if ((D) >= 3 && e1_) __asm__("" : "+r"(o1_));                  \
+                if ((D) >= 2) {                                                \
+                    STEP_PTR_AVX2(sr_, ss2_);                                  \
+                    if (e0_) STEP_PTR_AVX2(o0_, ds0_);                         \
+                    avg_rows_64_avx2(sr_, sr_ + ss_, 0, &n1_lo_, &n1_hi_);     \
+                    if (e0_) store_pow2_64(n1_lo_, n1_hi_, 0, o0_);            \
+                } else {                                                       \
+                    avg_rows_64_avx2(sr_ + ss2_, sr_ + ss_ * 3, 0,             \
+                                     &n1_lo_, &n1_hi_);                        \
+                    if (e0_) store_pow2_64(n1_lo_, n1_hi_, 0, o0_ + ds0_);     \
+                }                                                              \
+                avg_nodes_64_avx2(n0_lo_, n0_hi_, n1_lo_, n1_hi_,              \
+                                  &p0_lo_, &p0_hi_);                           \
+                if (e1_)                                                       \
+                    store_pow2_64(p0_lo_, p0_hi_, 1, o1_);                     \
+                                                                               \
+                if ((D) >= 2) {                                                \
+                    __m256i n2_lo_, n2_hi_, n3_lo_, n3_hi_;                    \
+                    __m256i p1_lo_, p1_hi_, q0_lo_, q0_hi_;                    \
+                    STEP_PTR_AVX2(sr_, ss2_);                                  \
+                    if (e0_) STEP_PTR_AVX2(o0_, ds0_);                         \
+                    avg_rows_64_avx2(sr_, sr_ + ss_, 0, &n2_lo_, &n2_hi_);     \
+                    if (e0_) store_pow2_64(n2_lo_, n2_hi_, 0, o0_);            \
+                                                                               \
+                    STEP_PTR_AVX2(sr_, ss2_);                                  \
+                    if (e0_) STEP_PTR_AVX2(o0_, ds0_);                         \
+                    avg_rows_64_avx2(sr_, sr_ + ss_, 0, &n3_lo_, &n3_hi_);     \
+                    if (e0_) store_pow2_64(n3_lo_, n3_hi_, 0, o0_);            \
+                                                                               \
+                    avg_nodes_64_avx2(n2_lo_, n2_hi_, n3_lo_, n3_hi_,          \
+                                      &p1_lo_, &p1_hi_);                       \
+                    if (e1_) {                                                 \
+                        if ((D) >= 3) STEP_PTR_AVX2(o1_, ds1_);                \
+                        else o1_ += ds1_;                                      \
+                        store_pow2_64(p1_lo_, p1_hi_, 1, o1_);                 \
+                    }                                                          \
+                    avg_nodes_64_avx2(p0_lo_, p0_hi_, p1_lo_, p1_hi_,          \
+                                      &q0_lo_, &q0_hi_);                       \
+                    if (e2_)                                                   \
+                        store_pow2_64(q0_lo_, q0_hi_, 2,                       \
+                                      out2_ + ((size_t)x_ >> 3));              \
+                                                                               \
+                    if ((D) >= 3) {                                            \
+                        __m256i n4_lo_, n4_hi_, n5_lo_, n5_hi_;                \
+                        __m256i n6_lo_, n6_hi_, n7_lo_, n7_hi_;                \
+                        __m256i p2_lo_, p2_hi_, p3_lo_, p3_hi_;                \
+                        __m256i q1_lo_, q1_hi_, root_lo_, root_hi_;            \
+                        STEP_PTR_AVX2(sr_, ss2_);                              \
+                        if (e0_) STEP_PTR_AVX2(o0_, ds0_);                     \
+                        avg_rows_64_avx2(sr_, sr_ + ss_, 0, &n4_lo_, &n4_hi_); \
+                        if (e0_) store_pow2_64(n4_lo_, n4_hi_, 0, o0_);        \
+                                                                               \
+                        STEP_PTR_AVX2(sr_, ss2_);                              \
+                        if (e0_) STEP_PTR_AVX2(o0_, ds0_);                     \
+                        avg_rows_64_avx2(sr_, sr_ + ss_, 0, &n5_lo_, &n5_hi_); \
+                        if (e0_) store_pow2_64(n5_lo_, n5_hi_, 0, o0_);        \
+                                                                               \
+                        avg_nodes_64_avx2(n4_lo_, n4_hi_, n5_lo_, n5_hi_,      \
+                                          &p2_lo_, &p2_hi_);                   \
+                        if (e1_) {                                             \
+                            STEP_PTR_AVX2(o1_, ds1_);                          \
+                            store_pow2_64(p2_lo_, p2_hi_, 1, o1_);             \
+                        }                                                      \
+                                                                               \
+                        STEP_PTR_AVX2(sr_, ss2_);                              \
+                        if (e0_) STEP_PTR_AVX2(o0_, ds0_);                     \
+                        avg_rows_64_avx2(sr_, sr_ + ss_, 0, &n6_lo_, &n6_hi_); \
+                        if (e0_) store_pow2_64(n6_lo_, n6_hi_, 0, o0_);        \
+                                                                               \
+                        STEP_PTR_AVX2(sr_, ss2_);                              \
+                        if (e0_) STEP_PTR_AVX2(o0_, ds0_);                     \
+                        avg_rows_64_avx2(sr_, sr_ + ss_, 0, &n7_lo_, &n7_hi_); \
+                        if (e0_) store_pow2_64(n7_lo_, n7_hi_, 0, o0_);        \
+                                                                               \
+                        avg_nodes_64_avx2(n6_lo_, n6_hi_, n7_lo_, n7_hi_,      \
+                                          &p3_lo_, &p3_hi_);                   \
+                        if (e1_) {                                             \
+                            STEP_PTR_AVX2(o1_, ds1_);                          \
+                            store_pow2_64(p3_lo_, p3_hi_, 1, o1_);             \
+                        }                                                      \
+                        avg_nodes_64_avx2(p2_lo_, p2_hi_, p3_lo_, p3_hi_,      \
+                                          &q1_lo_, &q1_hi_);                   \
+                        if (e2_)                                               \
+                            store_pow2_64(q1_lo_, q1_hi_, 2,                   \
+                                          out2_ + ds2_ + ((size_t)x_ >> 3));   \
+                        avg_nodes_64_avx2(q0_lo_, q0_hi_, q1_lo_, q1_hi_,      \
+                                          &root_lo_, &root_hi_);               \
+                        store_pow2_64(root_lo_, root_hi_, 3,                   \
+                                      out3_ + ((size_t)x_ >> 4));              \
+                    }                                                          \
+                }                                                              \
+            }                                                                  \
+        }                                                                      \
+        grp_ += ss_ * group_rows_;                                             \
+        if (e0_) out0_ += ds0_ * (group_rows_ >> 1);                           \
+        if ((D) >= 1 && e1_) out1_ += ds1_ * (group_rows_ >> 2);               \
+        if ((D) >= 2 && e2_) out2_ += ds2_ * (group_rows_ >> 3);               \
+        if ((D) >= 3) out3_ += ds3_;                                           \
+    }                                                                          \
+} while (0)
+
+    switch (deepest) {
+    case 0:
+        POW2_TREE_64_AVX2_LOOP(0, 1);
+        break;
+    case 1:
+        if (dense) POW2_TREE_64_AVX2_LOOP(1, 1);
+        else       POW2_TREE_64_AVX2_LOOP(1, 0);
+        break;
+    case 2:
+        if (dense) POW2_TREE_64_AVX2_LOOP(2, 1);
+        else       POW2_TREE_64_AVX2_LOOP(2, 0);
+        break;
+    default:
+        if (dense) POW2_TREE_64_AVX2_LOOP(3, 1);
+        else       POW2_TREE_64_AVX2_LOOP(3, 0);
+        break;
+    }
+
+#undef POW2_TREE_64_AVX2_LOOP
+#undef STEP_PTR_AVX2
+}
+
+static void __attribute__((noinline, hot)) scale_plane_pow2_tree_tail_32_avx2(
+    const uint8_t *restrict src,
+    int x, int src_h, int src_stride,
+    uint32_t active_outputs, int deepest,
+    uint8_t *restrict dst_planes[4], int dst_strides[4])
+{
     const int emit0 = (active_outputs & (1u << 1)) != 0;
     const int emit1 = (active_outputs & (1u << 3)) != 0;
     const int emit2 = (active_outputs & (1u << 5)) != 0;
     const int emit3 = (active_outputs & (1u << 7)) != 0;
+    const int group_rows = 2 << deepest;
+    const int num_groups = src_h / group_rows;
+    const ptrdiff_t ss    = (ptrdiff_t)src_stride;
+    const ptrdiff_t ss3   = ss * 3;
+    const ptrdiff_t ds0   = (ptrdiff_t)dst_strides[0];
+    const ptrdiff_t ds0_3 = ds0 * 3;
+    const ptrdiff_t ds1   = (ptrdiff_t)dst_strides[1];
+    const ptrdiff_t ds1_3 = ds1 * 3;
+    const ptrdiff_t ds2   = (ptrdiff_t)dst_strides[2];
+    const ptrdiff_t ds3   = (ptrdiff_t)dst_strides[3];
+    const uint8_t *grp = src + x;
+    uint8_t *out0 = emit0 ? (dst_planes[0] + ((size_t)x >> 1)) : NULL;
+    uint8_t *out1 = emit1 ? (dst_planes[1] + ((size_t)x >> 2)) : NULL;
+    uint8_t *out2 = emit2 ? (dst_planes[2] + ((size_t)x >> 3)) : NULL;
+    uint8_t *out3 = emit3 ? (dst_planes[3] + ((size_t)x >> 4)) : NULL;
 
     for (int g = 0; g < num_groups; g++) {
-        const uint8_t *grp = src
-            + (size_t)g * (size_t)group_rows * (size_t)src_stride;
-        uint8_t *out0 = emit0 ? dst_planes[0]
-            + (size_t)g * (size_t)(group_rows >> 1)
-              * (size_t)dst_strides[0] : NULL;
-        uint8_t *out1 = emit1 ? dst_planes[1]
-            + (size_t)g * (size_t)(group_rows >> 2)
-              * (size_t)dst_strides[1] : NULL;
-        uint8_t *out2 = emit2 ? dst_planes[2]
-            + (size_t)g * (size_t)(group_rows >> 3)
-              * (size_t)dst_strides[2] : NULL;
-        uint8_t *out3 = emit3 ? dst_planes[3]
-            + (size_t)g * (size_t)(group_rows >> 4)
-              * (size_t)dst_strides[3] : NULL;
+        const uint8_t *sr = grp;
+        uint8_t *o0 = out0;
+        __m256i n0 = avg_rows_32_avx2(sr, sr + ss, 0);
+        if (emit0) store_pow2_32(n0, 0, o0);
+        if (deepest >= 1) {
+            __m256i n1 = avg_rows_32_avx2(sr + ss * 2, sr + ss3, 0);
+            if (emit0) store_pow2_32(n1, 0, o0 + ds0);
+            __m256i p0 = _mm256_avg_epu8(n0, n1);
+            if (emit1) store_pow2_32(p0, 1, out1);
+            if (deepest >= 2) {
+                sr += ss * 4;
+                __asm__("" : "+r"(sr));
+                __m256i n2 = avg_rows_32_avx2(sr, sr + ss, 0);
+                if (emit0) store_pow2_32(n2, 0, o0 + ds0 * 2);
+                __m256i n3 = avg_rows_32_avx2(sr + ss * 2, sr + ss3, 0);
+                if (emit0) store_pow2_32(n3, 0, o0 + ds0_3);
+                __m256i p1 = _mm256_avg_epu8(n2, n3);
+                if (emit1) store_pow2_32(p1, 1, out1 + ds1);
+                __m256i q0 = _mm256_avg_epu8(p0, p1);
+                if (emit2) store_pow2_32(q0, 2, out2);
+                if (deepest >= 3) {
+                    sr += ss * 4;
+                    __asm__("" : "+r"(sr));
+                    if (emit0) {
+                        o0 += ds0 * 4;
+                        __asm__("" : "+r"(o0));
+                    }
+                    __m256i n4 = avg_rows_32_avx2(sr, sr + ss, 0);
+                    if (emit0) store_pow2_32(n4, 0, o0);
+                    __m256i n5 = avg_rows_32_avx2(sr + ss * 2, sr + ss3, 0);
+                    if (emit0) store_pow2_32(n5, 0, o0 + ds0);
+                    __m256i p2 = _mm256_avg_epu8(n4, n5);
+                    if (emit1) store_pow2_32(p2, 1, out1 + ds1 * 2);
 
-        for (int x = 0; x < src_w; x += 64) {
-            __m256i n0_lo, n0_hi, n1_lo, n1_hi;
-            __m256i p0_lo, p0_hi;
-
-            avg_rows_64_avx2(grp,
-                grp + (size_t)src_stride, x, &n0_lo, &n0_hi);
-            if (emit0)
-                store_pow2_64(n0_lo, n0_hi, 0, out0 + (size_t)x / 2);
-            if (deepest == 0)
-                continue;
-
-            avg_rows_64_avx2(
-                grp + (size_t)2 * (size_t)src_stride,
-                grp + (size_t)3 * (size_t)src_stride,
-                x, &n1_lo, &n1_hi);
-            if (emit0)
-                store_pow2_64(n1_lo, n1_hi, 0,
-                    out0 + (size_t)dst_strides[0] + (size_t)x / 2);
-            avg_nodes_64_avx2(n0_lo, n0_hi, n1_lo, n1_hi,
-                              &p0_lo, &p0_hi);
-            if (emit1)
-                store_pow2_64(p0_lo, p0_hi, 1, out1 + (size_t)x / 4);
-            if (deepest == 1)
-                continue;
-
-            __m256i n2_lo, n2_hi, n3_lo, n3_hi;
-            __m256i p1_lo, p1_hi, q0_lo, q0_hi;
-            avg_rows_64_avx2(
-                grp + (size_t)4 * (size_t)src_stride,
-                grp + (size_t)5 * (size_t)src_stride,
-                x, &n2_lo, &n2_hi);
-            if (emit0)
-                store_pow2_64(n2_lo, n2_hi, 0,
-                    out0 + (size_t)2 * (size_t)dst_strides[0]
-                         + (size_t)x / 2);
-            avg_rows_64_avx2(
-                grp + (size_t)6 * (size_t)src_stride,
-                grp + (size_t)7 * (size_t)src_stride,
-                x, &n3_lo, &n3_hi);
-            if (emit0)
-                store_pow2_64(n3_lo, n3_hi, 0,
-                    out0 + (size_t)3 * (size_t)dst_strides[0]
-                         + (size_t)x / 2);
-            avg_nodes_64_avx2(n2_lo, n2_hi, n3_lo, n3_hi,
-                              &p1_lo, &p1_hi);
-            if (emit1)
-                store_pow2_64(p1_lo, p1_hi, 1,
-                    out1 + (size_t)dst_strides[1] + (size_t)x / 4);
-            avg_nodes_64_avx2(p0_lo, p0_hi, p1_lo, p1_hi,
-                              &q0_lo, &q0_hi);
-            if (emit2)
-                store_pow2_64(q0_lo, q0_hi, 2, out2 + (size_t)x / 8);
-            if (deepest == 2)
-                continue;
-
-            __m256i n4_lo, n4_hi, n5_lo, n5_hi;
-            __m256i n6_lo, n6_hi, n7_lo, n7_hi;
-            __m256i p2_lo, p2_hi, p3_lo, p3_hi;
-            __m256i q1_lo, q1_hi, root_lo, root_hi;
-            avg_rows_64_avx2(
-                grp + (size_t)8 * (size_t)src_stride,
-                grp + (size_t)9 * (size_t)src_stride,
-                x, &n4_lo, &n4_hi);
-            if (emit0)
-                store_pow2_64(n4_lo, n4_hi, 0,
-                    out0 + (size_t)4 * (size_t)dst_strides[0]
-                         + (size_t)x / 2);
-            avg_rows_64_avx2(
-                grp + (size_t)10 * (size_t)src_stride,
-                grp + (size_t)11 * (size_t)src_stride,
-                x, &n5_lo, &n5_hi);
-            if (emit0)
-                store_pow2_64(n5_lo, n5_hi, 0,
-                    out0 + (size_t)5 * (size_t)dst_strides[0]
-                         + (size_t)x / 2);
-            avg_nodes_64_avx2(n4_lo, n4_hi, n5_lo, n5_hi,
-                              &p2_lo, &p2_hi);
-            if (emit1)
-                store_pow2_64(p2_lo, p2_hi, 1,
-                    out1 + (size_t)2 * (size_t)dst_strides[1]
-                         + (size_t)x / 4);
-
-            avg_rows_64_avx2(
-                grp + (size_t)12 * (size_t)src_stride,
-                grp + (size_t)13 * (size_t)src_stride,
-                x, &n6_lo, &n6_hi);
-            if (emit0)
-                store_pow2_64(n6_lo, n6_hi, 0,
-                    out0 + (size_t)6 * (size_t)dst_strides[0]
-                         + (size_t)x / 2);
-            avg_rows_64_avx2(
-                grp + (size_t)14 * (size_t)src_stride,
-                grp + (size_t)15 * (size_t)src_stride,
-                x, &n7_lo, &n7_hi);
-            if (emit0)
-                store_pow2_64(n7_lo, n7_hi, 0,
-                    out0 + (size_t)7 * (size_t)dst_strides[0]
-                         + (size_t)x / 2);
-            avg_nodes_64_avx2(n6_lo, n6_hi, n7_lo, n7_hi,
-                              &p3_lo, &p3_hi);
-            if (emit1)
-                store_pow2_64(p3_lo, p3_hi, 1,
-                    out1 + (size_t)3 * (size_t)dst_strides[1]
-                         + (size_t)x / 4);
-            avg_nodes_64_avx2(p2_lo, p2_hi, p3_lo, p3_hi,
-                              &q1_lo, &q1_hi);
-            if (emit2)
-                store_pow2_64(q1_lo, q1_hi, 2,
-                    out2 + (size_t)dst_strides[2] + (size_t)x / 8);
-            avg_nodes_64_avx2(q0_lo, q0_hi, q1_lo, q1_hi,
-                              &root_lo, &root_hi);
-            if (emit3)
-                store_pow2_64(root_lo, root_hi, 3, out3 + (size_t)x / 16);
+                    sr += ss * 4;
+                    __asm__("" : "+r"(sr));
+                    __m256i n6 = avg_rows_32_avx2(sr, sr + ss, 0);
+                    if (emit0) store_pow2_32(n6, 0, o0 + ds0 * 2);
+                    __m256i n7 = avg_rows_32_avx2(sr + ss * 2, sr + ss3, 0);
+                    if (emit0) store_pow2_32(n7, 0, o0 + ds0_3);
+                    __m256i p3 = _mm256_avg_epu8(n6, n7);
+                    if (emit1) store_pow2_32(p3, 1, out1 + ds1_3);
+                    __m256i q1 = _mm256_avg_epu8(p2, p3);
+                    if (emit2) store_pow2_32(q1, 2, out2 + ds2);
+                    if (emit3) store_pow2_32(_mm256_avg_epu8(q0, q1), 3, out3);
+                }
+            }
         }
+        grp += ss * group_rows;
+        if (emit0) out0 += ds0 * (group_rows >> 1);
+        if (emit1) out1 += ds1 * (group_rows >> 2);
+        if (emit2) out2 += ds2 * (group_rows >> 3);
+        if (emit3) out3 += ds3;
     }
 }
 
@@ -960,42 +1081,18 @@ static inline void h_chunk_6x_avx2(__m256i result_3x, uint8_t *restrict dst)
  * consumes them, and no full-width horizontal scratch row is needed.
  * ----------------------------------------------------------------------- */
 
-static void __attribute__((hot)) scale_plane_pow2_avx2(
+static void __attribute__((noinline)) scale_plane_pow2_scratch_avx2(
     const uint8_t *restrict src,
     int src_w, int src_h, int src_stride,
-    uint32_t active_outputs,
+    uint32_t active_outputs, int deepest,
     uint8_t *restrict dst_planes[4],
-    int dst_widths[4],
     int dst_strides[4],
-    int dst_heights[4],
     uint8_t *scratch_pool_base,
     size_t scratch_pool_size)
 {
-    (void)dst_heights;
-    (void)dst_widths;  /* the final halving writes results straight to the
-                        * output plane, so this width is not needed here */
-
     static const int bit_pos[4] = { 1, 3, 5, 7 };
-
-    /* Determine deepest active level (0=2x .. 3=16x). */
-    int deepest = -1;
-    for (int k = 3; k >= 0; k--) {
-        if (active_outputs & (1u << bit_pos[k])) {
-            deepest = k;
-            break;
-        }
-    }
-    if (deepest < 0) return;
-
     int group_rows = (2 << deepest);
     int num_groups = src_h / group_rows;
-
-    if ((src_w & 63) == 0) {
-        scale_plane_pow2_tree_64_avx2(src, src_w, src_h, src_stride,
-                                      active_outputs, deepest,
-                                      dst_planes, dst_strides);
-        return;
-    }
 
     /* Carve scratch buffers from the persistent pool (init-time alloc). */
     fused_scratch_t scratch;
@@ -1121,6 +1218,57 @@ static void __attribute__((hot)) scale_plane_pow2_avx2(
     /* Scratch buffers are carved from the persistent pool - nothing to free. */
 }
 
+static void __attribute__((hot)) scale_plane_pow2_avx2(
+    const uint8_t *restrict src,
+    int src_w, int src_h, int src_stride,
+    uint32_t active_outputs,
+    uint8_t *restrict dst_planes[4],
+    int dst_widths[4],
+    int dst_strides[4],
+    int dst_heights[4],
+    uint8_t *scratch_pool_base,
+    size_t scratch_pool_size)
+{
+    (void)dst_heights;
+    (void)dst_widths;
+
+    static const int bit_pos[4] = { 1, 3, 5, 7 };
+
+    /* Determine deepest active level (0=2x .. 3=16x). */
+    int deepest = -1;
+    for (int k = 3; k >= 0; k--) {
+        if (active_outputs & (1u << bit_pos[k])) {
+            deepest = k;
+            break;
+        }
+    }
+    if (deepest < 0) return;
+
+    if ((src_w & 63) == 0) {
+        scale_plane_pow2_tree_64_avx2(src, src_w, src_h, src_stride,
+                                      active_outputs, deepest,
+                                      dst_planes, dst_strides);
+        return;
+    }
+    if ((src_w & 31) == 0) {
+        int paired_w = src_w & ~63;
+        if (paired_w > 0) {
+            scale_plane_pow2_tree_64_avx2(src, paired_w, src_h, src_stride,
+                                          active_outputs, deepest,
+                                          dst_planes, dst_strides);
+        }
+        scale_plane_pow2_tree_tail_32_avx2(src, paired_w, src_h, src_stride,
+                                           active_outputs, deepest,
+                                           dst_planes, dst_strides);
+        return;
+    }
+
+    scale_plane_pow2_scratch_avx2(src, src_w, src_h, src_stride,
+                                  active_outputs, deepest,
+                                  dst_planes, dst_strides,
+                                  scratch_pool_base, scratch_pool_size);
+}
+
 
 /* -----------------------------------------------------------------------
  * Thirds kernel: scale a single plane (AVX2 fused vertical+horizontal)
@@ -1140,6 +1288,116 @@ static void __attribute__((hot)) scale_plane_pow2_avx2(
  * 1 row at 6x.  12x requires pairing two consecutive 6x rows via a
  * ping-pong buffer scheme.
  * ----------------------------------------------------------------------- */
+
+static void __attribute__((noinline)) scale_plane_thirds_tail_strip_avx2(
+    const uint8_t *restrict src,
+    int full_chunks, int tail_cols, int base6_groups, int src_stride,
+    uint32_t active_outputs,
+    int need_1_5x, int need_3x, int need_6x, int need_12x,
+    uint8_t *restrict dst_planes[4],
+    int dst_widths[4],
+    int dst_strides[4])
+{
+    const int tail_start    = full_chunks * 96;
+    const int tail_out_1_5x = full_chunks * 64;
+    const int tail_out_3x   = full_chunks * 32;
+    const int tail_out_6x   = full_chunks * 16;
+    const int tail_out_12x  = full_chunks * 8;
+    const ptrdiff_t ss  = (ptrdiff_t)src_stride;
+    const ptrdiff_t ds0 = (ptrdiff_t)dst_strides[0];
+    const ptrdiff_t ds1 = (ptrdiff_t)dst_strides[1];
+    const ptrdiff_t ds2 = (ptrdiff_t)dst_strides[2];
+    const ptrdiff_t ds3 = (ptrdiff_t)dst_strides[3];
+    uint8_t *p0 = dst_planes[0];
+    uint8_t *p1 = dst_planes[1];
+    uint8_t *p2 = dst_planes[2];
+    uint8_t *p3 = dst_planes[3];
+    const int dw0_rem = need_1_5x ? (dst_widths[0] - tail_out_1_5x) : 0;
+    const int dw1_rem = (active_outputs & (1u << 2)) ? (dst_widths[1] - tail_out_3x) : 0;
+    const int dw2_rem = (active_outputs & (1u << 4)) ? (dst_widths[2] - tail_out_6x) : 0;
+    const int dw3_rem = (active_outputs & (1u << 6)) ? (dst_widths[3] - tail_out_12x) : 0;
+
+    uint8_t tail_v6x_prev[96];
+
+    for (int g6 = 0; g6 < base6_groups; g6++) {
+        const uint8_t *grp = src + (size_t)g6 * 6 * (size_t)ss + tail_start;
+        const uint8_t *row0 = grp;
+        const uint8_t *row1 = grp + ss;
+        const uint8_t *row2 = grp + ss * 2;
+        const uint8_t *row3 = grp + ss * 3;
+        const uint8_t *row4 = grp + ss * 4;
+        const uint8_t *row5 = grp + ss * 5;
+
+        uint8_t tail_v01[96], tail_v23[96], tail_v45[96];
+        for (int x = 0; x < tail_cols; x++) {
+            tail_v01[x] = avg_u8(row0[x], row1[x]);
+            tail_v23[x] = avg_u8(row2[x], row3[x]);
+            tail_v45[x] = avg_u8(row4[x], row5[x]);
+        }
+
+        uint8_t tail_v3x0[96], tail_v3x1[96];
+        if (need_3x) {
+            for (int x = 0; x < tail_cols; x++) {
+                tail_v3x0[x] = avg_u8(tail_v01[x], tail_v23[x]);
+                tail_v3x1[x] = avg_u8(tail_v23[x], tail_v45[x]);
+            }
+        }
+
+        uint8_t tail_v6x[96];
+        if (need_6x) {
+            for (int x = 0; x < tail_cols; x++) {
+                tail_v6x[x] = avg_u8(tail_v3x0[x], tail_v3x1[x]);
+            }
+        }
+
+        if (need_1_5x) {
+            uint8_t *r0 = p0 + (size_t)(g6 * 4) * (size_t)ds0 + tail_out_1_5x;
+            h_filter_1_5x(tail_v01, tail_cols, r0, dw0_rem);
+
+            uint8_t tail_blend[96];
+            for (int x = 0; x < tail_cols; x++)
+                tail_blend[x] = blend_2_1(tail_v01[x], tail_v23[x]);
+            h_filter_1_5x(tail_blend, tail_cols, r0 + ds0, dw0_rem);
+
+            for (int x = 0; x < tail_cols; x++)
+                tail_blend[x] = blend_2_1(tail_v23[x], tail_v45[x]);
+            h_filter_1_5x(tail_blend, tail_cols, r0 + ds0 * 2, dw0_rem);
+
+            h_filter_1_5x(tail_v45, tail_cols, r0 + ds0 * 3, dw0_rem);
+        }
+
+        if (active_outputs & (1u << 2)) {
+            uint8_t *r0 = p1 + (size_t)(g6 * 2) * (size_t)ds1 + tail_out_3x;
+            h_filter_3x(tail_v3x0, tail_cols, r0, dw1_rem);
+            h_filter_3x(tail_v3x1, tail_cols, r0 + ds1, dw1_rem);
+        }
+
+        if (active_outputs & (1u << 4)) {
+            uint8_t *r0 = p2 + (size_t)g6 * (size_t)ds2 + tail_out_6x;
+            int w3_tail = tail_cols / 3;
+            uint8_t tail_h3x[32];
+            h_filter_3x(tail_v6x, tail_cols, tail_h3x, w3_tail);
+            h_filter_halve(tail_h3x, r0, dw2_rem);
+        }
+
+        if (need_12x) {
+            if ((g6 & 1) == 0) {
+                memcpy(tail_v6x_prev, tail_v6x, (size_t)tail_cols);
+            } else if ((active_outputs & (1u << 6)) && dw3_rem > 0) {
+                uint8_t tail_v12x[96], tail_h3x[32], tail_h6x[16];
+                for (int x = 0; x < tail_cols; x++)
+                    tail_v12x[x] = avg_u8(tail_v6x_prev[x], tail_v6x[x]);
+                int w3_tail = tail_cols / 3;
+                int w6_tail = w3_tail / 2;
+                h_filter_3x(tail_v12x, tail_cols, tail_h3x, w3_tail);
+                h_filter_halve(tail_h3x, tail_h6x, w6_tail);
+                h_filter_halve(tail_h6x,
+                               p3 + (size_t)(g6 >> 1) * (size_t)ds3 + tail_out_12x,
+                               dw3_rem);
+            }
+        }
+    }
+}
 
 static void __attribute__((hot, aligned(64))) scale_plane_thirds_avx2(
     const uint8_t *restrict src,
@@ -1165,457 +1423,248 @@ static void __attribute__((hot, aligned(64))) scale_plane_thirds_avx2(
     }
     if (deepest < 0) return;
 
-    int need_1_5x = (active_outputs & (1u << 0)) != 0;
-    int need_3x   = (deepest >= 1);
-    int need_6x   = (deepest >= 2);
-    int need_12x  = (deepest >= 3);
+    const int need_1_5x = (active_outputs & (1u << 0)) != 0;
+    const int emit_3x   = (active_outputs & (1u << 2)) != 0;
+    const int emit_6x   = (active_outputs & (1u << 4)) != 0;
+    const int emit_12x  = (active_outputs & (1u << 6)) != 0;
+    const int need_3x   = (deepest >= 1);
+    const int need_6x   = (deepest >= 2);
+    const int need_12x  = (deepest >= 3);
 
-    int base6_groups = src_h / 6;
-    size_t row_bytes = (size_t)src_w;
+    const int base6_groups = src_h / 6;
+    const int full_chunks  = src_w / 96;
+    const int tail_cols    = src_w - full_chunks * 96;
 
-    /* Carve scratch buffers from the persistent pool (init-time alloc). */
-    fused_scratch_t scratch;
-    fused_scratch_init(&scratch, scratch_pool_base, scratch_pool_size);
-
-    /* For 12x: two buffers to hold 6x vertical intermediates across
-     * consecutive 6-row groups.  On even groups we write to v6x_cur,
-     * then swap pointers so the odd group can read the previous. */
-    uint8_t *v6x_buf_a = NULL, *v6x_buf_b = NULL;
-    uint8_t *v6x_cur = NULL, *v6x_prev = NULL;
-    if (need_12x) {
-        v6x_buf_a = (uint8_t *)fused_scratch_alloc(&scratch, row_bytes);
-        v6x_buf_b = (uint8_t *)fused_scratch_alloc(&scratch, row_bytes);
-        if (!v6x_buf_a || !v6x_buf_b) return;
-        v6x_cur  = v6x_buf_a;
-        v6x_prev = v6x_buf_b;
+    /* Single planar 12x carry buffer ([A 32B | B 32B | C 32B] per 96B chunk)
+     * written on even groups and consumed directly inside the odd-group chunk
+     * loop.  96 = 8 * 12 never crosses a 12x boundary, so full chunks fuse
+     * regardless of whether tail_cols > 0. */
+    uint8_t *v6x_prev = NULL;
+    if (need_12x && full_chunks > 0) {
+        fused_scratch_t scratch;
+        fused_scratch_init(&scratch, scratch_pool_base, scratch_pool_size);
+        v6x_prev = (uint8_t *)fused_scratch_alloc(&scratch,
+                                                  (size_t)full_chunks * 96);
+        if (!v6x_prev) return;
     }
 
-    /* Horizontal scratch for 12x (3x -> halve -> halve) */
-    int w_3x = src_w / 3;
-    int w_6x = w_3x / 2;
-    uint8_t *h_3x_buf = NULL, *h_6x_buf = NULL;
-    if (need_12x && (active_outputs & (1u << 6))) {
-        h_3x_buf = (uint8_t *)fused_scratch_alloc(&scratch, (size_t)w_3x);
-        h_6x_buf = (uint8_t *)fused_scratch_alloc(
-            &scratch, (size_t)(w_6x > 0 ? w_6x : 1));
-        if (!h_3x_buf || !h_6x_buf) return;
-    }
+    if (full_chunks > 0) {
+        const ptrdiff_t ss  = (ptrdiff_t)src_stride;
+        const ptrdiff_t ds0 = (ptrdiff_t)dst_strides[0];
+        const ptrdiff_t ds1 = (ptrdiff_t)dst_strides[1];
+        const ptrdiff_t ds2 = (ptrdiff_t)dst_strides[2];
+        const ptrdiff_t ds3 = (ptrdiff_t)dst_strides[3];
 
-    /* Chunk geometry: 96 source bytes per chunk (LCM of 32 and 3) */
-    int full_chunks = src_w / 96;
-    int tail_start  = full_chunks * 96;
-    int tail_cols   = src_w - tail_start;
+        const uint8_t *grp = src;
+        uint8_t *p0 = need_1_5x ? dst_planes[0] : NULL;
+        uint8_t *p1 = emit_3x   ? dst_planes[1] : NULL;
+        uint8_t *p2 = emit_6x   ? dst_planes[2] : NULL;
+        uint8_t *p3 = emit_12x  ? dst_planes[3] : NULL;
 
-    /* When the width divides into whole 96-byte chunks, the 12x
-     * intermediate rows are stored per-chunk in component-planar layout
-     * ([A 32B | B 32B | C 32B]) instead of raw interleaved bytes: the
-     * chunk loop already holds the deinterleaved components, and the
-     * fused 12x pass can then consume them with no deinterleave of its
-     * own.  Widths with a tail keep the raw layout, which the fallback
-     * 12x path (h_filter_3x reading the row linearly) requires. */
-    int v6x_planar = need_12x && (tail_cols == 0);
+        for (int g6 = 0; g6 < base6_groups; g6++) {
+            const uint8_t *restrict row0 = grp;
+            const uint8_t *restrict row1 = grp + ss;
+            const uint8_t *restrict row2 = grp + ss * 2;
+            const uint8_t *restrict row3 = grp + ss * 3;
+            const uint8_t *restrict row4 = grp + ss * 4;
+            const uint8_t *restrict row5 = grp + ss * 5;
 
-    /* Output row cursors */
-    int out_row[4] = { 0, 0, 0, 0 };
+            uint8_t *dst_1_5x_r0 = p0;
+            uint8_t *dst_1_5x_r1 = need_1_5x ? (p0 + ds0)     : NULL;
+            uint8_t *dst_1_5x_r2 = need_1_5x ? (p0 + ds0 * 2) : NULL;
+            uint8_t *dst_1_5x_r3 = need_1_5x ? (p0 + ds0 * 3) : NULL;
+            uint8_t *dst_3x_r0   = p1;
+            uint8_t *dst_3x_r1   = emit_3x ? (p1 + ds1) : NULL;
+            uint8_t *dst_6x_r0   = p2;
+            uint8_t *dst_12x_r0  = p3;
 
-    for (int g6 = 0; g6 < base6_groups; g6++) {
-        const uint8_t *grp = src + (size_t)g6 * 6 * (size_t)src_stride;
+            /* ============================================================
+             * MAIN CHUNK LOOP: process 96 source columns at a time.
+             * Vertical intermediates stay in YMM registers; horizontal
+             * filtering is applied immediately per chunk.
+             * ============================================================ */
+            for (int ci = 0; ci < full_chunks; ci++) {
+                int cx = ci * 96;
+                int out_off_1_5x = ci * 64;  /* 96 -> 64 output bytes */
+                int out_off_3x   = ci * 32;  /* 96 -> 32 output bytes */
+                int out_off_6x   = ci * 16;  /* 96 -> 16 output bytes */
 
-        const uint8_t *restrict row0 = grp;
-        const uint8_t *restrict row1 = grp + (size_t)src_stride;
-        const uint8_t *restrict row2 = grp + (size_t)2 * (size_t)src_stride;
-        const uint8_t *restrict row3 = grp + (size_t)3 * (size_t)src_stride;
-        const uint8_t *restrict row4 = grp + (size_t)4 * (size_t)src_stride;
-        const uint8_t *restrict row5 = grp + (size_t)5 * (size_t)src_stride;
+                /* --- LOAD 6 rows x 3 YMM = 18 loads --- */
+                __m256i r0a = _mm256_load_si256((const __m256i *)(row0 + cx));
+                __m256i r0b = _mm256_load_si256((const __m256i *)(row0 + cx + 32));
+                __m256i r0c = _mm256_load_si256((const __m256i *)(row0 + cx + 64));
+                __m256i r1a = _mm256_load_si256((const __m256i *)(row1 + cx));
+                __m256i r1b = _mm256_load_si256((const __m256i *)(row1 + cx + 32));
+                __m256i r1c = _mm256_load_si256((const __m256i *)(row1 + cx + 64));
+                __m256i r2a = _mm256_load_si256((const __m256i *)(row2 + cx));
+                __m256i r2b = _mm256_load_si256((const __m256i *)(row2 + cx + 32));
+                __m256i r2c = _mm256_load_si256((const __m256i *)(row2 + cx + 64));
+                __m256i r3a = _mm256_load_si256((const __m256i *)(row3 + cx));
+                __m256i r3b = _mm256_load_si256((const __m256i *)(row3 + cx + 32));
+                __m256i r3c = _mm256_load_si256((const __m256i *)(row3 + cx + 64));
+                __m256i r4a = _mm256_load_si256((const __m256i *)(row4 + cx));
+                __m256i r4b = _mm256_load_si256((const __m256i *)(row4 + cx + 32));
+                __m256i r4c = _mm256_load_si256((const __m256i *)(row4 + cx + 64));
+                __m256i r5a = _mm256_load_si256((const __m256i *)(row5 + cx));
+                __m256i r5b = _mm256_load_si256((const __m256i *)(row5 + cx + 32));
+                __m256i r5c = _mm256_load_si256((const __m256i *)(row5 + cx + 64));
 
-        /* Compute output row base pointers */
-        uint8_t *dst_1_5x_r0 = NULL, *dst_1_5x_r1 = NULL;
-        uint8_t *dst_1_5x_r2 = NULL, *dst_1_5x_r3 = NULL;
-        if (need_1_5x) {
-            int ds = dst_strides[0];
-            dst_1_5x_r0 = dst_planes[0] + (size_t)out_row[0]       * (size_t)ds;
-            dst_1_5x_r1 = dst_planes[0] + (size_t)(out_row[0] + 1) * (size_t)ds;
-            dst_1_5x_r2 = dst_planes[0] + (size_t)(out_row[0] + 2) * (size_t)ds;
-            dst_1_5x_r3 = dst_planes[0] + (size_t)(out_row[0] + 3) * (size_t)ds;
-        }
+                /* --- VERTICAL PAIRWISE AVERAGES --- */
+                __m256i v01a = _mm256_avg_epu8(r0a, r1a);
+                __m256i v01b = _mm256_avg_epu8(r0b, r1b);
+                __m256i v01c = _mm256_avg_epu8(r0c, r1c);
+                __m256i v23a = _mm256_avg_epu8(r2a, r3a);
+                __m256i v23b = _mm256_avg_epu8(r2b, r3b);
+                __m256i v23c = _mm256_avg_epu8(r2c, r3c);
+                __m256i v45a = _mm256_avg_epu8(r4a, r5a);
+                __m256i v45b = _mm256_avg_epu8(r4b, r5b);
+                __m256i v45c = _mm256_avg_epu8(r4c, r5c);
 
-        uint8_t *dst_3x_r0 = NULL, *dst_3x_r1 = NULL;
-        if (active_outputs & (1u << 2)) {
-            int ds = dst_strides[1];
-            dst_3x_r0 = dst_planes[1] + (size_t)out_row[1]       * (size_t)ds;
-            dst_3x_r1 = dst_planes[1] + (size_t)(out_row[1] + 1) * (size_t)ds;
-        }
+                if (need_1_5x) {
+                    __m256i Av01, Bv01, Cv01, Av23, Bv23, Cv23, Av45, Bv45, Cv45;
+                    deinterleave_3x32(v01a, v01b, v01c, &Av01, &Bv01, &Cv01);
+                    deinterleave_3x32(v23a, v23b, v23c, &Av23, &Bv23, &Cv23);
+                    deinterleave_3x32(v45a, v45b, v45c, &Av45, &Bv45, &Cv45);
 
-        uint8_t *dst_6x_r0 = NULL;
-        if (active_outputs & (1u << 4)) {
-            dst_6x_r0 = dst_planes[2] + (size_t)out_row[2] * (size_t)dst_strides[2];
-        }
-
-        /* ============================================================
-         * MAIN CHUNK LOOP: process 96 source columns at a time.
-         * Vertical intermediates stay in YMM registers; horizontal
-         * filtering is applied immediately per chunk.
-         * ============================================================ */
-        for (int ci = 0; ci < full_chunks; ci++) {
-            int cx = ci * 96;
-            int out_off_1_5x = ci * 64;  /* 96 -> 64 output bytes */
-            int out_off_3x   = ci * 32;  /* 96 -> 32 output bytes */
-            int out_off_6x   = ci * 16;  /* 96 -> 16 output bytes */
-
-            /* --- LOAD 6 rows x 3 YMM = 18 loads ---
-             * Source rows are 32-byte aligned (validated at init) and cx is
-             * always a multiple of 96 = 32*3, so all three offsets cx,
-             * cx+32, cx+64 are multiples of 32: use aligned loads.
-             * Loading all 6 rows before any computation lets the CPU's
-             * out-of-order engine overlap the loads with subsequent
-             * arithmetic. */
-            __m256i r0a = _mm256_load_si256((const __m256i *)(row0 + cx));
-            __m256i r0b = _mm256_load_si256((const __m256i *)(row0 + cx + 32));
-            __m256i r0c = _mm256_load_si256((const __m256i *)(row0 + cx + 64));
-            __m256i r1a = _mm256_load_si256((const __m256i *)(row1 + cx));
-            __m256i r1b = _mm256_load_si256((const __m256i *)(row1 + cx + 32));
-            __m256i r1c = _mm256_load_si256((const __m256i *)(row1 + cx + 64));
-            __m256i r2a = _mm256_load_si256((const __m256i *)(row2 + cx));
-            __m256i r2b = _mm256_load_si256((const __m256i *)(row2 + cx + 32));
-            __m256i r2c = _mm256_load_si256((const __m256i *)(row2 + cx + 64));
-            __m256i r3a = _mm256_load_si256((const __m256i *)(row3 + cx));
-            __m256i r3b = _mm256_load_si256((const __m256i *)(row3 + cx + 32));
-            __m256i r3c = _mm256_load_si256((const __m256i *)(row3 + cx + 64));
-            __m256i r4a = _mm256_load_si256((const __m256i *)(row4 + cx));
-            __m256i r4b = _mm256_load_si256((const __m256i *)(row4 + cx + 32));
-            __m256i r4c = _mm256_load_si256((const __m256i *)(row4 + cx + 64));
-            __m256i r5a = _mm256_load_si256((const __m256i *)(row5 + cx));
-            __m256i r5b = _mm256_load_si256((const __m256i *)(row5 + cx + 32));
-            __m256i r5c = _mm256_load_si256((const __m256i *)(row5 + cx + 64));
-
-            /* --- VERTICAL PAIRWISE AVERAGES ---
-             * Average adjacent row pairs: rows 0+1 -> v01, rows 2+3 -> v23,
-             * rows 4+5 -> v45.  These three intermediates represent the
-             * vertical center of each pair and are reused across all output
-             * levels without writing to memory. */
-            __m256i v01a = _mm256_avg_epu8(r0a, r1a);
-            __m256i v01b = _mm256_avg_epu8(r0b, r1b);
-            __m256i v01c = _mm256_avg_epu8(r0c, r1c);
-            __m256i v23a = _mm256_avg_epu8(r2a, r3a);
-            __m256i v23b = _mm256_avg_epu8(r2b, r3b);
-            __m256i v23c = _mm256_avg_epu8(r2c, r3c);
-            __m256i v45a = _mm256_avg_epu8(r4a, r5a);
-            __m256i v45b = _mm256_avg_epu8(r4b, r5b);
-            __m256i v45c = _mm256_avg_epu8(r4c, r5c);
-
-            /* --- DEINTERLEAVE ONCE, REDUCE IN COMPONENT SPACE ---
-             * deinterleave_3x32 is a pure byte permutation P, and every
-             * vertical reduction here (pairwise avg, bilinear blend) is a
-             * pointwise byte op f, so P(f(x,y)) == f(P(x),P(y)).  When 1.5x is
-             * active the group emits >=4 output rows that all derive from the
-             * three pair averages v01/v23/v45, so deinterleaving those three
-             * ONCE and computing every level in A/B/C "component space" gives
-             * the same result with only 3 deinterleave_3x32 calls per chunk,
-             * down from one per reduced row (deinterleaving is the binding
-             * shuffle-port cost of this kernel).  This pays off when 1.5x is
-             * active and >=4 rows reuse the three averages.  With only 3x/6x
-             * there are <=3 such rows, so the else branch deinterleaves each
-             * reduced row directly and issues fewer shuffles.
-             *
-             * In planar mode the 12x intermediate is stored from component
-             * space inside the branches below (the components are already in
-             * registers there).  Only the raw fallback layout is produced
-             * here, while the raw pair averages are still live; the stored
-             * bytes match the interleaved layout the fallback 12x path
-             * reads. */
-            if (need_12x && !v6x_planar) {
-                __m256i v6xa = _mm256_avg_epu8(_mm256_avg_epu8(v01a, v23a),
-                                               _mm256_avg_epu8(v23a, v45a));
-                __m256i v6xb = _mm256_avg_epu8(_mm256_avg_epu8(v01b, v23b),
-                                               _mm256_avg_epu8(v23b, v45b));
-                __m256i v6xc = _mm256_avg_epu8(_mm256_avg_epu8(v01c, v23c),
-                                               _mm256_avg_epu8(v23c, v45c));
-                _mm256_storeu_si256((__m256i *)(v6x_cur + cx),      v6xa);
-                _mm256_storeu_si256((__m256i *)(v6x_cur + cx + 32), v6xb);
-                _mm256_storeu_si256((__m256i *)(v6x_cur + cx + 64), v6xc);
-            }
-
-            if (need_1_5x) {
-                __m256i Av01, Bv01, Cv01, Av23, Bv23, Cv23, Av45, Bv45, Cv45;
-                deinterleave_3x32(v01a, v01b, v01c, &Av01, &Bv01, &Cv01);
-                deinterleave_3x32(v23a, v23b, v23c, &Av23, &Bv23, &Cv23);
-                deinterleave_3x32(v45a, v45b, v45c, &Av45, &Bv45, &Cv45);
-
-                /* 1.5x: rows 0/3 are v01/v45 directly, rows 1/2 are vertical
-                 * bilinear blends computed component-wise (blend commutes with
-                 * the deinterleave). */
-                h_chunk_1_5x_avx2(Av01, Bv01, Cv01, dst_1_5x_r0 + out_off_1_5x);
-                {
-                    /* Vertical blend kept as 16-bit values and fed straight
-                     * into the horizontal bilinear, which consumes them as-is. */
-                    __m256i bA_lo, bA_hi, bB_lo, bB_hi, bC_lo, bC_hi;
-                    avx2_blend_2_1_u16(Av01, Av23, &bA_lo, &bA_hi);
-                    avx2_blend_2_1_u16(Bv01, Bv23, &bB_lo, &bB_hi);
-                    avx2_blend_2_1_u16(Cv01, Cv23, &bC_lo, &bC_hi);
-                    h_chunk_1_5x_u16_avx2(bA_lo, bA_hi, bB_lo, bB_hi,
-                                          bC_lo, bC_hi,
-                                          dst_1_5x_r1 + out_off_1_5x);
-                }
-                {
-                    __m256i bA_lo, bA_hi, bB_lo, bB_hi, bC_lo, bC_hi;
-                    avx2_blend_2_1_u16(Av23, Av45, &bA_lo, &bA_hi);
-                    avx2_blend_2_1_u16(Bv23, Bv45, &bB_lo, &bB_hi);
-                    avx2_blend_2_1_u16(Cv23, Cv45, &bC_lo, &bC_hi);
-                    h_chunk_1_5x_u16_avx2(bA_lo, bA_hi, bB_lo, bB_hi,
-                                          bC_lo, bC_hi,
-                                          dst_1_5x_r2 + out_off_1_5x);
-                }
-                h_chunk_1_5x_avx2(Av45, Bv45, Cv45, dst_1_5x_r3 + out_off_1_5x);
-
-                /* 3x vertical reduction in component space (reused by 6x). */
-                __m256i A3x0 = _mm256_setzero_si256();
-                __m256i B3x0 = _mm256_setzero_si256();
-                __m256i C3x0 = _mm256_setzero_si256();
-                __m256i A3x1 = _mm256_setzero_si256();
-                __m256i B3x1 = _mm256_setzero_si256();
-                __m256i C3x1 = _mm256_setzero_si256();
-                if (need_3x) {
-                    A3x0 = _mm256_avg_epu8(Av01, Av23);
-                    B3x0 = _mm256_avg_epu8(Bv01, Bv23);
-                    C3x0 = _mm256_avg_epu8(Cv01, Cv23);
-                    A3x1 = _mm256_avg_epu8(Av23, Av45);
-                    B3x1 = _mm256_avg_epu8(Bv23, Bv45);
-                    C3x1 = _mm256_avg_epu8(Cv23, Cv45);
-
-                    if (active_outputs & (1u << 2)) {
-                        h_chunk_3x_avx2(A3x0, B3x0, C3x0, dst_3x_r0 + out_off_3x);
-                        h_chunk_3x_avx2(A3x1, B3x1, C3x1, dst_3x_r1 + out_off_3x);
+                    h_chunk_1_5x_avx2(Av01, Bv01, Cv01, dst_1_5x_r0 + out_off_1_5x);
+                    {
+                        __m256i bA_lo, bA_hi, bB_lo, bB_hi, bC_lo, bC_hi;
+                        avx2_blend_2_1_u16(Av01, Av23, &bA_lo, &bA_hi);
+                        avx2_blend_2_1_u16(Bv01, Bv23, &bB_lo, &bB_hi);
+                        avx2_blend_2_1_u16(Cv01, Cv23, &bC_lo, &bC_hi);
+                        h_chunk_1_5x_u16_avx2(bA_lo, bA_hi, bB_lo, bB_hi,
+                                              bC_lo, bC_hi,
+                                              dst_1_5x_r1 + out_off_1_5x);
                     }
-                }
-
-                /* 6x = halve(box3(avg(v3x0,v3x1))) in component space.  The
-                 * same component averages are the planar 12x intermediate
-                 * (need_12x implies need_3x, so A3x0..C3x1 are real here). */
-                if ((need_6x && (active_outputs & (1u << 4))) || v6x_planar) {
-                    __m256i A6x = _mm256_avg_epu8(A3x0, A3x1);
-                    __m256i B6x = _mm256_avg_epu8(B3x0, B3x1);
-                    __m256i C6x = _mm256_avg_epu8(C3x0, C3x1);
-                    if (need_6x && (active_outputs & (1u << 4))) {
-                        uint8_t __attribute__((aligned(32))) scratch_3x[32];
-                        __m256i r3x = h_chunk_3x_avx2(A6x, B6x, C6x, scratch_3x);
-                        h_chunk_6x_avx2(r3x, dst_6x_r0 + out_off_6x);
+                    {
+                        __m256i bA_lo, bA_hi, bB_lo, bB_hi, bC_lo, bC_hi;
+                        avx2_blend_2_1_u16(Av23, Av45, &bA_lo, &bA_hi);
+                        avx2_blend_2_1_u16(Bv23, Bv45, &bB_lo, &bB_hi);
+                        avx2_blend_2_1_u16(Cv23, Cv45, &bC_lo, &bC_hi);
+                        h_chunk_1_5x_u16_avx2(bA_lo, bA_hi, bB_lo, bB_hi,
+                                              bC_lo, bC_hi,
+                                              dst_1_5x_r2 + out_off_1_5x);
                     }
-                    if (v6x_planar) {
-                        _mm256_storeu_si256((__m256i *)(v6x_cur + cx),      A6x);
-                        _mm256_storeu_si256((__m256i *)(v6x_cur + cx + 32), B6x);
-                        _mm256_storeu_si256((__m256i *)(v6x_cur + cx + 64), C6x);
-                    }
-                }
-            } else {
-                /* No 1.5x: deinterleave each reduced row directly (original
-                 * path).  With only 3x/6x outputs there are <=3 rows reusing
-                 * the pair averages, so deinterleaving all three of them would
-                 * issue MORE shuffles than this. */
-                __m256i v3x0a = _mm256_setzero_si256();
-                __m256i v3x0b = _mm256_setzero_si256();
-                __m256i v3x0c = _mm256_setzero_si256();
-                __m256i v3x1a = _mm256_setzero_si256();
-                __m256i v3x1b = _mm256_setzero_si256();
-                __m256i v3x1c = _mm256_setzero_si256();
-                if (need_3x) {
-                    v3x0a = _mm256_avg_epu8(v01a, v23a);
-                    v3x0b = _mm256_avg_epu8(v01b, v23b);
-                    v3x0c = _mm256_avg_epu8(v01c, v23c);
-                    v3x1a = _mm256_avg_epu8(v23a, v45a);
-                    v3x1b = _mm256_avg_epu8(v23b, v45b);
-                    v3x1c = _mm256_avg_epu8(v23c, v45c);
+                    h_chunk_1_5x_avx2(Av45, Bv45, Cv45, dst_1_5x_r3 + out_off_1_5x);
 
-                    if (active_outputs & (1u << 2)) {
-                        __m256i A, B, C;
-                        deinterleave_3x32(v3x0a, v3x0b, v3x0c, &A, &B, &C);
-                        h_chunk_3x_avx2(A, B, C, dst_3x_r0 + out_off_3x);
-                        deinterleave_3x32(v3x1a, v3x1b, v3x1c, &A, &B, &C);
-                        h_chunk_3x_avx2(A, B, C, dst_3x_r1 + out_off_3x);
-                    }
-                }
-                if ((need_6x && (active_outputs & (1u << 4))) || v6x_planar) {
-                    __m256i v6xa = _mm256_avg_epu8(v3x0a, v3x1a);
-                    __m256i v6xb = _mm256_avg_epu8(v3x0b, v3x1b);
-                    __m256i v6xc = _mm256_avg_epu8(v3x0c, v3x1c);
-                    __m256i A, B, C;
-                    deinterleave_3x32(v6xa, v6xb, v6xc, &A, &B, &C);
-                    if (need_6x && (active_outputs & (1u << 4))) {
-                        uint8_t __attribute__((aligned(32))) scratch_3x[32];
-                        __m256i r3x = h_chunk_3x_avx2(A, B, C, scratch_3x);
-                        h_chunk_6x_avx2(r3x, dst_6x_r0 + out_off_6x);
-                    }
-                    /* Planar 12x store: the deinterleave above moves from
-                     * the 12x consumer to here - same count, one per
-                     * chunk - and the consumer gets components for free. */
-                    if (v6x_planar) {
-                        _mm256_storeu_si256((__m256i *)(v6x_cur + cx),      A);
-                        _mm256_storeu_si256((__m256i *)(v6x_cur + cx + 32), B);
-                        _mm256_storeu_si256((__m256i *)(v6x_cur + cx + 64), C);
-                    }
-                }
-            }
-        } /* end chunk loop */
+                    /* 3x vertical reduction in component space (reused by 6x/12x). */
+                    __m256i A3x0 = _mm256_setzero_si256();
+                    __m256i B3x0 = _mm256_setzero_si256();
+                    __m256i C3x0 = _mm256_setzero_si256();
+                    __m256i A3x1 = _mm256_setzero_si256();
+                    __m256i B3x1 = _mm256_setzero_si256();
+                    __m256i C3x1 = _mm256_setzero_si256();
+                    if (need_3x) {
+                        A3x0 = _mm256_avg_epu8(Av01, Av23);
+                        B3x0 = _mm256_avg_epu8(Bv01, Bv23);
+                        C3x0 = _mm256_avg_epu8(Cv01, Cv23);
+                        A3x1 = _mm256_avg_epu8(Av23, Av45);
+                        B3x1 = _mm256_avg_epu8(Bv23, Bv45);
+                        C3x1 = _mm256_avg_epu8(Cv23, Cv45);
 
-        /* ============================================================
-         * TAIL: handle remaining columns (< 96) with scalar h_filter.
-         * Compute vertical intermediates into stack buffers, then apply
-         * the existing scalar horizontal filters.
-         * ============================================================ */
-        if (tail_cols > 0) {
-            /* Stack buffers for tail vertical intermediates (max 95 bytes) */
-            uint8_t tail_v01[96], tail_v23[96], tail_v45[96];
-
-            for (int x = 0; x < tail_cols; x++) {
-                int sx = tail_start + x;
-                tail_v01[x] = avg_u8(row0[sx], row1[sx]);
-                tail_v23[x] = avg_u8(row2[sx], row3[sx]);
-                tail_v45[x] = avg_u8(row4[sx], row5[sx]);
-            }
-
-            uint8_t tail_v3x0[96], tail_v3x1[96];
-            if (need_3x) {
-                for (int x = 0; x < tail_cols; x++) {
-                    tail_v3x0[x] = avg_u8(tail_v01[x], tail_v23[x]);
-                    tail_v3x1[x] = avg_u8(tail_v23[x], tail_v45[x]);
-                }
-            }
-
-            uint8_t tail_v6x[96];
-            if (need_6x) {
-                for (int x = 0; x < tail_cols; x++) {
-                    tail_v6x[x] = avg_u8(tail_v3x0[x], tail_v3x1[x]);
-                }
-                if (need_12x) {
-                    memcpy(v6x_cur + tail_start, tail_v6x, (size_t)tail_cols);
-                }
-            }
-
-            /* How many output pixels the AVX2 chunks already produced */
-            int tail_out_1_5x = full_chunks * 64;
-            int tail_out_3x   = full_chunks * 32;
-            int tail_out_6x   = full_chunks * 16;
-
-            /* 1.5x tail */
-            if (need_1_5x) {
-                int dw_rem = dst_widths[0] - tail_out_1_5x;
-
-                h_filter_1_5x(tail_v01, tail_cols,
-                              dst_1_5x_r0 + tail_out_1_5x, dw_rem);
-
-                uint8_t tail_blend[96];
-                for (int x = 0; x < tail_cols; x++)
-                    tail_blend[x] = blend_2_1(tail_v01[x], tail_v23[x]);
-                h_filter_1_5x(tail_blend, tail_cols,
-                              dst_1_5x_r1 + tail_out_1_5x, dw_rem);
-
-                for (int x = 0; x < tail_cols; x++)
-                    tail_blend[x] = blend_2_1(tail_v23[x], tail_v45[x]);
-                h_filter_1_5x(tail_blend, tail_cols,
-                              dst_1_5x_r2 + tail_out_1_5x, dw_rem);
-
-                h_filter_1_5x(tail_v45, tail_cols,
-                              dst_1_5x_r3 + tail_out_1_5x, dw_rem);
-            }
-
-            /* 3x tail */
-            if (active_outputs & (1u << 2)) {
-                int dw_rem = dst_widths[1] - tail_out_3x;
-                h_filter_3x(tail_v3x0, tail_cols,
-                            dst_3x_r0 + tail_out_3x, dw_rem);
-                h_filter_3x(tail_v3x1, tail_cols,
-                            dst_3x_r1 + tail_out_3x, dw_rem);
-            }
-
-            /* 6x tail */
-            if (active_outputs & (1u << 4)) {
-                int dw_rem = dst_widths[2] - tail_out_6x;
-                int w3_tail = tail_cols / 3;
-                uint8_t tail_h3x[32];
-                h_filter_3x(tail_v6x, tail_cols, tail_h3x, w3_tail);
-                h_filter_halve(tail_h3x, dst_6x_r0 + tail_out_6x, dw_rem);
-            }
-        }
-
-        /* Update output row cursors */
-        if (need_1_5x) out_row[0] += 4;
-        if (active_outputs & (1u << 2)) out_row[1] += 2;
-        if (active_outputs & (1u << 4)) out_row[2] += 1;
-
-        /* ============================================================
-         * 12x handling: pair two consecutive 6-row groups.
-         * v6x_cur holds this group's 6x vertical intermediate (src_w bytes).
-         * On even groups: swap pointers so current becomes previous.
-         * On odd groups: average prev with current, apply horizontal, output.
-         *
-         * 12x requires averaging two consecutive 6x rows, each derived from
-         * a different 6-row source group.  Since the two 6x rows come from
-         * different iterations of the outer loop, we save each 6x
-         * intermediate in v6x_cur and pair them every two iterations.
-         * The ping-pong swap avoids copying.
-         * ============================================================ */
-        if (need_12x) {
-            if ((g6 & 1) == 0) {
-                /* Swap so v6x_cur data becomes v6x_prev for the next group */
-                uint8_t *tmp = v6x_prev;
-                v6x_prev = v6x_cur;
-                v6x_cur  = tmp;
-            } else {
-                /* Average v6x_prev (even group) with v6x_cur (odd group) */
-                int avx2_32 = src_w / 32;
-                int x = 0;
-                for (int c = 0; c < avx2_32; c++, x += 32) {
-                    __m256i a = _mm256_loadu_si256((const __m256i *)(v6x_prev + x));
-                    __m256i b = _mm256_loadu_si256((const __m256i *)(v6x_cur + x));
-                    _mm256_storeu_si256((__m256i *)(v6x_prev + x),
-                                        _mm256_avg_epu8(a, b));
-                }
-                for (; x < src_w; x++) {
-                    v6x_prev[x] = avg_u8(v6x_prev[x], v6x_cur[x]);
-                }
-
-                if (active_outputs & (1u << 6)) {
-                    int dw = dst_widths[3];
-                    int ds = dst_strides[3];
-
-                    /* Horizontal 12:1 reduction = 3x box average -> halve ->
-                     * halve.  In planar mode (whole-chunk widths) the rows
-                     * already hold deinterleaved [A|B|C] components per
-                     * 96-byte chunk - the vertical average above is pointwise
-                     * so the layout survives it - and the cascade runs fused
-                     * per chunk with NO shuffle work at all: 96 bytes of
-                     * components -> 32 box-of-3 (3x) -> 16 (6x) -> 8 (12x)
-                     * output bytes, all in registers.  Every pair/triplet
-                     * boundary stays inside the chunk, so each output byte is
-                     * the exact 12:1 average (box3_div_avx2 is h_filter_3x's
-                     * div-by-3, and the two halves match avg_u8).  Other
-                     * widths use the buffered raw-layout path in the else
-                     * branch. */
-                    uint8_t *restrict out12 =
-                        dst_planes[3] + (size_t)out_row[3] * (size_t)ds;
-                    if (v6x_planar) {
-                        int fc12 = src_w / 96;
-                        for (int c = 0; c < fc12; c++) {
-                            const uint8_t *cs = v6x_prev + (size_t)c * 96;
-                            __m256i A = _mm256_loadu_si256((const __m256i *)cs);
-                            __m256i B = _mm256_loadu_si256((const __m256i *)(cs + 32));
-                            __m256i C = _mm256_loadu_si256((const __m256i *)(cs + 64));
-                            __m256i box = box3_div_avx2(A, B, C);   /* 32B 3x  */
-                            __m128i six = avx2_halve_32_to_16(box); /* 16B 6x  */
-                            __m128i twl = halve_16_to_8(six);       /* 8B  12x */
-                            _mm_storel_epi64((__m128i *)(out12 + (size_t)c * 8), twl);
+                        if (emit_3x) {
+                            h_chunk_3x_avx2(A3x0, B3x0, C3x0, dst_3x_r0 + out_off_3x);
+                            h_chunk_3x_avx2(A3x1, B3x1, C3x1, dst_3x_r1 + out_off_3x);
                         }
-                    } else {
-                        h_filter_3x(v6x_prev, src_w, h_3x_buf, w_3x);
-                        h_filter_halve(h_3x_buf, h_6x_buf, w_6x);
-                        h_filter_halve(h_6x_buf, out12, dw);
                     }
-                    out_row[3]++;
-                }
-            }
-        }
-    } /* end g6 loop */
 
-    /* Scratch buffers are carved from the persistent pool - nothing to free. */
+                    if (emit_6x || need_12x) {
+                        __m256i A6x = _mm256_avg_epu8(A3x0, A3x1);
+                        __m256i B6x = _mm256_avg_epu8(B3x0, B3x1);
+                        __m256i C6x = _mm256_avg_epu8(C3x0, C3x1);
+                        if (emit_6x) {
+                            h_chunk_6x_avx2(box3_div_avx2(A6x, B6x, C6x),
+                                            dst_6x_r0 + out_off_6x);
+                        }
+                        if (need_12x) {
+                            if ((g6 & 1) == 0) {
+                                _mm256_storeu_si256((__m256i *)(v6x_prev + cx),      A6x);
+                                _mm256_storeu_si256((__m256i *)(v6x_prev + cx + 32), B6x);
+                                _mm256_storeu_si256((__m256i *)(v6x_prev + cx + 64), C6x);
+                            } else if (emit_12x) {
+                                __m256i A12 = _mm256_avg_epu8(
+                                    _mm256_loadu_si256((const __m256i *)(v6x_prev + cx)), A6x);
+                                __m256i B12 = _mm256_avg_epu8(
+                                    _mm256_loadu_si256((const __m256i *)(v6x_prev + cx + 32)), B6x);
+                                __m256i C12 = _mm256_avg_epu8(
+                                    _mm256_loadu_si256((const __m256i *)(v6x_prev + cx + 64)), C6x);
+                                __m256i box = box3_div_avx2(A12, B12, C12);
+                                __m128i six = avx2_halve_32_to_16(box);
+                                __m128i twl = halve_16_to_8(six);
+                                _mm_storel_epi64((__m128i *)(dst_12x_r0 + ci * 8), twl);
+                            }
+                        }
+                    }
+                } else {
+                    /* No 1.5x: deinterleave each reduced row directly. */
+                    __m256i v3x0a = _mm256_setzero_si256();
+                    __m256i v3x0b = _mm256_setzero_si256();
+                    __m256i v3x0c = _mm256_setzero_si256();
+                    __m256i v3x1a = _mm256_setzero_si256();
+                    __m256i v3x1b = _mm256_setzero_si256();
+                    __m256i v3x1c = _mm256_setzero_si256();
+                    if (need_3x) {
+                        v3x0a = _mm256_avg_epu8(v01a, v23a);
+                        v3x0b = _mm256_avg_epu8(v01b, v23b);
+                        v3x0c = _mm256_avg_epu8(v01c, v23c);
+                        v3x1a = _mm256_avg_epu8(v23a, v45a);
+                        v3x1b = _mm256_avg_epu8(v23b, v45b);
+                        v3x1c = _mm256_avg_epu8(v23c, v45c);
+
+                        if (emit_3x) {
+                            __m256i A, B, C;
+                            deinterleave_3x32(v3x0a, v3x0b, v3x0c, &A, &B, &C);
+                            h_chunk_3x_avx2(A, B, C, dst_3x_r0 + out_off_3x);
+                            deinterleave_3x32(v3x1a, v3x1b, v3x1c, &A, &B, &C);
+                            h_chunk_3x_avx2(A, B, C, dst_3x_r1 + out_off_3x);
+                        }
+                    }
+                    if (emit_6x || need_12x) {
+                        __m256i v6xa = _mm256_avg_epu8(v3x0a, v3x1a);
+                        __m256i v6xb = _mm256_avg_epu8(v3x0b, v3x1b);
+                        __m256i v6xc = _mm256_avg_epu8(v3x0c, v3x1c);
+                        __m256i A, B, C;
+                        deinterleave_3x32(v6xa, v6xb, v6xc, &A, &B, &C);
+                        if (emit_6x) {
+                            h_chunk_6x_avx2(box3_div_avx2(A, B, C),
+                                            dst_6x_r0 + out_off_6x);
+                        }
+                        if (need_12x) {
+                            if ((g6 & 1) == 0) {
+                                _mm256_storeu_si256((__m256i *)(v6x_prev + cx),      A);
+                                _mm256_storeu_si256((__m256i *)(v6x_prev + cx + 32), B);
+                                _mm256_storeu_si256((__m256i *)(v6x_prev + cx + 64), C);
+                            } else if (emit_12x) {
+                                __m256i A12 = _mm256_avg_epu8(
+                                    _mm256_loadu_si256((const __m256i *)(v6x_prev + cx)), A);
+                                __m256i B12 = _mm256_avg_epu8(
+                                    _mm256_loadu_si256((const __m256i *)(v6x_prev + cx + 32)), B);
+                                __m256i C12 = _mm256_avg_epu8(
+                                    _mm256_loadu_si256((const __m256i *)(v6x_prev + cx + 64)), C);
+                                __m256i box = box3_div_avx2(A12, B12, C12);
+                                __m128i six = avx2_halve_32_to_16(box);
+                                __m128i twl = halve_16_to_8(six);
+                                _mm_storel_epi64((__m128i *)(dst_12x_r0 + ci * 8), twl);
+                            }
+                        }
+                    }
+                }
+            } /* end chunk loop */
+
+            grp += ss * 6;
+            if (need_1_5x) p0 += ds0 * 4;
+            if (emit_3x)   p1 += ds1 * 2;
+            if (emit_6x)   p2 += ds2;
+            if (emit_12x && (g6 & 1)) p3 += ds3;
+        } /* end g6 loop */
+    }
+
+    if (tail_cols > 0) {
+        scale_plane_thirds_tail_strip_avx2(
+            src, full_chunks, tail_cols, base6_groups, src_stride,
+            active_outputs, need_1_5x, need_3x, need_6x, need_12x,
+            dst_planes, dst_widths, dst_strides);
+    }
 }
 
 

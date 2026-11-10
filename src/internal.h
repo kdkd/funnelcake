@@ -332,6 +332,10 @@ void fused_kernel_pow2_up_scalar(const fused_kernel_params_t *p,
                                  const uint8_t *src_v);
 
 #if defined(__x86_64__)
+void fused_up_2x_plane_avx2(const uint8_t *src, int src_w, int src_h,
+                            int src_stride, uint8_t *dst, int dst_stride,
+                            uint8_t *scratch, int terminal);
+
 void fused_kernel_upscale_avx2(const fused_kernel_params_t *p,
                                const uint8_t *src_y,
                                const uint8_t *src_u,
@@ -720,6 +724,17 @@ void fused_kernel_pow2_up_hdr_scalar(const fused_hdr_kernel_params_t *p,
                                      const uint16_t *src_v);
 
 #if defined(__x86_64__)
+int fused_deinterleave_p010_avx2(const fused_hdr_kernel_params_t *p,
+                                 const uint16_t *src_uv);
+
+int fused_deinterleave_p010_avx512(const fused_hdr_kernel_params_t *p,
+                                   const uint16_t *src_uv);
+
+void fused_up_2x_plane_avx2_u16(const uint16_t *src, int src_w, int src_h,
+                                int src_el_stride, uint16_t *dst,
+                                int dst_el_stride, uint16_t *scratch,
+                                int terminal);
+
 void fused_kernel_upscale_hdr_avx2(const fused_hdr_kernel_params_t *p,
                                    const uint16_t *src_y,
                                    const uint16_t *src_u,

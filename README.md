@@ -69,7 +69,7 @@ would use. For downscale workloads libswscale also supports a "cascade"
 mode where each output feeds the next, which is roughly 1.5–2× faster
 than independent mode on multi-level ladders; even against cascaded
 libswscale, funnelcake remains 3–10× faster on every tested AVX2/NEON CPU
-and 13–16× faster on the AVX-512 path.
+and 18–22× faster on the AVX-512 path.
 
 Each workload label spells out the exact scales being produced. For
 example:
@@ -92,12 +92,12 @@ Smaller time is better; larger speedup is better.
 
 | Workload | Ryzen 9955HX (Zen 5, AVX-512) | Epyc 7302 (Zen 2, AVX2) | Xeon 6132 (Skylake, AVX2) | Xeon E5v4 (Broadwell, AVX2) |
 |---|---|---|---|---|
-| 640×360 down:2x                   |    3 µs (16.5×) |    6 µs (18.6×) |    6 µs (20.7×) |   32 µs  (4.4×) |
-| 960×540 down:1.5x,3x              |   13 µs (25.1×) |   55 µs  (9.6×) |   69 µs  (9.0×) |  182 µs  (3.8×) |
-| 1280×720 down:2x,4x               |   14 µs (27.6×) |   41 µs (16.6×) |   71 µs (11.5×) |  176 µs  (5.5×) |
-| 1920×1080 down:1.5x,3x,6x         |   53 µs (30.9×) |  226 µs (12.3×) |  286 µs (11.6×) |  537 µs  (6.7×) |
-| 2560×1440 down:2x,4x,8x           |   71 µs (31.2×) |  192 µs (19.6×) |  364 µs (12.2×) |  479 µs (10.4×) |
-| 3840×2160 down:1.5x,3x,6x,12x     |  200 µs (39.3×) | 1512 µs  (8.9×) | 1470 µs (10.7×) | 1672 µs (10.3×) |
+| 640×360 down:2x                   |    2 µs (23.0×) |    5 µs (22.5×) |    5 µs (28.3×) |   27 µs  (6.0×) |
+| 960×540 down:1.5x,3x              |   12 µs (25.6×) |   53 µs  (9.9×) |   69 µs (10.7×) |  175 µs  (4.5×) |
+| 1280×720 down:2x,4x               |   12 µs (32.9×) |   33 µs (20.7×) |   64 µs (14.8×) |  135 µs  (7.7×) |
+| 1920×1080 down:1.5x,3x,6x         |   44 µs (35.6×) |  221 µs (12.6×) |  300 µs (12.7×) |  506 µs  (8.2×) |
+| 2560×1440 down:2x,4x,8x           |   56 µs (38.1×) |  142 µs (26.2×) |  315 µs (16.2×) |  299 µs (18.8×) |
+| 3840×2160 down:1.5x,3x,6x,12x     |  175 µs (43.3×) | 1547 µs  (8.8×) | 1788 µs (10.5×) | 1633 µs (12.4×) |
 
 The AVX-512 kernels require the F+BW+VL+VBMI feature set (Zen 4 and
 later, Ice Lake and later) and are selected at runtime. The Xeon 6132
@@ -120,21 +120,21 @@ core and AVX2 is the faster choice anyway.
 
 **x86_64 / AVX2 & AVX-512**
 
-The upscale kernels themselves are AVX2 on every x86 part - the large
+The 2× upscale kernels themselves are AVX2 on every x86 part - the large
 terminal upscale outputs are store-bandwidth bound, so wider vectors
-have nothing to add there - but the AVX-512 column below reflects the
-whole-call timing on that system.
+have nothing to add there - while the 1.5× tail uses AVX-512 VBMI where
+available.
 
 | Workload | Ryzen 9955HX (Zen 5, AVX-512) | Epyc 7302 (Zen 2, AVX2) | Xeon 6132 (Skylake, AVX2) | Xeon E5v4 (Broadwell, AVX2) |
 |---|---|---|---|---|
-| 480×270 up:2x                   |    7 µs (17.7×) |   18 µs (15.5×) |   21 µs (14.5×) |   48 µs  (9.8×) |
-| 480×270 up:2x,4x                |   40 µs (10.5×) |   93 µs  (9.8×) |  175 µs  (6.2×) |  226 µs  (7.0×) |
-| 960×540 up:2x                   |   30 µs (16.1×) |   74 µs (13.5×) |  149 µs  (8.0×) |  178 µs  (7.8×) |
-| 960×540 up:2x,3x                |  248 µs  (5.2×) |  604 µs  (4.5×) |  682 µs  (4.9×) |  838 µs  (4.7×) |
-| 1920×1080 up:2x                 |  120 µs (16.0×) |  482 µs  (8.4×) |  691 µs  (6.8×) |  671 µs  (8.2×) |
-| 1920×1080 up:1.5x               |  213 µs  (6.5×) |  519 µs  (5.3×) |  524 µs  (6.5×) |  706 µs  (5.7×) |
-| 240×136 up:2x,4x,8x,16x         |  166 µs  (5.3×) |  706 µs  (3.2×) |  930 µs  (2.7×) |  976 µs  (3.1×) |
-| 120×68 up:2x,4x,8x,16x,32x      |  169 µs  (4.3×) |  712 µs  (2.8×) |  931 µs  (2.2×) | 1202 µs  (2.1×) |
+| 480×270 up:2x                   |    7 µs (18.7×) |   19 µs (14.5×) |   24 µs (15.5×) |   50 µs  (8.2×) |
+| 480×270 up:2x,4x                |   37 µs (11.6×) |   93 µs  (9.9×) |  180 µs  (7.0×) |  242 µs  (5.6×) |
+| 960×540 up:2x                   |   32 µs (15.2×) |   74 µs (13.6×) |  155 µs  (8.8×) |  194 µs  (7.7×) |
+| 960×540 up:2x,3x                |  120 µs (10.5×) |  601 µs  (4.5×) |  789 µs  (4.8×) |  955 µs  (4.3×) |
+| 1920×1080 up:2x                 |  116 µs (16.4×) |  599 µs  (7.0×) |  885 µs  (6.1×) |  773 µs  (7.8×) |
+| 1920×1080 up:1.5x               |   93 µs (14.8×) |  513 µs  (5.4×) |  604 µs  (6.5×) |  768 µs  (5.5×) |
+| 240×136 up:2x,4x,8x,16x         |  161 µs  (5.6×) |  870 µs  (2.8×) | 1174 µs  (2.6×) | 1045 µs  (3.1×) |
+| 120×68 up:2x,4x,8x,16x,32x      |  166 µs  (4.4×) |  865 µs  (2.4×) | 1202 µs  (2.2×) | 1060 µs  (2.6×) |
 
 **aarch64 / NEON**
 
@@ -162,9 +162,9 @@ discussion.
 
 | Workload | Ryzen 9955HX (Zen 5, AVX-512) | Epyc 7302 (Zen 2, AVX2) | Xeon 6132 (Skylake, AVX2) | Xeon E5v4 (Broadwell, AVX2) |
 |---|---|---|---|---|
-| 1920×1080 down:2x up:2x             |  148 µs (16.2×) |  692 µs (7.2×) |  947 µs (6.1×) |  800 µs (8.0×) |
-| 1920×1080 down:1.5x,3x up:2x        |  162 µs (19.4×) |  972 µs (6.3×) | 1144 µs (6.4×) |  979 µs (8.0×) |
-| 1280×720 down:2x,4x up:2x,4x        |  488 µs  (7.3×) | 2584 µs (3.0×) | 2463 µs (3.6×) | 2119 µs (4.5×) |
+| 1920×1080 down:2x up:2x             |  142 µs (16.6×) |  747 µs (6.9×) | 1132 µs (6.0×) |  905 µs (8.1×) |
+| 1920×1080 down:1.5x,3x up:2x        |  154 µs (20.0×) | 1014 µs (6.3×) | 1360 µs (6.2×) | 1104 µs (8.3×) |
+| 1280×720 down:2x,4x up:2x,4x        |  285 µs (12.2×) | 2912 µs (2.8×) | 2972 µs (3.4×) | 2913 µs (4.0×) |
 
 **aarch64 / NEON**
 
@@ -195,15 +195,15 @@ reference bit for bit.
 
 | Workload | Ryzen 9955HX (AVX-512) | Epyc 7302 (AVX2) | Xeon 6132 (AVX2) | Xeon E5v4 (AVX2) |
 |---|---|---|---|---|
-| 1920×1080 I010 down:1.5x,3x,6x        |    74 µs |   258 µs |   396 µs |   381 µs |
-| 3840×2160 I010 down:1.5x,3x,6x,12x    |   783 µs |  2523 µs |  2727 µs |  2945 µs |
-| 3840×2160 P010 down:1.5x,3x,6x,12x    |   990 µs |  3100 µs |  3668 µs |  4990 µs |
-| 1920×1080 I010 up:2x                  |   255 µs |  1917 µs |  2139 µs |  1871 µs |
-| 1920×1080 I010 down:1.5x,3x up:2x     |   536 µs |  2502 µs |  2708 µs |  2963 µs |
-| 1920×1080 I010 down:1.5x,3x,6x tone   |   319 µs |  3133 µs |  4855 µs |  2099 µs |
-| 3840×2160 I010 down:1.5x,3x,6x,12x tone |  1746 µs | 14261 µs | 21387 µs | 10882 µs |
-| 1920×1080 I010 down:1.5x,3x,6x HDR+tone |   318 µs |  3124 µs |  4860 µs |  2190 µs |
-| 3840×2160 I010 tone 1x                |  1777 µs | 19644 µs | 30683 µs | 12081 µs |
+| 1920×1080 I010 down:1.5x,3x,6x        |    72 µs |   254 µs |   432 µs |   383 µs |
+| 3840×2160 I010 down:1.5x,3x,6x,12x    |   752 µs |  3049 µs |  3080 µs |  3062 µs |
+| 3840×2160 P010 down:1.5x,3x,6x,12x    |   983 µs |  3512 µs |  4296 µs |  4878 µs |
+| 1920×1080 I010 up:2x                  |   239 µs |  2282 µs |  2567 µs |  2010 µs |
+| 1920×1080 I010 down:1.5x,3x up:2x     |   581 µs |  2965 µs |  3045 µs |  2959 µs |
+| 1920×1080 I010 down:1.5x,3x,6x tone   |   320 µs |  3011 µs |  5162 µs |  2139 µs |
+| 3840×2160 I010 down:1.5x,3x,6x,12x tone |  1785 µs | 14172 µs | 22329 µs | 10618 µs |
+| 1920×1080 I010 down:1.5x,3x,6x HDR+tone |   320 µs |  2996 µs |  5207 µs |  2061 µs |
+| 3840×2160 I010 tone 1x                |  1771 µs | 18893 µs | 31427 µs | 11521 µs |
 
 **aarch64 / NEON**
 

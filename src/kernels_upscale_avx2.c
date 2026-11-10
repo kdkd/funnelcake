@@ -328,9 +328,9 @@ up_h_2x_vblend_row_avx2_nt(const uint8_t *a_row, const uint8_t *b_row,
  * Vertical 2x upscale of one plane (with horizontal doubling fused)
  * ----------------------------------------------------------------------- */
 
-static void up_2x_plane_avx2(const uint8_t *src, int src_w, int src_h,
-                             int src_stride, uint8_t *dst, int dst_stride,
-                             uint8_t *scratch, int terminal)
+void fused_up_2x_plane_avx2(const uint8_t *src, int src_w, int src_h,
+                            int src_stride, uint8_t *dst, int dst_stride,
+                            uint8_t *scratch, int terminal)
 {
     if (!scratch) return;
 
@@ -737,8 +737,8 @@ static void upscale_plane_avx2(const fused_kernel_params_t *p,
                                           : p->up_out[FUSED_UP_IDX_2X].plane_v;
             dst_stride = p->up_out[FUSED_UP_IDX_2X].uv_stride;
         }
-        if (dst) up_2x_plane_avx2(src, src_w, src_h, src_stride, dst, dst_stride,
-                                   p->upscale_scratch, N == 1 && !tail);
+        if (dst) fused_up_2x_plane_avx2(src, src_w, src_h, src_stride, dst, dst_stride,
+                                        p->upscale_scratch, N == 1 && !tail);
     }
 
     for (int k = 1; k < N; k++) {
@@ -763,8 +763,8 @@ static void upscale_plane_avx2(const fused_kernel_params_t *p,
             dst_stride    = p->up_out[k].uv_stride;
         }
         if (src_up && dst) {
-            up_2x_plane_avx2(src_up, up_w, up_h, src_up_stride, dst, dst_stride,
-                             p->upscale_scratch, k == N - 1 && !tail);
+            fused_up_2x_plane_avx2(src_up, up_w, up_h, src_up_stride, dst, dst_stride,
+                                   p->upscale_scratch, k == N - 1 && !tail);
         }
     }
 
@@ -1087,10 +1087,10 @@ up_h_2x_vblend_row_avx2_u16_nt(const uint16_t *a_row, const uint16_t *b_row,
 }
 
 /* ---- Vertical 2x upscale of one HDR plane ---- */
-static void up_2x_plane_avx2_u16(const uint16_t *src, int src_w, int src_h,
-                                 int src_el_stride, uint16_t *dst,
-                                 int dst_el_stride, uint16_t *scratch,
-                                 int terminal)
+void fused_up_2x_plane_avx2_u16(const uint16_t *src, int src_w, int src_h,
+                                int src_el_stride, uint16_t *dst,
+                                int dst_el_stride, uint16_t *scratch,
+                                int terminal)
 {
     if (!scratch) return;
 
@@ -1357,10 +1357,10 @@ static void upscale_plane_hdr_avx2(const fused_hdr_kernel_params_t *p,
                                              : p->hdr_up_out[FUSED_UP_IDX_2X].plane_v;
             dst_el_stride = p->hdr_up_out[FUSED_UP_IDX_2X].uv_stride / (int)sizeof(uint16_t);
         }
-        if (dst) up_2x_plane_avx2_u16(src, src_w, src_h, src_el_stride,
-                                       dst, dst_el_stride,
-                                       p->upscale_scratch_hdr,
-                                       N == 1 && !tail);
+        if (dst) fused_up_2x_plane_avx2_u16(src, src_w, src_h, src_el_stride,
+                                            dst, dst_el_stride,
+                                            p->upscale_scratch_hdr,
+                                            N == 1 && !tail);
     }
 
     for (int k = 1; k < N; k++) {
@@ -1385,9 +1385,9 @@ static void upscale_plane_hdr_avx2(const fused_hdr_kernel_params_t *p,
             dst_el_stride    = p->hdr_up_out[k].uv_stride / (int)sizeof(uint16_t);
         }
         if (src_up && dst) {
-            up_2x_plane_avx2_u16(src_up, up_w, up_h, src_up_el_stride,
-                                 dst, dst_el_stride, p->upscale_scratch_hdr,
-                                 k == N - 1 && !tail);
+            fused_up_2x_plane_avx2_u16(src_up, up_w, up_h, src_up_el_stride,
+                                       dst, dst_el_stride, p->upscale_scratch_hdr,
+                                       k == N - 1 && !tail);
         }
     }
 
@@ -1458,7 +1458,7 @@ void fused_kernel_upscale_hdr_avx2(const fused_hdr_kernel_params_t *p,
     int up_src_uv_el_stride = p->src_uv_el_stride;
 
     if (p->is_p010) {
-        if (fused_hdr_deinterleave_p010(p, src_u) != 0) return;
+        if (fused_deinterleave_p010_avx2(p, src_u) != 0) return;
         up_src_u = p->p010_tmp_u;
         up_src_v = p->p010_tmp_v;
         up_src_uv_el_stride = p->p010_tmp_stride / (int)sizeof(uint16_t);

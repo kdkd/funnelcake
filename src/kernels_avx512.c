@@ -262,93 +262,83 @@ static inline __attribute__((always_inline)) __m512i avg_rows_64_avx512(
  * vertical tree uses the same bottom-up rounded averages as the main loop;
  * store_pow2_64_avx512 completes the matching horizontal tree. */
 static inline __attribute__((always_inline)) void pow2_tree_tile_64_avx512(
-    const uint8_t *restrict grp, int src_stride, int x, int deepest,
+    const uint8_t *restrict grp, ptrdiff_t ss, ptrdiff_t ss3,
+    int x, int deepest,
     int emit0, int emit1, int emit2, int emit3,
     uint8_t *restrict out0, uint8_t *restrict out1,
     uint8_t *restrict out2, uint8_t *restrict out3,
-    int dst_strides[4])
+    ptrdiff_t ds0, ptrdiff_t ds0_3,
+    ptrdiff_t ds1, ptrdiff_t ds1_3,
+    ptrdiff_t ds2)
 {
-    __m512i n0 = avg_rows_64_avx512(
-        grp, grp + (size_t)src_stride, x);
+    const uint8_t *sr = grp + x;
+    uint8_t *o0 = emit0 ? (out0 + ((size_t)x >> 1)) : NULL;
+
+    __m512i n0 = avg_rows_64_avx512(sr, sr + ss, 0);
     if (emit0)
-        store_pow2_64_avx512(n0, 0, out0 + (size_t)x / 2);
+        store_pow2_64_avx512(n0, 0, o0);
     if (deepest == 0)
         return;
 
-    __m512i n1 = avg_rows_64_avx512(
-        grp + (size_t)2 * (size_t)src_stride,
-        grp + (size_t)3 * (size_t)src_stride, x);
+    __m512i n1 = avg_rows_64_avx512(sr + ss * 2, sr + ss3, 0);
     if (emit0)
-        store_pow2_64_avx512(n1, 0,
-            out0 + (size_t)dst_strides[0] + (size_t)x / 2);
+        store_pow2_64_avx512(n1, 0, o0 + ds0);
     __m512i p0 = _mm512_avg_epu8(n0, n1);
     if (emit1)
-        store_pow2_64_avx512(p0, 1, out1 + (size_t)x / 4);
+        store_pow2_64_avx512(p0, 1, out1 + ((size_t)x >> 2));
     if (deepest == 1)
         return;
 
-    __m512i n2 = avg_rows_64_avx512(
-        grp + (size_t)4 * (size_t)src_stride,
-        grp + (size_t)5 * (size_t)src_stride, x);
+    sr += ss * 4;
+    __asm__("" : "+r"(sr));
+    __m512i n2 = avg_rows_64_avx512(sr, sr + ss, 0);
     if (emit0)
-        store_pow2_64_avx512(n2, 0,
-            out0 + (size_t)2 * (size_t)dst_strides[0] + (size_t)x / 2);
-    __m512i n3 = avg_rows_64_avx512(
-        grp + (size_t)6 * (size_t)src_stride,
-        grp + (size_t)7 * (size_t)src_stride, x);
+        store_pow2_64_avx512(n2, 0, o0 + ds0 * 2);
+    __m512i n3 = avg_rows_64_avx512(sr + ss * 2, sr + ss3, 0);
     if (emit0)
-        store_pow2_64_avx512(n3, 0,
-            out0 + (size_t)3 * (size_t)dst_strides[0] + (size_t)x / 2);
+        store_pow2_64_avx512(n3, 0, o0 + ds0_3);
     __m512i p1 = _mm512_avg_epu8(n2, n3);
     if (emit1)
-        store_pow2_64_avx512(p1, 1,
-            out1 + (size_t)dst_strides[1] + (size_t)x / 4);
+        store_pow2_64_avx512(p1, 1, out1 + ds1 + ((size_t)x >> 2));
     __m512i q0 = _mm512_avg_epu8(p0, p1);
     if (emit2)
-        store_pow2_64_level2_avx512(q0, out2 + (size_t)x / 8);
+        store_pow2_64_level2_avx512(q0, out2 + ((size_t)x >> 3));
     if (deepest == 2)
         return;
 
-    __m512i n4 = avg_rows_64_avx512(
-        grp + (size_t)8 * (size_t)src_stride,
-        grp + (size_t)9 * (size_t)src_stride, x);
+    sr += ss * 4;
+    __asm__("" : "+r"(sr));
+    if (emit0) {
+        o0 += ds0 * 4;
+        __asm__("" : "+r"(o0));
+    }
+    __m512i n4 = avg_rows_64_avx512(sr, sr + ss, 0);
     if (emit0)
-        store_pow2_64_avx512(n4, 0,
-            out0 + (size_t)4 * (size_t)dst_strides[0] + (size_t)x / 2);
-    __m512i n5 = avg_rows_64_avx512(
-        grp + (size_t)10 * (size_t)src_stride,
-        grp + (size_t)11 * (size_t)src_stride, x);
+        store_pow2_64_avx512(n4, 0, o0);
+    __m512i n5 = avg_rows_64_avx512(sr + ss * 2, sr + ss3, 0);
     if (emit0)
-        store_pow2_64_avx512(n5, 0,
-            out0 + (size_t)5 * (size_t)dst_strides[0] + (size_t)x / 2);
+        store_pow2_64_avx512(n5, 0, o0 + ds0);
     __m512i p2 = _mm512_avg_epu8(n4, n5);
     if (emit1)
-        store_pow2_64_avx512(p2, 1,
-            out1 + (size_t)2 * (size_t)dst_strides[1] + (size_t)x / 4);
+        store_pow2_64_avx512(p2, 1, out1 + ds1 * 2 + ((size_t)x >> 2));
 
-    __m512i n6 = avg_rows_64_avx512(
-        grp + (size_t)12 * (size_t)src_stride,
-        grp + (size_t)13 * (size_t)src_stride, x);
+    sr += ss * 4;
+    __asm__("" : "+r"(sr));
+    __m512i n6 = avg_rows_64_avx512(sr, sr + ss, 0);
     if (emit0)
-        store_pow2_64_avx512(n6, 0,
-            out0 + (size_t)6 * (size_t)dst_strides[0] + (size_t)x / 2);
-    __m512i n7 = avg_rows_64_avx512(
-        grp + (size_t)14 * (size_t)src_stride,
-        grp + (size_t)15 * (size_t)src_stride, x);
+        store_pow2_64_avx512(n6, 0, o0 + ds0 * 2);
+    __m512i n7 = avg_rows_64_avx512(sr + ss * 2, sr + ss3, 0);
     if (emit0)
-        store_pow2_64_avx512(n7, 0,
-            out0 + (size_t)7 * (size_t)dst_strides[0] + (size_t)x / 2);
+        store_pow2_64_avx512(n7, 0, o0 + ds0_3);
     __m512i p3 = _mm512_avg_epu8(n6, n7);
     if (emit1)
-        store_pow2_64_avx512(p3, 1,
-            out1 + (size_t)3 * (size_t)dst_strides[1] + (size_t)x / 4);
+        store_pow2_64_avx512(p3, 1, out1 + ds1_3 + ((size_t)x >> 2));
     __m512i q1 = _mm512_avg_epu8(p2, p3);
     if (emit2)
-        store_pow2_64_level2_avx512(q1,
-            out2 + (size_t)dst_strides[2] + (size_t)x / 8);
+        store_pow2_64_level2_avx512(q1, out2 + ds2 + ((size_t)x >> 3));
     if (emit3)
         store_pow2_64_level3_avx512(_mm512_avg_epu8(q0, q1),
-            out3 + (size_t)x / 16);
+            out3 + ((size_t)x >> 4));
 }
 
 /* Scratch-free fast path for regular 128-byte widths.  The tree is built in
@@ -389,34 +379,52 @@ static void __attribute__((noinline, hot)) scale_plane_pow2_tree_tail_64_avx512(
     uint32_t active_outputs, int deepest,
     uint8_t *restrict dst_planes[4], int dst_strides[4])
 {
-    const int group_rows = 2 << deepest;
-    const int num_groups = src_h / group_rows;
     const int emit0 = (active_outputs & (1u << 1)) != 0;
     const int emit1 = (active_outputs & (1u << 3)) != 0;
     const int emit2 = (active_outputs & (1u << 5)) != 0;
     const int emit3 = (active_outputs & (1u << 7)) != 0;
+    const ptrdiff_t ss    = (ptrdiff_t)src_stride;
+    const ptrdiff_t ss3   = ss * 3;
+    const ptrdiff_t ds0   = (ptrdiff_t)dst_strides[0];
+    const ptrdiff_t ds0_3 = ds0 * 3;
+    const ptrdiff_t ds1   = (ptrdiff_t)dst_strides[1];
+    const ptrdiff_t ds1_3 = ds1 * 3;
+    const ptrdiff_t ds2   = (ptrdiff_t)dst_strides[2];
+    const ptrdiff_t ds3   = (ptrdiff_t)dst_strides[3];
 
-    for (int g = 0; g < num_groups; g++) {
-        const uint8_t *grp = src
-            + (size_t)g * (size_t)group_rows * (size_t)src_stride;
-        uint8_t *out0 = emit0 ? dst_planes[0]
-            + (size_t)g * (size_t)(group_rows >> 1)
-              * (size_t)dst_strides[0] : NULL;
-        uint8_t *out1 = emit1 ? dst_planes[1]
-            + (size_t)g * (size_t)(group_rows >> 2)
-              * (size_t)dst_strides[1] : NULL;
-        uint8_t *out2 = emit2 ? dst_planes[2]
-            + (size_t)g * (size_t)(group_rows >> 3)
-              * (size_t)dst_strides[2] : NULL;
-        uint8_t *out3 = emit3 ? dst_planes[3]
-            + (size_t)g * (size_t)(group_rows >> 4)
-              * (size_t)dst_strides[3] : NULL;
+#define POW2_TAIL_64_LOOP(D) do {                                              \
+    const int group_rows_ = 2 << (D);                                          \
+    const int num_groups_ = src_h / group_rows_;                               \
+    const uint8_t *grp_ = src;                                                 \
+    uint8_t *out0_ = emit0 ? dst_planes[0] : NULL;                             \
+    uint8_t *out1_ = ((D) >= 1 && emit1) ? dst_planes[1] : NULL;               \
+    uint8_t *out2_ = ((D) >= 2 && emit2) ? dst_planes[2] : NULL;               \
+    uint8_t *out3_ = ((D) >= 3 && emit3) ? dst_planes[3] : NULL;               \
+    for (int g_ = 0; g_ < num_groups_; g_++) {                                 \
+        pow2_tree_tile_64_avx512(                                              \
+            grp_, ss, ss3, x, (D),                                             \
+            ((D) == 0) ? 1 : emit0,                                            \
+            ((D) == 1) ? 1 : emit1,                                            \
+            ((D) == 2) ? 1 : emit2,                                            \
+            ((D) == 3) ? 1 : emit3,                                            \
+            out0_, out1_, out2_, out3_,                                        \
+            ds0, ds0_3, ds1, ds1_3, ds2);                                      \
+        grp_ += ss * group_rows_;                                              \
+        if (emit0) out0_ += ds0 * (group_rows_ >> 1);                          \
+        if ((D) >= 1 && emit1) out1_ += ds1 * (group_rows_ >> 2);              \
+        if ((D) >= 2 && emit2) out2_ += ds2 * (group_rows_ >> 3);              \
+        if ((D) >= 3 && emit3) out3_ += ds3;                                   \
+    }                                                                          \
+} while (0)
 
-        pow2_tree_tile_64_avx512(
-            grp, src_stride, x, deepest,
-            emit0, emit1, emit2, emit3,
-            out0, out1, out2, out3, dst_strides);
+    switch (deepest) {
+    case 0: POW2_TAIL_64_LOOP(0); break;
+    case 1: POW2_TAIL_64_LOOP(1); break;
+    case 2: POW2_TAIL_64_LOOP(2); break;
+    default: POW2_TAIL_64_LOOP(3); break;
     }
+
+#undef POW2_TAIL_64_LOOP
 }
 
 /* Plane-level shape matching the proven integrated tree, kept separate so
@@ -466,44 +474,18 @@ static void __attribute__((hot)) scale_plane_pow2_chroma64_plane_avx512(
  * time; a 64-byte residual stays vectorized and uncommon shorter tails use
  * the bit-identical scalar reduction.
  * ----------------------------------------------------------------------- */
-static void __attribute__((hot)) scale_plane_pow2_avx512(
+static void __attribute__((noinline)) scale_plane_pow2_scratch_avx512(
     const uint8_t *restrict src,
     int src_w, int src_h, int src_stride,
-    uint32_t active_outputs,
+    uint32_t active_outputs, int deepest,
     uint8_t *restrict dst_planes[4],
-    int dst_widths[4],
     int dst_strides[4],
-    int dst_heights[4],
     uint8_t *scratch_pool_base,
     size_t scratch_pool_size)
 {
-    (void)dst_heights;
-    (void)dst_widths;
-
     static const int bit_pos[4] = { 1, 3, 5, 7 };
-
-    /* Determine deepest active level (0=2x .. 3=16x). */
-    int deepest = -1;
-    for (int k = 3; k >= 0; k--) {
-        if (active_outputs & (1u << bit_pos[k])) {
-            deepest = k;
-            break;
-        }
-    }
-    if (deepest < 0) return;
-
     int group_rows = (2 << deepest);
     int num_groups = src_h / group_rows;
-
-    /* The common video widths (and their 4:2:0 chroma widths) are exact
-     * 128-byte multiples.  Tile the vertical tree in registers there; keep
-     * the established scratch path below for uncommon ragged widths. */
-    if ((src_w & 127) == 0) {
-        scale_plane_pow2_tree_128_avx512(src, src_w, src_h, src_stride,
-                                         active_outputs, deepest,
-                                         dst_planes, dst_strides);
-        return;
-    }
 
     /* Carve scratch buffers from the persistent pool (init-time alloc). */
     fused_scratch_t scratch;
@@ -627,6 +609,60 @@ static void __attribute__((hot)) scale_plane_pow2_avx512(
     }
 
     /* Scratch buffers are carved from the persistent pool - nothing to free. */
+}
+
+static void __attribute__((hot)) scale_plane_pow2_avx512(
+    const uint8_t *restrict src,
+    int src_w, int src_h, int src_stride,
+    uint32_t active_outputs,
+    uint8_t *restrict dst_planes[4],
+    int dst_widths[4],
+    int dst_strides[4],
+    int dst_heights[4],
+    uint8_t *scratch_pool_base,
+    size_t scratch_pool_size)
+{
+    (void)dst_heights;
+    (void)dst_widths;
+
+    static const int bit_pos[4] = { 1, 3, 5, 7 };
+
+    /* Determine deepest active level (0=2x .. 3=16x). */
+    int deepest = -1;
+    for (int k = 3; k >= 0; k--) {
+        if (active_outputs & (1u << bit_pos[k])) {
+            deepest = k;
+            break;
+        }
+    }
+    if (deepest < 0) return;
+
+    /* Common video widths (and 4:2:0 chroma widths) are 128-byte or 64-byte
+     * multiples.  Tile the vertical tree in registers there; keep the
+     * outlined scratch path for uncommon ragged widths. */
+    if ((src_w & 127) == 0) {
+        scale_plane_pow2_tree_128_avx512(src, src_w, src_h, src_stride,
+                                         active_outputs, deepest,
+                                         dst_planes, dst_strides);
+        return;
+    }
+    if ((src_w & 63) == 0) {
+        int paired_w = src_w & ~127;
+        if (paired_w > 0) {
+            scale_plane_pow2_tree_128_avx512(src, paired_w, src_h, src_stride,
+                                             active_outputs, deepest,
+                                             dst_planes, dst_strides);
+        }
+        scale_plane_pow2_tree_tail_64_avx512(src, paired_w, src_h, src_stride,
+                                             active_outputs, deepest,
+                                             dst_planes, dst_strides);
+        return;
+    }
+
+    scale_plane_pow2_scratch_avx512(src, src_w, src_h, src_stride,
+                                    active_outputs, deepest,
+                                    dst_planes, dst_strides,
+                                    scratch_pool_base, scratch_pool_size);
 }
 
 /* =========================================================================
